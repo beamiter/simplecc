@@ -1486,6 +1486,8 @@ enddef
 
 var s_inlay_enabled: bool = true
 var s_inlay_timer: number = 0
+var s_inlay_cache: list<any> = []
+var s_inlay_cache_bufnr: number = -1
 
 export def InlayHintsToggle()
   s_inlay_enabled = !s_inlay_enabled
@@ -1541,12 +1543,17 @@ def OnInlayHints(ev: dict<any>)
     return
   endif
   var hints = get(ev, 'hints', [])
-  # Don't clear old hints if response is empty (server still loading)
   if empty(hints)
     return
   endif
+  # Cache for later restoration
+  s_inlay_cache = hints
+  s_inlay_cache_bufnr = bufnr('%')
+  ApplyInlayHints(hints, bufnr('%'))
+enddef
+
+def ApplyInlayHints(hints: list<any>, bnr: number)
   ClearInlayHints()
-  var bnr = bufnr('%')
   try
     prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
@@ -1565,6 +1572,23 @@ def OnInlayHints(ev: dict<any>)
       endtry
     endif
   endfor
+enddef
+
+def RestoreInlayHints()
+  if empty(s_inlay_cache) || !s_inlay_enabled || !g:simplecc_inlay_hints
+    return
+  endif
+  var bnr = bufnr('%')
+  if bnr != s_inlay_cache_bufnr
+    return
+  endif
+  # Check if hints are still displayed by looking for a prop on a cached hint line
+  var check_line = get(s_inlay_cache[0], 'line', 0) + 1
+  var existing = check_line > 0 ? prop_list(check_line, {bufnr: bnr, type: 'SimpleCCInlay'}) : []
+  if empty(existing)
+    # Hints were lost, restore from cache
+    ApplyInlayHints(s_inlay_cache, bnr)
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -1989,6 +2013,8 @@ export def OnCursorHold()
   if !s_initialized
     return
   endif
+  # Restore inlay hints if they were lost (e.g. from async redraws)
+  RestoreInlayHints()
   # Clear stale selection ranges
   s_selection_ranges = []
 enddef
