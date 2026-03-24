@@ -196,6 +196,18 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
+            ServerEvent::Progress { token, kind, title, message, percentage } => {
+                let ev = serde_json::json!({
+                    "type": "progress",
+                    "server": server_name,
+                    "token": token,
+                    "kind": kind,
+                    "title": title,
+                    "message": message,
+                    "percentage": percentage,
+                });
+                let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
+            }
             ServerEvent::ApplyEdit { id: _, edit } => {
                 let ev = serde_json::json!({
                     "type": "applyEdit",

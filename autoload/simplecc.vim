@@ -202,6 +202,51 @@ def OnBackendEvent(line: string)
   elseif ev.type ==# 'serverStatus'
     OnServerStatus(ev)
 
+  elseif ev.type ==# 'implementation'
+    OnImplementation(ev)
+
+  elseif ev.type ==# 'typeDefinition'
+    OnTypeDefinition(ev)
+
+  elseif ev.type ==# 'documentSymbol'
+    OnDocumentSymbol(ev)
+
+  elseif ev.type ==# 'workspaceSymbol'
+    OnWorkspaceSymbol(ev)
+
+  elseif ev.type ==# 'documentHighlight'
+    OnDocumentHighlightResult(ev)
+
+  elseif ev.type ==# 'inlayHint'
+    OnInlayHints(ev)
+
+  elseif ev.type ==# 'callHierarchyPrepare'
+    OnCallHierarchyPrepare(ev)
+
+  elseif ev.type ==# 'incomingCalls'
+    OnIncomingCallsResult(ev)
+
+  elseif ev.type ==# 'outgoingCalls'
+    OnOutgoingCallsResult(ev)
+
+  elseif ev.type ==# 'selectionRange'
+    OnSelectionRange(ev)
+
+  elseif ev.type ==# 'semanticTokens'
+    OnSemanticTokens(ev)
+
+  elseif ev.type ==# 'codeLens'
+    OnCodeLens(ev)
+
+  elseif ev.type ==# 'foldingRange'
+    OnFoldingRange(ev)
+
+  elseif ev.type ==# 'linkedEditingRange'
+    OnLinkedEditingRange(ev)
+
+  elseif ev.type ==# 'progress'
+    OnProgress(ev)
+
   elseif ev.type ==# 'installProgress'
     OnInstallProgress(ev)
 
@@ -313,6 +358,7 @@ export def OnBufOpen()
     return
   endif
   SendDidOpen(bufnr('%'))
+  RequestInlayHintsDebounced()
 enddef
 
 export def OnBufSave()
@@ -325,6 +371,7 @@ export def OnBufSave()
   endif
   var text = join(getline(1, '$'), "\n") .. "\n"
   Send({type: 'textDocument/didSave', id: NextId(), uri: uri, text: text})
+  RequestInlayHintsDebounced()
 enddef
 
 export def OnBufClose()
@@ -837,6 +884,9 @@ def DisplayDiagnostics(uri: string)
 
   # Update text properties for underlines
   UpdateDiagHighlights(bufnr, items)
+
+  # Virtual text diagnostics
+  DisplayVirtualDiag(bufnr, items)
 enddef
 
 def UpdateDiagHighlights(bufnr: number, items: list<dict<any>>)
@@ -1214,6 +1264,733 @@ export def OpenConfig()
     ])
     setlocal filetype=json
   endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Go to Implementation
+# ═════════════════════════════════════════════════════════
+
+export def Implementation()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  var id = NextId()
+  Send({
+    type: 'textDocument/implementation',
+    id: id,
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+enddef
+
+def OnImplementation(ev: dict<any>)
+  var locs = get(ev, 'locations', [])
+  if empty(locs)
+    echo 'No implementation found'
+    return
+  endif
+  if len(locs) == 1
+    JumpToLocation(locs[0])
+  else
+    LocationsToQuickfix(locs, 'Implementation')
+  endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Go to Type Definition
+# ═════════════════════════════════════════════════════════
+
+export def TypeDefinition()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  var id = NextId()
+  Send({
+    type: 'textDocument/typeDefinition',
+    id: id,
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+enddef
+
+def OnTypeDefinition(ev: dict<any>)
+  var locs = get(ev, 'locations', [])
+  if empty(locs)
+    echo 'No type definition found'
+    return
+  endif
+  if len(locs) == 1
+    JumpToLocation(locs[0])
+  else
+    LocationsToQuickfix(locs, 'TypeDefinition')
+  endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Document Symbol (Outline)
+# ═════════════════════════════════════════════════════════
+
+export def DocumentSymbol()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  Send({
+    type: 'textDocument/documentSymbol',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+  })
+enddef
+
+def OnDocumentSymbol(ev: dict<any>)
+  var symbols = get(ev, 'symbols', [])
+  if empty(symbols)
+    echo 'No symbols found'
+    return
+  endif
+  var qf_items: list<dict<any>> = []
+  FlattenSymbols(symbols, qf_items, 0)
+  setloclist(0, qf_items)
+  lopen
+enddef
+
+def FlattenSymbols(symbols: list<any>, items: list<dict<any>>, depth: number)
+  var indent = repeat('  ', depth)
+  for s in symbols
+    var kind = get(s, 'kind', '')
+    var name = get(s, 'name', '')
+    add(items, {
+      filename: expand('%:p'),
+      lnum: get(s, 'line', 0) + 1,
+      col: get(s, 'character', 0) + 1,
+      text: printf('%s[%s] %s', indent, kind, name),
+    })
+    var children = get(s, 'children', [])
+    if !empty(children)
+      FlattenSymbols(children, items, depth + 1)
+    endif
+  endfor
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Workspace Symbol
+# ═════════════════════════════════════════════════════════
+
+export def WorkspaceSymbol(query: string = '')
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  var q = query
+  if q ==# ''
+    q = input('Symbol query: ')
+    if q ==# ''
+      return
+    endif
+  endif
+  Send({
+    type: 'workspace/symbol',
+    id: NextId(),
+    languageId: BufFt(),
+    query: q,
+  })
+enddef
+
+def OnWorkspaceSymbol(ev: dict<any>)
+  var symbols = get(ev, 'symbols', [])
+  if empty(symbols)
+    echo 'No symbols found'
+    return
+  endif
+  var qf_items: list<dict<any>> = []
+  for s in symbols
+    var uri = get(s, 'detail', '')
+    var fpath = substitute(uri, '^file://', '', '')
+    add(qf_items, {
+      filename: fpath,
+      lnum: get(s, 'line', 0) + 1,
+      col: get(s, 'character', 0) + 1,
+      text: printf('[%s] %s', get(s, 'kind', ''), get(s, 'name', '')),
+    })
+  endfor
+  setqflist(qf_items)
+  copen
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Document Highlight
+# ═════════════════════════════════════════════════════════
+
+var s_dochighlight_ids: list<number> = []
+
+export def DocumentHighlight()
+  if !s_initialized
+    return
+  endif
+  Send({
+    type: 'textDocument/documentHighlight',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+enddef
+
+export def DocumentHighlightClear()
+  for mid in s_dochighlight_ids
+    try
+      matchdelete(mid)
+    catch
+    endtry
+  endfor
+  s_dochighlight_ids = []
+enddef
+
+def OnDocumentHighlightResult(ev: dict<any>)
+  DocumentHighlightClear()
+  var highlights = get(ev, 'highlights', [])
+  if empty(highlights)
+    return
+  endif
+  for h in highlights
+    var kind = get(h, 'kind', 'text')
+    var hl_group = 'SimpleCCDocHighlightText'
+    if kind ==# 'read'
+      hl_group = 'SimpleCCDocHighlightRead'
+    elseif kind ==# 'write'
+      hl_group = 'SimpleCCDocHighlightWrite'
+    endif
+    var sl = get(h, 'line', 0) + 1
+    var sc = get(h, 'character', 0) + 1
+    var el = get(h, 'end_line', 0) + 1
+    var ec = get(h, 'end_character', 0) + 1
+    try
+      var mid = matchadd(hl_group, '\%' .. sl .. 'l\%' .. sc .. 'c\_.*\%' .. el .. 'l\%' .. ec .. 'c')
+      add(s_dochighlight_ids, mid)
+    catch
+    endtry
+  endfor
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Inlay Hints
+# ═════════════════════════════════════════════════════════
+
+var s_inlay_enabled: bool = true
+var s_inlay_timer: number = 0
+
+export def InlayHintsToggle()
+  s_inlay_enabled = !s_inlay_enabled
+  if s_inlay_enabled
+    echo '[SimpleCC] Inlay hints ON'
+    RequestInlayHints()
+  else
+    echo '[SimpleCC] Inlay hints OFF'
+    ClearInlayHints()
+  endif
+enddef
+
+def RequestInlayHintsDebounced()
+  if s_inlay_timer > 0
+    timer_stop(s_inlay_timer)
+  endif
+  s_inlay_timer = timer_start(500, (_) => {
+    RequestInlayHints()
+  })
+enddef
+
+def RequestInlayHints()
+  if !s_initialized || !s_inlay_enabled || !g:simplecc_inlay_hints
+    return
+  endif
+  var ft = BufFt()
+  if ft ==# ''
+    return
+  endif
+  Send({
+    type: 'textDocument/inlayHint',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: ft,
+    startLine: 0,
+    endLine: line('$'),
+  })
+enddef
+
+def ClearInlayHints()
+  try
+    prop_type_add('SimpleCCInlay', {bufnr: bufnr('%'), highlight: 'SimpleCCInlayHint'})
+  catch
+  endtry
+  try
+    prop_remove({type: 'SimpleCCInlay', bufnr: bufnr('%'), all: true})
+  catch
+  endtry
+enddef
+
+def OnInlayHints(ev: dict<any>)
+  if !s_inlay_enabled
+    return
+  endif
+  var hints = get(ev, 'hints', [])
+  # Don't clear old hints if response is empty (server still loading)
+  if empty(hints)
+    return
+  endif
+  ClearInlayHints()
+  var bnr = bufnr('%')
+  try
+    prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
+  catch
+  endtry
+  for h in hints
+    var lnum = get(h, 'line', 0) + 1
+    var col = get(h, 'character', 0) + 1
+    var label = get(h, 'label', '')
+    var pad_l = get(h, 'padding_left', false)
+    var pad_r = get(h, 'padding_right', false)
+    var text = (pad_l ? ' ' : '') .. label .. (pad_r ? ' ' : '')
+    if lnum > 0 && lnum <= line('$')
+      try
+        prop_add(lnum, col, {type: 'SimpleCCInlay', text: text, bufnr: bnr})
+      catch
+      endtry
+    endif
+  endfor
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Call Hierarchy
+# ═════════════════════════════════════════════════════════
+
+var s_call_hierarchy_items: list<any> = []
+
+export def IncomingCalls()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  s_call_hierarchy_items = []
+  Send({
+    type: 'textDocument/prepareCallHierarchy',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+  # Store direction for when prepare result arrives
+  b:simplecc_call_direction = 'incoming'
+enddef
+
+export def OutgoingCalls()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  s_call_hierarchy_items = []
+  Send({
+    type: 'textDocument/prepareCallHierarchy',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+  b:simplecc_call_direction = 'outgoing'
+enddef
+
+def OnCallHierarchyPrepare(ev: dict<any>)
+  var items = get(ev, 'items', [])
+  if empty(items)
+    echo 'No call hierarchy item found'
+    return
+  endif
+  s_call_hierarchy_items = items
+  var item = items[0]
+  var raw = get(item, 'raw', {})
+  var direction = get(b:, 'simplecc_call_direction', 'incoming')
+  var req_type = direction ==# 'incoming' ? 'callHierarchy/incomingCalls' : 'callHierarchy/outgoingCalls'
+  Send({
+    type: req_type,
+    id: NextId(),
+    languageId: BufFt(),
+    item: raw,
+  })
+enddef
+
+def OnIncomingCallsResult(ev: dict<any>)
+  var calls = get(ev, 'calls', [])
+  if empty(calls)
+    echo 'No incoming calls'
+    return
+  endif
+  var qf_items: list<dict<any>> = []
+  for c in calls
+    var item = get(c, 'item', {})
+    var uri = get(item, 'uri', '')
+    var fpath = substitute(uri, '^file://', '', '')
+    add(qf_items, {
+      filename: fpath,
+      lnum: get(item, 'line', 0) + 1,
+      col: get(item, 'character', 0) + 1,
+      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
+    })
+  endfor
+  setqflist(qf_items)
+  copen
+enddef
+
+def OnOutgoingCallsResult(ev: dict<any>)
+  var calls = get(ev, 'calls', [])
+  if empty(calls)
+    echo 'No outgoing calls'
+    return
+  endif
+  var qf_items: list<dict<any>> = []
+  for c in calls
+    var item = get(c, 'item', {})
+    var uri = get(item, 'uri', '')
+    var fpath = substitute(uri, '^file://', '', '')
+    add(qf_items, {
+      filename: fpath,
+      lnum: get(item, 'line', 0) + 1,
+      col: get(item, 'character', 0) + 1,
+      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
+    })
+  endfor
+  setqflist(qf_items)
+  copen
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Selection Range (Smart Expand/Shrink)
+# ═════════════════════════════════════════════════════════
+
+var s_selection_ranges: list<any> = []
+var s_selection_idx: number = 0
+
+export def SelectionExpand()
+  if !s_initialized
+    return
+  endif
+  if empty(s_selection_ranges)
+    Send({
+      type: 'textDocument/selectionRange',
+      id: NextId(),
+      uri: BufUri(),
+      languageId: BufFt(),
+      positions: [{line: line('.') - 1, character: col('.') - 1}],
+    })
+    return
+  endif
+  # Expand to next parent
+  if s_selection_idx > 0
+    s_selection_idx -= 1
+  endif
+  ApplySelectionRange()
+enddef
+
+export def SelectionShrink()
+  if empty(s_selection_ranges)
+    return
+  endif
+  if s_selection_idx < len(s_selection_ranges) - 1
+    s_selection_idx += 1
+  endif
+  ApplySelectionRange()
+enddef
+
+def OnSelectionRange(ev: dict<any>)
+  var ranges = get(ev, 'ranges', [])
+  if empty(ranges)
+    return
+  endif
+  # Flatten the nested selection range into a list (outermost first)
+  s_selection_ranges = []
+  var r = ranges[0]
+  while type(r) == v:t_dict
+    add(s_selection_ranges, r)
+    r = get(r, 'parent', {})
+  endwhile
+  # Reverse so innermost is first
+  reverse(s_selection_ranges)
+  s_selection_idx = 0
+  ApplySelectionRange()
+enddef
+
+def ApplySelectionRange()
+  if empty(s_selection_ranges)
+    return
+  endif
+  var r = s_selection_ranges[s_selection_idx]
+  var sl = get(r, 'line', 0) + 1
+  var sc = get(r, 'character', 0) + 1
+  var el = get(r, 'end_line', 0) + 1
+  var ec = get(r, 'end_character', 0)
+  normal! v
+  cursor(sl, sc)
+  normal! o
+  cursor(el, ec)
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Semantic Tokens
+# ═════════════════════════════════════════════════════════
+
+export def SemanticTokens()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  Send({
+    type: 'textDocument/semanticTokens',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+  })
+enddef
+
+def OnSemanticTokens(ev: dict<any>)
+  var tokens = get(ev, 'tokens', [])
+  if empty(tokens)
+    echo 'No semantic tokens'
+    return
+  endif
+  var bnr = bufnr('%')
+  # Clear old semantic highlights
+  for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
+      'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
+      'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
+      'Number', 'Operator', 'Decorator']
+    var ptype = 'SimpleCCSemantic' .. tt
+    try
+      prop_type_add(ptype, {bufnr: bnr, highlight: 'SimpleCCSemantic' .. tt})
+    catch
+    endtry
+    try
+      prop_remove({type: ptype, bufnr: bnr, all: true})
+    catch
+    endtry
+  endfor
+
+  for t in tokens
+    var lnum = get(t, 'line', 0) + 1
+    var col = get(t, 'start', 0) + 1
+    var length = get(t, 'length', 0)
+    var ttype = get(t, 'token_type', '')
+    # Capitalize first letter for highlight group name
+    var hl_suffix = toupper(ttype[0]) .. ttype[1 :]
+    var ptype = 'SimpleCCSemantic' .. hl_suffix
+    if lnum > 0 && col > 0 && length > 0
+      try
+        prop_type_add(ptype, {bufnr: bnr, highlight: ptype})
+      catch
+      endtry
+      try
+        prop_add(lnum, col, {type: ptype, length: length, bufnr: bnr})
+      catch
+      endtry
+    endif
+  endfor
+  echo printf('[SimpleCC] Applied %d semantic tokens', len(tokens))
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Code Lens
+# ═════════════════════════════════════════════════════════
+
+export def CodeLens()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  Send({
+    type: 'textDocument/codeLens',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+  })
+enddef
+
+def OnCodeLens(ev: dict<any>)
+  var lenses = get(ev, 'lenses', [])
+  if empty(lenses)
+    echo 'No code lenses'
+    return
+  endif
+  var bnr = bufnr('%')
+  try
+    prop_type_add('SimpleCCCodeLens', {bufnr: bnr, highlight: 'Comment'})
+  catch
+  endtry
+  try
+    prop_remove({type: 'SimpleCCCodeLens', bufnr: bnr, all: true})
+  catch
+  endtry
+  for l in lenses
+    var lnum = get(l, 'line', 0) + 1
+    var title = get(l, 'command_title', '')
+    if title !=# '' && lnum > 0 && lnum <= line('$')
+      try
+        prop_add(lnum, 0, {type: 'SimpleCCCodeLens', text: '  ' .. title, text_align: 'after', bufnr: bnr})
+      catch
+      endtry
+    endif
+  endfor
+  echo printf('[SimpleCC] %d code lenses', len(lenses))
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Folding Range
+# ═════════════════════════════════════════════════════════
+
+export def FoldingRange()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  Send({
+    type: 'textDocument/foldingRange',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+  })
+enddef
+
+def OnFoldingRange(ev: dict<any>)
+  var ranges = get(ev, 'ranges', [])
+  if empty(ranges)
+    echo 'No folding ranges'
+    return
+  endif
+  setlocal foldmethod=manual
+  normal! zE
+  for r in ranges
+    var sl = get(r, 'start_line', 0) + 1
+    var el = get(r, 'end_line', 0) + 1
+    if el > sl
+      try
+        execute printf('%d,%dfold', sl, el)
+      catch
+      endtry
+    endif
+  endfor
+  echo printf('[SimpleCC] Created %d folds', len(ranges))
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Linked Editing Range
+# ═════════════════════════════════════════════════════════
+
+def OnLinkedEditingRange(ev: dict<any>)
+  # Placeholder for linked editing support
+  var result = get(ev, 'result', {})
+  if type(result) != v:t_dict
+    return
+  endif
+  var ranges = get(result, 'ranges', [])
+  if empty(ranges)
+    return
+  endif
+  echo printf('[SimpleCC] %d linked ranges', len(ranges))
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Progress
+# ═════════════════════════════════════════════════════════
+
+def OnProgress(ev: dict<any>)
+  var kind = get(ev, 'kind', '')
+  var title = get(ev, 'title', '')
+  var msg = get(ev, 'message', '')
+  var pct = get(ev, 'percentage', -1)
+  var server = get(ev, 'server', '')
+
+  if kind ==# 'begin'
+    g:simplecc_status = printf('%s: %s', server, title)
+  elseif kind ==# 'report'
+    if pct >= 0
+      g:simplecc_status = printf('%s: %s %d%%', server, msg !=# '' ? msg : title, pct)
+    elseif msg !=# ''
+      g:simplecc_status = printf('%s: %s', server, msg)
+    endif
+  elseif kind ==# 'end'
+    g:simplecc_status = server
+    if msg !=# ''
+      echo printf('[SimpleCC] %s', msg)
+    endif
+  endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Virtual Text Diagnostics
+# ═════════════════════════════════════════════════════════
+
+def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
+  if !g:simplecc_virtual_diag
+    return
+  endif
+  try
+    prop_type_add('SimpleCCVirtualDiag', {bufnr: bufnr, highlight: 'SimpleCCVirtualDiagError'})
+  catch
+  endtry
+  try
+    prop_remove({type: 'SimpleCCVirtualDiag', bufnr: bufnr, all: true})
+  catch
+  endtry
+  # Show one diagnostic per line (highest severity)
+  var line_diags: dict<dict<any>> = {}
+  for item in items
+    var lnum = get(item, 'line', 0) + 1
+    var key = string(lnum)
+    var sev = get(item, 'severity', 3)
+    if !has_key(line_diags, key) || sev < get(line_diags[key], 'severity', 99)
+      line_diags[key] = item
+    endif
+  endfor
+  for [key, item] in items(line_diags)
+    var lnum = str2nr(key)
+    var sev = get(item, 'severity', 3)
+    var msg = get(item, 'message', '')
+    # Truncate long messages
+    if len(msg) > 60
+      msg = msg[: 57] .. '...'
+    endif
+    # Replace newlines
+    msg = substitute(msg, "\n", ' ', 'g')
+    var hl = sev <= 1 ? 'SimpleCCVirtualDiagError' : 'SimpleCCVirtualDiagWarn'
+    try
+      prop_type_add('SimpleCCVirtualDiag', {bufnr: bufnr, highlight: hl})
+    catch
+    endtry
+    if lnum > 0 && lnum <= getbufinfo(bufnr)[0].linecount
+      try
+        prop_add(lnum, 0, {type: 'SimpleCCVirtualDiag', text: '  ' .. msg, text_align: 'after', bufnr: bufnr})
+      catch
+      endtry
+    endif
+  endfor
+enddef
+
+# ═════════════════════════════════════════════════════════
+# CursorHold handler (inlay hints refresh)
+# ═════════════════════════════════════════════════════════
+
+export def OnCursorHold()
+  if !s_initialized
+    return
+  endif
+  # Clear stale selection ranges
+  s_selection_ranges = []
 enddef
 
 # ═════════════════════════════════════════════════════════

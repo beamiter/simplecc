@@ -41,6 +41,13 @@ pub enum ServerEvent {
         id: Value,
         edit: types::WorkspaceEdit,
     },
+    Progress {
+        token: String,
+        kind: String,
+        title: String,
+        message: String,
+        percentage: Option<u64>,
+    },
 }
 
 impl LspClient {
@@ -458,6 +465,259 @@ impl LspClient {
 
         Ok(Some(sigs))
     }
+
+    pub async fn implementation(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
+        let result = self.request("textDocument/implementation", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        parse_locations(result)
+    }
+
+    pub async fn type_definition(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
+        let result = self.request("textDocument/typeDefinition", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        parse_locations(result)
+    }
+
+    pub async fn document_symbol(&self, uri: &str) -> Result<Vec<types::DocumentSymbolItem>> {
+        let result = self.request("textDocument/documentSymbol", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        // Try DocumentSymbol[] first, then SymbolInformation[]
+        if let Ok(syms) = serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone()) {
+            return Ok(convert_doc_symbols(&syms));
+        }
+        if let Ok(infos) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result) {
+            return Ok(infos.iter().map(|i| types::DocumentSymbolItem {
+                name: i.name.clone(),
+                kind: types::symbol_kind_label(i.kind).to_string(),
+                detail: None,
+                line: i.location.range.start.line,
+                character: i.location.range.start.character,
+                end_line: i.location.range.end.line,
+                end_character: i.location.range.end.character,
+                children: vec![],
+            }).collect());
+        }
+        Ok(vec![])
+    }
+
+    pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<types::DocumentSymbolItem>> {
+        let result = self.request("workspace/symbol", json!({
+            "query": query,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        if let Ok(infos) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result) {
+            return Ok(infos.iter().map(|i| types::DocumentSymbolItem {
+                name: i.name.clone(),
+                kind: types::symbol_kind_label(i.kind).to_string(),
+                detail: Some(i.location.uri.to_string()),
+                line: i.location.range.start.line,
+                character: i.location.range.start.character,
+                end_line: i.location.range.end.line,
+                end_character: i.location.range.end.character,
+                children: vec![],
+            }).collect());
+        }
+        Ok(vec![])
+    }
+
+    pub async fn document_highlight(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::DocumentHighlightItem>> {
+        let result = self.request("textDocument/documentHighlight", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let highlights: Vec<lsp_types::DocumentHighlight> = serde_json::from_value(result)?;
+        Ok(highlights.iter().map(|h| types::DocumentHighlightItem {
+            line: h.range.start.line,
+            character: h.range.start.character,
+            end_line: h.range.end.line,
+            end_character: h.range.end.character,
+            kind: types::highlight_kind_label(h.kind).to_string(),
+        }).collect())
+    }
+
+    pub async fn inlay_hints(&self, uri: &str, start_line: u32, end_line: u32) -> Result<Vec<types::InlayHintItem>> {
+        let result = self.request("textDocument/inlayHint", json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": 0 },
+                "end": { "line": end_line, "character": 0 },
+            },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let hints: Vec<lsp_types::InlayHint> = serde_json::from_value(result)?;
+        Ok(hints.iter().map(|h| {
+            let label = match &h.label {
+                lsp_types::InlayHintLabel::String(s) => s.clone(),
+                lsp_types::InlayHintLabel::LabelParts(parts) => {
+                    parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join("")
+                }
+            };
+            let kind = match h.kind {
+                Some(lsp_types::InlayHintKind::TYPE) => "type",
+                Some(lsp_types::InlayHintKind::PARAMETER) => "parameter",
+                _ => "other",
+            };
+            types::InlayHintItem {
+                line: h.position.line,
+                character: h.position.character,
+                label,
+                kind: kind.to_string(),
+                padding_left: h.padding_left.unwrap_or(false),
+                padding_right: h.padding_right.unwrap_or(false),
+            }
+        }).collect())
+    }
+
+    pub async fn call_hierarchy_prepare(&self, uri: &str, line: u32, character: u32) -> Result<Vec<lsp_types::CallHierarchyItem>> {
+        let result = self.request("textDocument/prepareCallHierarchy", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        Ok(serde_json::from_value(result)?)
+    }
+
+    pub async fn call_hierarchy_incoming(&self, item: &lsp_types::CallHierarchyItem) -> Result<Vec<types::CallHierarchyCall>> {
+        let result = self.request("callHierarchy/incomingCalls", json!({
+            "item": item,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let calls: Vec<lsp_types::CallHierarchyIncomingCall> = serde_json::from_value(result)?;
+        Ok(calls.iter().map(|c| types::CallHierarchyCall {
+            item: convert_call_hierarchy_item(&c.from),
+            from_ranges: c.from_ranges.iter().map(|r| types::RangeItem {
+                line: r.start.line, character: r.start.character,
+                end_line: r.end.line, end_character: r.end.character,
+            }).collect(),
+        }).collect())
+    }
+
+    pub async fn call_hierarchy_outgoing(&self, item: &lsp_types::CallHierarchyItem) -> Result<Vec<types::CallHierarchyCall>> {
+        let result = self.request("callHierarchy/outgoingCalls", json!({
+            "item": item,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let calls: Vec<lsp_types::CallHierarchyOutgoingCall> = serde_json::from_value(result)?;
+        Ok(calls.iter().map(|c| types::CallHierarchyCall {
+            item: convert_call_hierarchy_item(&c.to),
+            from_ranges: c.from_ranges.iter().map(|r| types::RangeItem {
+                line: r.start.line, character: r.start.character,
+                end_line: r.end.line, end_character: r.end.character,
+            }).collect(),
+        }).collect())
+    }
+
+    pub async fn selection_range(&self, uri: &str, positions: &[(u32, u32)]) -> Result<Vec<types::SelectionRangeItem>> {
+        let pos_arr: Vec<_> = positions.iter().map(|(l, c)| json!({"line": l, "character": c})).collect();
+        let result = self.request("textDocument/selectionRange", json!({
+            "textDocument": { "uri": uri },
+            "positions": pos_arr,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let ranges: Vec<lsp_types::SelectionRange> = serde_json::from_value(result)?;
+        Ok(ranges.iter().map(|r| convert_selection_range(r)).collect())
+    }
+
+    pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
+        let result = self.request("textDocument/semanticTokens/full", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
+        let caps = self.capabilities.lock().await;
+        let legend = caps.as_ref()
+            .and_then(|c| c.semantic_tokens_provider.as_ref())
+            .and_then(|p| match p {
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(o) => Some(&o.legend),
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(o) => Some(&o.semantic_tokens_options.legend),
+            });
+        let type_names: Vec<String> = legend.map(|l| l.token_types.iter().map(|t| t.as_str().to_string()).collect()).unwrap_or_default();
+        let mod_names: Vec<String> = legend.map(|l| l.token_modifiers.iter().map(|m| m.as_str().to_string()).collect()).unwrap_or_default();
+        drop(caps);
+
+        let mut decoded = Vec::new();
+        let mut line: u32 = 0;
+        let mut start: u32 = 0;
+        for token in tokens.data {
+            if token.delta_line > 0 {
+                line += token.delta_line;
+                start = token.delta_start;
+            } else {
+                start += token.delta_start;
+            }
+            let token_type = type_names.get(token.token_type as usize).cloned().unwrap_or_else(|| format!("type_{}", token.token_type));
+            let mut modifiers = Vec::new();
+            for (i, name) in mod_names.iter().enumerate() {
+                if token.token_modifiers_bitset & (1 << i) != 0 {
+                    modifiers.push(name.clone());
+                }
+            }
+            decoded.push(types::SemanticTokenItem {
+                line,
+                start,
+                length: token.length,
+                token_type,
+                modifiers,
+            });
+        }
+        Ok(decoded)
+    }
+
+    pub async fn code_lens(&self, uri: &str) -> Result<Vec<types::CodeLensItem>> {
+        let result = self.request("textDocument/codeLens", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let lenses: Vec<lsp_types::CodeLens> = serde_json::from_value(result)?;
+        Ok(lenses.iter().map(|l| types::CodeLensItem {
+            line: l.range.start.line,
+            character: l.range.start.character,
+            end_line: l.range.end.line,
+            end_character: l.range.end.character,
+            command_title: l.command.as_ref().map(|c| c.title.clone()),
+        }).collect())
+    }
+
+    pub async fn folding_range(&self, uri: &str) -> Result<Vec<types::FoldingRangeItem>> {
+        let result = self.request("textDocument/foldingRange", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let ranges: Vec<lsp_types::FoldingRange> = serde_json::from_value(result)?;
+        Ok(ranges.iter().map(|r| types::FoldingRangeItem {
+            start_line: r.start_line,
+            end_line: r.end_line,
+            kind: r.kind.as_ref().map(|k| match k {
+                lsp_types::FoldingRangeKind::Comment => "comment".to_string(),
+                lsp_types::FoldingRangeKind::Imports => "imports".to_string(),
+                lsp_types::FoldingRangeKind::Region => "region".to_string(),
+                _ => "other".to_string(),
+            }),
+        }).collect())
+    }
+
+    pub async fn linked_editing_range(&self, uri: &str, line: u32, character: u32) -> Result<Option<types::LinkedEditingRangeItem>> {
+        let result = self.request("textDocument/linkedEditingRange", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        if result.is_null() { return Ok(None); }
+        let ler: lsp_types::LinkedEditingRanges = serde_json::from_value(result)?;
+        Ok(Some(types::LinkedEditingRangeItem {
+            ranges: ler.ranges.iter().map(|r| types::RangeItem {
+                line: r.start.line, character: r.start.character,
+                end_line: r.end.line, end_character: r.end.character,
+            }).collect(),
+            word_pattern: ler.word_pattern,
+        }))
+    }
 }
 
 /// Parse GotoDefinitionResponse / locations.
@@ -484,6 +744,40 @@ fn parse_locations(result: Value) -> Result<Vec<types::Location>> {
         }).collect());
     }
     Ok(vec![])
+}
+
+fn convert_doc_symbols(syms: &[lsp_types::DocumentSymbol]) -> Vec<types::DocumentSymbolItem> {
+    syms.iter().map(|s| types::DocumentSymbolItem {
+        name: s.name.clone(),
+        kind: types::symbol_kind_label(s.kind).to_string(),
+        detail: s.detail.clone(),
+        line: s.selection_range.start.line,
+        character: s.selection_range.start.character,
+        end_line: s.range.end.line,
+        end_character: s.range.end.character,
+        children: s.children.as_ref().map(|c| convert_doc_symbols(c)).unwrap_or_default(),
+    }).collect()
+}
+
+fn convert_call_hierarchy_item(item: &lsp_types::CallHierarchyItem) -> types::CallHierarchyItem {
+    types::CallHierarchyItem {
+        name: item.name.clone(),
+        kind: types::symbol_kind_label(item.kind).to_string(),
+        uri: item.uri.to_string(),
+        line: item.selection_range.start.line,
+        character: item.selection_range.start.character,
+        detail: item.detail.clone(),
+    }
+}
+
+fn convert_selection_range(r: &lsp_types::SelectionRange) -> types::SelectionRangeItem {
+    types::SelectionRangeItem {
+        line: r.range.start.line,
+        character: r.range.start.character,
+        end_line: r.range.end.line,
+        end_character: r.range.end.character,
+        parent: r.parent.as_ref().map(|p| Box::new(convert_selection_range(p))),
+    }
 }
 
 /// Handle server-initiated requests (workspace/applyEdit, etc.)
@@ -579,9 +873,25 @@ async fn handle_server_notification(
             };
             let _ = event_tx.send(event).await;
         }
-        "$/progress" | "window/workDoneProgress" => {
-            // Silently ignore progress notifications for now
+        "$/progress" => {
+            // Forward progress to Vim
+            if let Some(token) = params.get("token") {
+                if let Some(value) = params.get("value") {
+                    let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                    let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                    let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                    let percentage = value.get("percentage").and_then(|p| p.as_u64());
+                    let _ = event_tx.send(ServerEvent::Progress {
+                        token: token.to_string(),
+                        kind: kind.to_string(),
+                        title: title.to_string(),
+                        message: message.to_string(),
+                        percentage,
+                    }).await;
+                }
+            }
         }
+        "window/workDoneProgress" => {}
         _ => {
             // Ignore unknown notifications
         }
@@ -652,6 +962,81 @@ fn client_capabilities() -> ClientCapabilities {
                 did_save: Some(true),
                 ..Default::default()
             }),
+            implementation: Some(GotoCapability {
+                link_support: Some(true),
+                ..Default::default()
+            }),
+            type_definition: Some(GotoCapability {
+                link_support: Some(true),
+                ..Default::default()
+            }),
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
+            }),
+            document_highlight: Some(DocumentHighlightClientCapabilities {
+                ..Default::default()
+            }),
+            inlay_hint: Some(InlayHintClientCapabilities {
+                ..Default::default()
+            }),
+            call_hierarchy: Some(CallHierarchyClientCapabilities {
+                ..Default::default()
+            }),
+            selection_range: Some(SelectionRangeClientCapabilities {
+                ..Default::default()
+            }),
+            semantic_tokens: Some(SemanticTokensClientCapabilities {
+                requests: SemanticTokensClientCapabilitiesRequests {
+                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    ..Default::default()
+                },
+                token_types: vec![
+                    SemanticTokenType::NAMESPACE,
+                    SemanticTokenType::TYPE,
+                    SemanticTokenType::CLASS,
+                    SemanticTokenType::ENUM,
+                    SemanticTokenType::INTERFACE,
+                    SemanticTokenType::STRUCT,
+                    SemanticTokenType::TYPE_PARAMETER,
+                    SemanticTokenType::PARAMETER,
+                    SemanticTokenType::VARIABLE,
+                    SemanticTokenType::PROPERTY,
+                    SemanticTokenType::ENUM_MEMBER,
+                    SemanticTokenType::EVENT,
+                    SemanticTokenType::FUNCTION,
+                    SemanticTokenType::METHOD,
+                    SemanticTokenType::MACRO,
+                    SemanticTokenType::KEYWORD,
+                    SemanticTokenType::MODIFIER,
+                    SemanticTokenType::COMMENT,
+                    SemanticTokenType::STRING,
+                    SemanticTokenType::NUMBER,
+                    SemanticTokenType::REGEXP,
+                    SemanticTokenType::OPERATOR,
+                    SemanticTokenType::DECORATOR,
+                ],
+                token_modifiers: vec![
+                    SemanticTokenModifier::DECLARATION,
+                    SemanticTokenModifier::DEFINITION,
+                    SemanticTokenModifier::READONLY,
+                    SemanticTokenModifier::STATIC,
+                    SemanticTokenModifier::DEPRECATED,
+                    SemanticTokenModifier::ABSTRACT,
+                    SemanticTokenModifier::ASYNC,
+                    SemanticTokenModifier::MODIFICATION,
+                    SemanticTokenModifier::DOCUMENTATION,
+                    SemanticTokenModifier::DEFAULT_LIBRARY,
+                ],
+                formats: vec![lsp_types::TokenFormat::RELATIVE],
+                ..Default::default()
+            }),
+            folding_range: Some(FoldingRangeClientCapabilities {
+                ..Default::default()
+            }),
+            linked_editing_range: Some(LinkedEditingRangeClientCapabilities {
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
@@ -661,6 +1046,9 @@ fn client_capabilities() -> ClientCapabilities {
                 ..Default::default()
             }),
             workspace_folders: Some(true),
+            symbol: Some(WorkspaceSymbolClientCapabilities {
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()

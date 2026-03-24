@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
+use lsp::types;
 
 // ─── Vim → Daemon request types ──────────────────────────
 
@@ -143,6 +144,88 @@ enum Request {
         language_id: String,
         line: u32,
         character: u32,
+    },
+
+    #[serde(rename = "textDocument/implementation")]
+    Implementation {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
+    },
+    #[serde(rename = "textDocument/typeDefinition")]
+    TypeDefinition {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
+    },
+    #[serde(rename = "textDocument/documentSymbol")]
+    DocumentSymbol {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+    #[serde(rename = "workspace/symbol")]
+    WorkspaceSymbol {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        query: String,
+    },
+    #[serde(rename = "textDocument/documentHighlight")]
+    DocumentHighlight {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
+    },
+    #[serde(rename = "textDocument/inlayHint")]
+    InlayHint {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        #[serde(rename = "startLine")] start_line: u32,
+        #[serde(rename = "endLine")] end_line: u32,
+    },
+    #[serde(rename = "textDocument/prepareCallHierarchy")]
+    PrepareCallHierarchy {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
+    },
+    #[serde(rename = "callHierarchy/incomingCalls")]
+    IncomingCalls {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        item: serde_json::Value,
+    },
+    #[serde(rename = "callHierarchy/outgoingCalls")]
+    OutgoingCalls {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        item: serde_json::Value,
+    },
+    #[serde(rename = "textDocument/selectionRange")]
+    SelectionRange {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        positions: Vec<serde_json::Value>,
+    },
+    #[serde(rename = "textDocument/semanticTokens")]
+    SemanticTokensFull {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+    #[serde(rename = "textDocument/codeLens")]
+    CodeLens {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+    #[serde(rename = "textDocument/foldingRange")]
+    FoldingRange {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+    #[serde(rename = "textDocument/linkedEditingRange")]
+    LinkedEditingRange {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
     },
 
     // Server install
@@ -454,6 +537,207 @@ async fn handle_request(
                     match c.signature_help(&uri, line, character).await {
                         Ok(Some(sigs)) => send_event(&out, json!({"type": "signatureHelp", "id": id, "signatures": sigs})),
                         Ok(None) => send_event(&out, json!({"type": "signatureHelp", "id": id, "signatures": null})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::Implementation { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.implementation(&uri, line, character).await {
+                        Ok(locs) => send_event(&out, json!({"type": "implementation", "id": id, "locations": locs})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::TypeDefinition { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.type_definition(&uri, line, character).await {
+                        Ok(locs) => send_event(&out, json!({"type": "typeDefinition", "id": id, "locations": locs})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::DocumentSymbol { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.document_symbol(&uri).await {
+                        Ok(symbols) => send_event(&out, json!({"type": "documentSymbol", "id": id, "symbols": symbols})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::WorkspaceSymbol { id, language_id, query } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.workspace_symbol(&query).await {
+                        Ok(symbols) => send_event(&out, json!({"type": "workspaceSymbol", "id": id, "symbols": symbols})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::DocumentHighlight { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.document_highlight(&uri, line, character).await {
+                        Ok(highlights) => send_event(&out, json!({"type": "documentHighlight", "id": id, "highlights": highlights})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::InlayHint { id, uri, language_id, start_line, end_line } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.inlay_hints(&uri, start_line, end_line).await {
+                        Ok(hints) => send_event(&out, json!({"type": "inlayHint", "id": id, "hints": hints})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::PrepareCallHierarchy { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.call_hierarchy_prepare(&uri, line, character).await {
+                        Ok(items) => {
+                            let converted: Vec<_> = items.iter().map(|i| json!({
+                                "name": i.name,
+                                "kind": types::symbol_kind_label(i.kind),
+                                "uri": i.uri.to_string(),
+                                "line": i.selection_range.start.line,
+                                "character": i.selection_range.start.character,
+                                "detail": i.detail,
+                                "raw": serde_json::to_value(i).ok(),
+                            })).collect();
+                            send_event(&out, json!({"type": "callHierarchyPrepare", "id": id, "items": converted}));
+                        }
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::IncomingCalls { id, language_id, item } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    if let Ok(lsp_item) = serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
+                        match c.call_hierarchy_incoming(&lsp_item).await {
+                            Ok(calls) => send_event(&out, json!({"type": "incomingCalls", "id": id, "calls": calls})),
+                            Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        }
+                    }
+                }
+            }
+        }
+
+        Request::OutgoingCalls { id, language_id, item } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    if let Ok(lsp_item) = serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
+                        match c.call_hierarchy_outgoing(&lsp_item).await {
+                            Ok(calls) => send_event(&out, json!({"type": "outgoingCalls", "id": id, "calls": calls})),
+                            Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        }
+                    }
+                }
+            }
+        }
+
+        Request::SelectionRange { id, uri, language_id, positions } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    let pos: Vec<(u32, u32)> = positions.iter().filter_map(|p| {
+                        Some((p.get("line")?.as_u64()? as u32, p.get("character")?.as_u64()? as u32))
+                    }).collect();
+                    match c.selection_range(&uri, &pos).await {
+                        Ok(ranges) => send_event(&out, json!({"type": "selectionRange", "id": id, "ranges": ranges})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::SemanticTokensFull { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.semantic_tokens_full(&uri).await {
+                        Ok(tokens) => send_event(&out, json!({"type": "semanticTokens", "id": id, "tokens": tokens})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::CodeLens { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.code_lens(&uri).await {
+                        Ok(lenses) => send_event(&out, json!({"type": "codeLens", "id": id, "lenses": lenses})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::FoldingRange { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.folding_range(&uri).await {
+                        Ok(ranges) => send_event(&out, json!({"type": "foldingRange", "id": id, "ranges": ranges})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::LinkedEditingRange { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.linked_editing_range(&uri, line, character).await {
+                        Ok(Some(ranges)) => send_event(&out, json!({"type": "linkedEditingRange", "id": id, "result": ranges})),
+                        Ok(None) => send_event(&out, json!({"type": "linkedEditingRange", "id": id, "result": null})),
                         Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
                     }
                 }

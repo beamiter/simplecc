@@ -27,6 +27,8 @@ g:simplecc_sign_warn       = get(g:, 'simplecc_sign_warn', 'W>')
 g:simplecc_sign_info       = get(g:, 'simplecc_sign_info', 'I>')
 g:simplecc_sign_hint       = get(g:, 'simplecc_sign_hint', 'H>')
 g:simplecc_auto_install    = get(g:, 'simplecc_auto_install', 0)
+g:simplecc_inlay_hints     = get(g:, 'simplecc_inlay_hints', 1)
+g:simplecc_virtual_diag    = get(g:, 'simplecc_virtual_diag', 1)
 g:simplecc_status          = ''
 
 # ─── Commands ─────────────────────────────────────────────
@@ -46,6 +48,20 @@ command! -nargs=0 SimpleCCNextDiag      simplecc#DiagNext()
 command! -nargs=0 SimpleCCPrevDiag      simplecc#DiagPrev()
 command! -nargs=0 SimpleCCSignatureHelp simplecc#SignatureHelp()
 command! -nargs=0 SimpleCCLog           simplecc#ShowLog()
+command! -nargs=0 SimpleCCImplementation  simplecc#Implementation()
+command! -nargs=0 SimpleCCTypeDef       simplecc#TypeDefinition()
+command! -nargs=0 SimpleCCOutline       simplecc#DocumentSymbol()
+command! -nargs=? SimpleCCWorkspaceSymbol simplecc#WorkspaceSymbol(<q-args>)
+command! -nargs=0 SimpleCCHighlight     simplecc#DocumentHighlight()
+command! -nargs=0 SimpleCCHighlightClear simplecc#DocumentHighlightClear()
+command! -nargs=0 SimpleCCInlayHints    simplecc#InlayHintsToggle()
+command! -nargs=0 SimpleCCIncomingCalls simplecc#IncomingCalls()
+command! -nargs=0 SimpleCCOutgoingCalls simplecc#OutgoingCalls()
+command! -nargs=0 SimpleCCSelExpand     simplecc#SelectionExpand()
+command! -nargs=0 SimpleCCSelShrink     simplecc#SelectionShrink()
+command! -nargs=0 SimpleCCSemanticTokens simplecc#SemanticTokens()
+command! -nargs=0 SimpleCCCodeLens      simplecc#CodeLens()
+command! -nargs=0 SimpleCCFold          simplecc#FoldingRange()
 command! -nargs=? -complete=custom,SimpleCCInstallComplete SimpleCCInstall simplecc#InstallServer(<q-args>)
 command! -nargs=0 SimpleCCServers       simplecc#ListServers()
 
@@ -63,6 +79,10 @@ if !g:simplecc_no_default_maps
   nnoremap <silent> <leader>f  :SimpleCCFormat<CR>
   nnoremap <silent> [d         :SimpleCCPrevDiag<CR>
   nnoremap <silent> ]d         :SimpleCCNextDiag<CR>
+  nnoremap <silent> gi         :SimpleCCImplementation<CR>
+  nnoremap <silent> gy         :SimpleCCTypeDef<CR>
+  nnoremap <silent> <leader>o  :SimpleCCOutline<CR>
+  nnoremap <silent> <leader>ih :SimpleCCInlayHints<CR>
 endif
 
 # ─── Signs ────────────────────────────────────────────────
@@ -83,6 +103,33 @@ highlight default link SimpleCCInfoHL    SpellLocal
 highlight default link SimpleCCHintHL    SpellRare
 highlight default link SimpleCCFloatBorder FloatBorder
 highlight default link SimpleCCPmenuSel  PmenuSel
+highlight default SimpleCCInlayHint guifg=#7f848e ctermfg=245
+highlight default link SimpleCCDocHighlightRead Search
+highlight default link SimpleCCDocHighlightWrite IncSearch
+highlight default link SimpleCCDocHighlightText CursorLine
+highlight default link SimpleCCVirtualDiagError DiagnosticVirtualTextError
+highlight default link SimpleCCVirtualDiagWarn  DiagnosticVirtualTextWarn
+# Semantic token highlights
+highlight default link SimpleCCSemanticNamespace Include
+highlight default link SimpleCCSemanticType      Type
+highlight default link SimpleCCSemanticClass     Type
+highlight default link SimpleCCSemanticEnum      Type
+highlight default link SimpleCCSemanticInterface Type
+highlight default link SimpleCCSemanticStruct    Type
+highlight default link SimpleCCSemanticTypeParameter Type
+highlight default link SimpleCCSemanticParameter Identifier
+highlight default link SimpleCCSemanticVariable  Identifier
+highlight default link SimpleCCSemanticProperty  Identifier
+highlight default link SimpleCCSemanticEnumMember Constant
+highlight default link SimpleCCSemanticFunction  Function
+highlight default link SimpleCCSemanticMethod    Function
+highlight default link SimpleCCSemanticMacro     Macro
+highlight default link SimpleCCSemanticKeyword   Keyword
+highlight default link SimpleCCSemanticComment   Comment
+highlight default link SimpleCCSemanticString    String
+highlight default link SimpleCCSemanticNumber    Number
+highlight default link SimpleCCSemanticOperator  Operator
+highlight default link SimpleCCSemanticDecorator PreProc
 
 # ─── Autocmds ─────────────────────────────────────────────
 augroup simplecc
@@ -96,4 +143,5 @@ augroup simplecc
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
   autocmd InsertLeave * simplecc#OnInsertLeave()
   autocmd CompleteChanged * simplecc#OnCompleteChanged()
+  autocmd CursorHold * simplecc#OnCursorHold()
 augroup END
