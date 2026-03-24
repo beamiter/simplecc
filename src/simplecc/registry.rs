@@ -52,18 +52,23 @@ impl Registry {
             return Ok(Some(name));
         }
 
-        // Check if command is available
-        if !is_command_available(&cfg.command) {
-            eprintln!("[simplecc] command not found: {}", cfg.command);
-            let event = serde_json::json!({
-                "type": "serverStatus",
-                "server": name,
-                "status": "error",
-                "message": format!("command not found: {}", cfg.command),
-            });
-            let _ = self.event_tx.send(serde_json::to_string(&event).unwrap()).await;
-            return Ok(None);
-        }
+        // Resolve command: PATH -> absolute path -> managed install
+        let resolved_cmd = match resolve_command(&cfg.command) {
+            Some(cmd) => cmd,
+            None => {
+                eprintln!("[simplecc] command not found: {}", cfg.command);
+                let installable = super::installer::is_known_server(&name);
+                let event = serde_json::json!({
+                    "type": "serverStatus",
+                    "server": name,
+                    "status": "notFound",
+                    "message": format!("command not found: {}", cfg.command),
+                    "installable": installable,
+                });
+                let _ = self.event_tx.send(serde_json::to_string(&event).unwrap()).await;
+                return Ok(None);
+            }
+        };
 
         // Start server
         let root_uri = format!("file://{}", self.root_dir);
@@ -79,22 +84,22 @@ impl Registry {
 
         match LspClient::start(
             &name,
-            &cfg.command,
+            &resolved_cmd,
             &cfg.args,
             &root_uri,
             &self.root_dir,
             cfg.initialization_options.clone(),
         ).await {
-            Ok(client) => {
+            Ok((client, event_rx)) => {
                 let client = Arc::new(Mutex::new(client));
                 self.clients.insert(name.clone(), client.clone());
                 self.ft_map.insert(filetype.to_string(), name.clone());
 
-                // Spawn event forwarder
+                // Spawn event forwarder with the receiver directly (no client lock needed)
                 let server_name = name.clone();
                 let event_tx2 = self.event_tx.clone();
                 tokio::spawn(async move {
-                    forward_server_events(client, &server_name, event_tx2).await;
+                    forward_server_events(event_rx, &server_name, event_tx2).await;
                 });
 
                 // Notify running
@@ -142,6 +147,13 @@ impl Registry {
         }
     }
 
+    /// Update the command path for a server (after installation).
+    pub fn update_server_command(&mut self, name: &str, command: &str) {
+        if let Some(cfg) = self.config.language_servers.get_mut(name) {
+            cfg.command = command.to_string();
+        }
+    }
+
     /// List all active servers.
     #[allow(dead_code)]
     pub fn active_servers(&self) -> Vec<String> {
@@ -150,18 +162,15 @@ impl Registry {
 }
 
 /// Forward server events (diagnostics, messages) to Vim via stdout.
+/// Takes the receiver directly — no client lock needed, eliminating deadlocks.
 async fn forward_server_events(
-    client: Arc<Mutex<LspClient>>,
+    mut event_rx: tokio::sync::mpsc::Receiver<ServerEvent>,
     server_name: &str,
     event_tx: EventTx,
 ) {
-    loop {
-        let event = {
-            let mut c = client.lock().await;
-            c.server_events.recv().await
-        };
+    while let Some(event) = event_rx.recv().await {
         match event {
-            Some(ServerEvent::Diagnostics { uri, diagnostics }) => {
+            ServerEvent::Diagnostics { uri, diagnostics } => {
                 let ev = serde_json::json!({
                     "type": "diagnostics",
                     "uri": uri,
@@ -169,7 +178,7 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            Some(ServerEvent::LogMessage { level, message }) => {
+            ServerEvent::LogMessage { level, message } => {
                 let ev = serde_json::json!({
                     "type": "log",
                     "server": server_name,
@@ -178,7 +187,7 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            Some(ServerEvent::ShowMessage { level, message }) => {
+            ServerEvent::ShowMessage { level, message } => {
                 let ev = serde_json::json!({
                     "type": "showMessage",
                     "server": server_name,
@@ -187,19 +196,52 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            Some(ServerEvent::ApplyEdit { id: _, edit }) => {
+            ServerEvent::ApplyEdit { id: _, edit } => {
                 let ev = serde_json::json!({
                     "type": "applyEdit",
                     "edit": edit,
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            None => break, // Channel closed
         }
     }
 }
 
-fn is_command_available(cmd: &str) -> bool {
-    which::which(cmd).is_ok()
-        || std::path::Path::new(cmd).exists()
+/// Resolve the actual command path: check managed installs first, then PATH.
+/// Managed installs take priority because PATH may contain broken proxies
+/// (e.g. rustup shims for components not installed in the toolchain).
+fn resolve_command(cmd: &str) -> Option<String> {
+    // 1. Check managed install directory first
+    if let Some(path) = super::installer::installed_binary_path(cmd) {
+        if path.exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    // 2. Check if it's an absolute path
+    if std::path::Path::new(cmd).is_absolute() && std::path::Path::new(cmd).exists() {
+        return Some(cmd.to_string());
+    }
+    // 3. Search PATH, but verify the binary is actually executable (not a broken proxy)
+    if let Ok(p) = which::which(cmd) {
+        if verify_executable(&p) {
+            return Some(p.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Verify a binary is actually runnable (not a broken rustup shim, etc.)
+fn verify_executable(path: &std::path::Path) -> bool {
+    // If it's a symlink, check if the target resolves.
+    // Rustup proxies are symlinks to `rustup` itself, which then fails.
+    // Quick heuristic: try running with --version and check exit code.
+    match std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
 }

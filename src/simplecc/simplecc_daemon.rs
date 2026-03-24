@@ -1,4 +1,5 @@
 mod config;
+mod installer;
 mod lsp;
 mod registry;
 
@@ -142,6 +143,17 @@ enum Request {
         language_id: String,
         line: u32,
         character: u32,
+    },
+
+    // Server install
+    #[serde(rename = "server/install")]
+    InstallServer {
+        id: u64,
+        server: String,
+    },
+    #[serde(rename = "server/listInstallable")]
+    ListInstallable {
+        id: u64,
     },
 }
 
@@ -316,29 +328,52 @@ async fn handle_request(
         }
 
         Request::Hover { id, uri, language_id, line, character } => {
+            eprintln!("[simplecc] hover request: uri={} lang={} line={} char={}", uri, language_id, line, character);
             let r = registry.lock().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
                     let c = client.lock().await;
                     match c.hover(&uri, line, character).await {
-                        Ok(Some(contents)) => send_event(&out, json!({"type": "hover", "id": id, "contents": contents})),
-                        Ok(None) => send_event(&out, json!({"type": "hover", "id": id, "contents": null})),
-                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        Ok(Some(contents)) => {
+                            eprintln!("[simplecc] hover result: {} bytes", contents.len());
+                            send_event(&out, json!({"type": "hover", "id": id, "contents": contents}));
+                        }
+                        Ok(None) => {
+                            eprintln!("[simplecc] hover result: none");
+                            send_event(&out, json!({"type": "hover", "id": id, "contents": null}));
+                        }
+                        Err(e) => {
+                            eprintln!("[simplecc] hover error: {}", e);
+                            send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()}));
+                        }
                     }
+                } else {
+                    eprintln!("[simplecc] hover: no client for filetype: {}", language_id);
                 }
             }
         }
 
         Request::Definition { id, uri, language_id, line, character } => {
+            eprintln!("[simplecc] definition request: uri={} lang={} line={} char={}", uri, language_id, line, character);
             let r = registry.lock().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
                     let c = client.lock().await;
                     match c.definition(&uri, line, character).await {
-                        Ok(locs) => send_event(&out, json!({"type": "definition", "id": id, "locations": locs})),
-                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        Ok(locs) => {
+                            eprintln!("[simplecc] definition result: {} locations", locs.len());
+                            send_event(&out, json!({"type": "definition", "id": id, "locations": locs}));
+                        }
+                        Err(e) => {
+                            eprintln!("[simplecc] definition error: {}", e);
+                            send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()}));
+                        }
                     }
+                } else {
+                    eprintln!("[simplecc] no client for filetype: {}", language_id);
                 }
+            } else {
+                eprintln!("[simplecc] registry not initialized");
             }
         }
 
@@ -423,6 +458,49 @@ async fn handle_request(
                     }
                 }
             }
+        }
+
+        Request::InstallServer { id, server } => {
+            let out_clone = out.clone();
+            let reg_clone = registry.clone();
+            // Spawn install in background so it doesn't block the main loop
+            tokio::spawn(async move {
+                match installer::install_server(&server, &out_clone).await {
+                    Ok(path) => {
+                        send_event(&out_clone, json!({
+                            "type": "installResult",
+                            "id": id,
+                            "server": server,
+                            "status": "ok",
+                            "path": path.to_string_lossy(),
+                        }));
+                        // Update registry so the server can be started with the new path
+                        let mut r = reg_clone.lock().await;
+                        if let Some(ref mut reg) = *r {
+                            reg.update_server_command(&server, &path.to_string_lossy());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[simplecc] install {} failed: {}", server, e);
+                        send_event(&out_clone, json!({
+                            "type": "installResult",
+                            "id": id,
+                            "server": server,
+                            "status": "error",
+                            "message": e.to_string(),
+                        }));
+                    }
+                }
+            });
+        }
+
+        Request::ListInstallable { id } => {
+            let servers = installer::list_installable();
+            send_event(&out, json!({
+                "type": "installableServers",
+                "id": id,
+                "servers": servers,
+            }));
         }
     }
 }

@@ -26,6 +26,7 @@ g:simplecc_sign_error      = get(g:, 'simplecc_sign_error', 'E>')
 g:simplecc_sign_warn       = get(g:, 'simplecc_sign_warn', 'W>')
 g:simplecc_sign_info       = get(g:, 'simplecc_sign_info', 'I>')
 g:simplecc_sign_hint       = get(g:, 'simplecc_sign_hint', 'H>')
+g:simplecc_auto_install    = get(g:, 'simplecc_auto_install', 0)
 g:simplecc_status          = ''
 
 # ─── Commands ─────────────────────────────────────────────
@@ -45,6 +46,12 @@ command! -nargs=0 SimpleCCNextDiag      simplecc#DiagNext()
 command! -nargs=0 SimpleCCPrevDiag      simplecc#DiagPrev()
 command! -nargs=0 SimpleCCSignatureHelp simplecc#SignatureHelp()
 command! -nargs=0 SimpleCCLog           simplecc#ShowLog()
+command! -nargs=? -complete=custom,SimpleCCInstallComplete SimpleCCInstall simplecc#InstallServer(<q-args>)
+command! -nargs=0 SimpleCCServers       simplecc#ListServers()
+
+def SimpleCCInstallComplete(arglead: string, cmdline: string, cursorpos: number): string
+  return "rust-analyzer\nclangd\npyright\nlua-language-server\ngopls"
+enddef
 
 # ─── Keymaps ──────────────────────────────────────────────
 if !g:simplecc_no_default_maps

@@ -202,6 +202,15 @@ def OnBackendEvent(line: string)
   elseif ev.type ==# 'serverStatus'
     OnServerStatus(ev)
 
+  elseif ev.type ==# 'installProgress'
+    OnInstallProgress(ev)
+
+  elseif ev.type ==# 'installResult'
+    OnInstallResult(ev)
+
+  elseif ev.type ==# 'installableServers'
+    OnInstallableServers(ev)
+
   elseif ev.type ==# 'showMessage'
     var lvl = get(ev, 'level', 'info')
     var msg = get(ev, 'message', '')
@@ -976,6 +985,14 @@ def OnServerStatus(ev: dict<any>)
 
   if status ==# 'running'
     g:simplecc_status = server
+  elseif status ==# 'notFound' && get(ev, 'installable', false)
+    if g:simplecc_auto_install
+      DoInstall(server)
+    else
+      echohl WarningMsg
+      echom printf('[SimpleCC] %s not found. Run :SimpleCCInstall %s to install.', server, server)
+      echohl None
+    endif
   elseif status ==# 'error'
     echohl ErrorMsg
     echom printf('[SimpleCC] %s: %s', server, msg)
@@ -1198,6 +1215,113 @@ export def OpenConfig()
     setlocal filetype=json
   endif
 enddef
+
+# ═════════════════════════════════════════════════════════
+# Server install
+# ═════════════════════════════════════════════════════════
+
+export def InstallServer(name: string = '')
+  if !IsRunning()
+    if !EnsureBackend()
+      return
+    endif
+  endif
+
+  var server = name
+  if server ==# ''
+    var servers = ['rust-analyzer', 'clangd', 'pyright', 'lua-language-server', 'gopls']
+    popup_menu(servers, {
+      title: ' Install Language Server ',
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+      padding: [0, 1, 0, 1],
+      callback: (_, idx) => {
+        if idx > 0
+          DoInstall(servers[idx - 1])
+        endif
+      },
+    })
+    return
+  endif
+
+  DoInstall(server)
+enddef
+
+def DoInstall(server: string)
+  echom printf('[SimpleCC] Installing %s...', server)
+  Send({
+    type: 'server/install',
+    id: NextId(),
+    server: server,
+  })
+enddef
+
+export def ListServers()
+  if !IsRunning()
+    echom '[SimpleCC] not running'
+    return
+  endif
+  Send({
+    type: 'server/listInstallable',
+    id: NextId(),
+  })
+enddef
+
+def OnInstallProgress(ev: dict<any>)
+  var server = get(ev, 'server', '')
+  var stage = get(ev, 'stage', '')
+  var pct = get(ev, 'percent', 0)
+  echo printf('[SimpleCC] %s: %s %d%%', server, stage, pct)
+  redrawstatus
+enddef
+
+def OnInstallResult(ev: dict<any>)
+  var server = get(ev, 'server', '')
+  var status = get(ev, 'status', '')
+  if status ==# 'ok'
+    var path = get(ev, 'path', '')
+    echohl ModeMsg
+    echom printf('[SimpleCC] %s installed successfully: %s', server, path)
+    echohl None
+    # Re-trigger buffer open to start the server
+    var ft = &filetype
+    if ft !=# '' && bufname('%') !=# ''
+      SendDidOpen(bufnr('%'))
+    endif
+  else
+    echohl ErrorMsg
+    echom printf('[SimpleCC] %s install failed: %s', server, get(ev, 'message', ''))
+    echohl None
+  endif
+enddef
+
+def OnInstallableServers(ev: dict<any>)
+  var servers = get(ev, 'servers', [])
+  if empty(servers)
+    echo '[SimpleCC] No installable servers'
+    return
+  endif
+  var lines = ['Language Servers:', '']
+  for s in servers
+    var name = get(s, 'name', '')
+    var installed = get(s, 'installed', false)
+    var path = get(s, 'path', '')
+    if installed
+      add(lines, printf('  ✓ %s  (%s)', name, path))
+    else
+      add(lines, printf('  ✗ %s  (not installed)', name))
+    endif
+  endfor
+
+  new
+  setlocal buftype=nofile bufhidden=wipe noswapfile
+  setline(1, lines)
+  setlocal nomodifiable
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Helpers
+# ═════════════════════════════════════════════════════════
 
 def FindProjectRoot(): string
   var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'pyproject.toml',

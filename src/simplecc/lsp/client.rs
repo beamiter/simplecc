@@ -19,8 +19,6 @@ pub struct LspClient {
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
     pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeAction>>>,
-    /// Channel for server-initiated events (diagnostics, log, etc.)
-    pub server_events: mpsc::Receiver<ServerEvent>,
     server_name: String,
 }
 
@@ -47,6 +45,8 @@ pub enum ServerEvent {
 
 impl LspClient {
     /// Start a new LSP server and perform the initialize handshake.
+    /// Returns (client, server_events_receiver) — the receiver is separate
+    /// to avoid holding the client lock while waiting for server events.
     pub async fn start(
         server_name: &str,
         cmd: &str,
@@ -54,7 +54,7 @@ impl LspClient {
         root_uri: &str,
         root_path: &str,
         init_options: Option<Value>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
         let (transport, mut incoming) =
             LspTransport::spawn(cmd, args, Some(root_path))?;
 
@@ -103,14 +103,13 @@ impl LspClient {
             pending,
             capabilities,
             cached_actions: Arc::new(Mutex::new(Vec::new())),
-            server_events: event_rx,
             server_name: server_name.to_string(),
         };
 
         // Initialize
         client.initialize(root_uri, root_path, init_options).await?;
 
-        Ok(client)
+        Ok((client, event_rx))
     }
 
     fn next_request_id(&self) -> i64 {
@@ -138,7 +137,7 @@ impl LspClient {
             t.send(&msg).await?;
         }
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), rx).await??;
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(120), rx).await??;
 
         if let Some(err) = resp.get("error") {
             bail!("LSP error: {}", err);
