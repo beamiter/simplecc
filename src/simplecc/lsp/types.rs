@@ -16,6 +16,11 @@ pub struct CompletionItem {
     pub sort_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter_text: Option<String>,
+    /// Index for completionItem/resolve
+    pub index: usize,
+    /// Whether this item uses snippet syntax
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_snippet: Option<bool>,
 }
 
 /// Location for definition / references.
@@ -186,6 +191,8 @@ pub struct CodeLensItem {
     pub end_character: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_title: Option<String>,
+    /// Index for codeLens/execute
+    pub index: usize,
 }
 
 /// Folding range.

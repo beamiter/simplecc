@@ -14,8 +14,8 @@ pub struct Registry {
     config: Config,
     /// server_name -> LspClient
     clients: HashMap<String, Arc<Mutex<LspClient>>>,
-    /// filetype -> server_name
-    ft_map: HashMap<String, String>,
+    /// filetype -> list of server_names (supports multi-server per filetype)
+    ft_map: HashMap<String, Vec<String>>,
     root_dir: String,
     event_tx: EventTx,
 }
@@ -33,10 +33,12 @@ impl Registry {
 
     /// Ensure the server for a given filetype is started. Returns server name if available.
     pub async fn ensure_server(&mut self, filetype: &str) -> Result<Option<String>> {
-        // Already mapped?
-        if let Some(name) = self.ft_map.get(filetype) {
-            if self.clients.contains_key(name) {
-                return Ok(Some(name.clone()));
+        // Already mapped and running?
+        if let Some(names) = self.ft_map.get(filetype) {
+            if let Some(name) = names.first() {
+                if self.clients.contains_key(name) {
+                    return Ok(Some(name.clone()));
+                }
             }
         }
 
@@ -48,7 +50,10 @@ impl Registry {
 
         // Already started?
         if self.clients.contains_key(&name) {
-            self.ft_map.insert(filetype.to_string(), name.clone());
+            let names = self.ft_map.entry(filetype.to_string()).or_insert_with(Vec::new);
+            if !names.contains(&name) {
+                names.push(name.clone());
+            }
             return Ok(Some(name));
         }
 
@@ -93,7 +98,10 @@ impl Registry {
             Ok((client, event_rx)) => {
                 let client = Arc::new(Mutex::new(client));
                 self.clients.insert(name.clone(), client.clone());
-                self.ft_map.insert(filetype.to_string(), name.clone());
+                let names = self.ft_map.entry(filetype.to_string()).or_insert_with(Vec::new);
+                if !names.contains(&name) {
+                    names.push(name.clone());
+                }
 
                 // Spawn event forwarder with the receiver directly (no client lock needed)
                 let server_name = name.clone();
@@ -126,10 +134,20 @@ impl Registry {
         }
     }
 
-    /// Get the client for a filetype, if started.
+    /// Get the primary client for a filetype, if started.
     pub fn client_for_filetype(&self, filetype: &str) -> Option<Arc<Mutex<LspClient>>> {
-        let name = self.ft_map.get(filetype)?;
+        let names = self.ft_map.get(filetype)?;
+        let name = names.first()?;
         self.clients.get(name).cloned()
+    }
+
+    /// Get all clients for a filetype (for multi-server support).
+    pub fn clients_for_filetype(&self, filetype: &str) -> Vec<Arc<Mutex<LspClient>>> {
+        if let Some(names) = self.ft_map.get(filetype) {
+            names.iter().filter_map(|n| self.clients.get(n).cloned()).collect()
+        } else {
+            vec![]
+        }
     }
 
     /// Get the client for a server name.

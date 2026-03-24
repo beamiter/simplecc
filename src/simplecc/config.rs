@@ -63,7 +63,7 @@ impl Config {
         Config::default()
     }
 
-    /// Find which server handles a given filetype.
+    /// Find which server handles a given filetype (returns first match).
     pub fn server_for_filetype(&self, filetype: &str) -> Option<(&str, &ServerConfig)> {
         for (name, cfg) in &self.language_servers {
             if cfg.filetypes.iter().any(|ft| ft == filetype) {
@@ -71,6 +71,15 @@ impl Config {
             }
         }
         None
+    }
+
+    /// Find all servers that handle a given filetype.
+    #[allow(dead_code)]
+    pub fn servers_for_filetype(&self, filetype: &str) -> Vec<(&str, &ServerConfig)> {
+        self.language_servers.iter()
+            .filter(|(_, cfg)| cfg.filetypes.iter().any(|ft| ft == filetype))
+            .map(|(name, cfg)| (name.as_str(), cfg))
+            .collect()
     }
 }
 

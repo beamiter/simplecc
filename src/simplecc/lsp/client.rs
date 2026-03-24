@@ -19,6 +19,10 @@ pub struct LspClient {
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
     pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeAction>>>,
+    /// Cached completion items for resolve
+    pub cached_completions: Arc<Mutex<Vec<lsp_types::CompletionItem>>>,
+    /// Cached code lenses for execute
+    pub cached_code_lenses: Arc<Mutex<Vec<lsp_types::CodeLens>>>,
     server_name: String,
 }
 
@@ -110,6 +114,8 @@ impl LspClient {
             pending,
             capabilities,
             cached_actions: Arc::new(Mutex::new(Vec::new())),
+            cached_completions: Arc::new(Mutex::new(Vec::new())),
+            cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
             server_name: server_name.to_string(),
         };
 
@@ -218,11 +224,34 @@ impl LspClient {
         })).await
     }
 
-    pub async fn did_change(&self, uri: &str, version: i32, text: &str) -> Result<()> {
-        // Full document sync for simplicity
+    pub async fn did_change(&self, uri: &str, version: i32, text: Option<&str>, changes: Option<Vec<Value>>) -> Result<()> {
+        let content_changes = if let Some(changes) = changes {
+            // Check if server supports incremental sync
+            let caps = self.capabilities.lock().await;
+            let supports_incremental = caps.as_ref().and_then(|c| {
+                match &c.text_document_sync {
+                    Some(TextDocumentSyncCapability::Kind(kind)) => Some(*kind == TextDocumentSyncKind::INCREMENTAL),
+                    Some(TextDocumentSyncCapability::Options(opts)) => opts.change.map(|k| k == TextDocumentSyncKind::INCREMENTAL),
+                    None => None,
+                }
+            }).unwrap_or(false);
+            drop(caps);
+            if supports_incremental {
+                json!(changes)
+            } else if let Some(text) = text {
+                json!([{ "text": text }])
+            } else {
+                json!([{ "text": "" }])
+            }
+        } else if let Some(text) = text {
+            json!([{ "text": text }])
+        } else {
+            json!([{ "text": "" }])
+        };
+
         self.notify("textDocument/didChange", json!({
             "textDocument": { "uri": uri, "version": version },
-            "contentChanges": [{ "text": text }]
+            "contentChanges": content_changes
         })).await
     }
 
@@ -256,7 +285,11 @@ impl LspClient {
             vec![]
         };
 
-        Ok(items.into_iter().map(|item| {
+        // Cache raw items for resolve
+        *self.cached_completions.lock().await = items.clone();
+
+        Ok(items.into_iter().enumerate().map(|(idx, item)| {
+            let is_snippet = item.insert_text_format == Some(InsertTextFormat::SNIPPET);
             let insert_text = item.insert_text.clone()
                 .or_else(|| item.text_edit.as_ref().map(|te| match te {
                     CompletionTextEdit::Edit(e) => e.new_text.clone(),
@@ -270,6 +303,8 @@ impl LspClient {
                 insert_text,
                 sort_text: item.sort_text.clone(),
                 filter_text: item.filter_text.clone().or(Some(item.label)),
+                index: idx,
+                is_snippet: if is_snippet { Some(true) } else { None },
             }
         }).collect())
     }
@@ -676,13 +711,136 @@ impl LspClient {
         })).await?;
         if result.is_null() { return Ok(vec![]); }
         let lenses: Vec<lsp_types::CodeLens> = serde_json::from_value(result)?;
-        Ok(lenses.iter().map(|l| types::CodeLensItem {
+        // Cache for later execution
+        *self.cached_code_lenses.lock().await = lenses.clone();
+        Ok(lenses.iter().enumerate().map(|(idx, l)| types::CodeLensItem {
             line: l.range.start.line,
             character: l.range.start.character,
             end_line: l.range.end.line,
             end_character: l.range.end.character,
             command_title: l.command.as_ref().map(|c| c.title.clone()),
+            index: idx,
         }).collect())
+    }
+
+    pub async fn completion_resolve(&self, index: usize) -> Result<types::CompletionItem> {
+        let cached = self.cached_completions.lock().await;
+        let item = cached.get(index).ok_or_else(|| anyhow::anyhow!("invalid completion index"))?;
+        let result = self.request("completionItem/resolve", serde_json::to_value(item)?).await?;
+        let resolved: lsp_types::CompletionItem = serde_json::from_value(result)?;
+        Ok(types::CompletionItem {
+            label: resolved.label.clone(),
+            kind: resolved.kind.map(types::completion_kind_label).map(String::from),
+            detail: resolved.detail.clone(),
+            documentation: types::extract_doc(&resolved.documentation),
+            insert_text: resolved.insert_text.clone(),
+            sort_text: resolved.sort_text.clone(),
+            filter_text: resolved.filter_text.clone(),
+            index,
+            is_snippet: None,
+        })
+    }
+
+    pub async fn execute_code_lens(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
+        let cached = self.cached_code_lenses.lock().await;
+        let lens = cached.get(index).ok_or_else(|| anyhow::anyhow!("invalid code lens index"))?;
+        // Resolve if no command yet
+        let lens = if lens.command.is_none() {
+            let resolved = self.request("codeLens/resolve", serde_json::to_value(lens)?).await?;
+            serde_json::from_value::<lsp_types::CodeLens>(resolved)?
+        } else {
+            lens.clone()
+        };
+        drop(cached);
+        if let Some(ref cmd) = lens.command {
+            let result = self.request("workspace/executeCommand", json!({
+                "command": cmd.command,
+                "arguments": cmd.arguments,
+            })).await;
+            // Command may return a workspace edit
+            if let Ok(val) = result {
+                if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(val) {
+                    return Ok(Some(types::from_lsp_workspace_edit(&edit)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    // ─── Type Hierarchy (LSP 3.17) ─────────────────────────
+
+    pub async fn type_hierarchy_prepare(&self, uri: &str, line: u32, character: u32) -> Result<Vec<lsp_types::TypeHierarchyItem>> {
+        let result = self.request("textDocument/prepareTypeHierarchy", json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        Ok(serde_json::from_value(result)?)
+    }
+
+    pub async fn type_hierarchy_supertypes(&self, item: &lsp_types::TypeHierarchyItem) -> Result<Vec<types::CallHierarchyItem>> {
+        let result = self.request("typeHierarchy/supertypes", json!({
+            "item": item,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let items: Vec<lsp_types::TypeHierarchyItem> = serde_json::from_value(result)?;
+        Ok(items.iter().map(|i| types::CallHierarchyItem {
+            name: i.name.clone(),
+            kind: types::symbol_kind_label(i.kind).to_string(),
+            uri: i.uri.to_string(),
+            line: i.selection_range.start.line,
+            character: i.selection_range.start.character,
+            detail: i.detail.clone(),
+        }).collect())
+    }
+
+    pub async fn type_hierarchy_subtypes(&self, item: &lsp_types::TypeHierarchyItem) -> Result<Vec<types::CallHierarchyItem>> {
+        let result = self.request("typeHierarchy/subtypes", json!({
+            "item": item,
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let items: Vec<lsp_types::TypeHierarchyItem> = serde_json::from_value(result)?;
+        Ok(items.iter().map(|i| types::CallHierarchyItem {
+            name: i.name.clone(),
+            kind: types::symbol_kind_label(i.kind).to_string(),
+            uri: i.uri.to_string(),
+            line: i.selection_range.start.line,
+            character: i.selection_range.start.character,
+            detail: i.detail.clone(),
+        }).collect())
+    }
+
+    // ─── Pull Diagnostics (LSP 3.17) ───────────────────────
+
+    pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<types::DiagnosticItem>> {
+        let result = self.request("textDocument/diagnostic", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        // Parse DocumentDiagnosticReport
+        let items_val = result.get("items")
+            .or_else(|| result.get("relatedDocuments"))
+            .cloned()
+            .unwrap_or_else(|| {
+                // Try full report format
+                result.get("items").cloned().unwrap_or(Value::Array(vec![]))
+            });
+        if let Ok(diags) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(items_val) {
+            return Ok(diags.iter().map(|d| types::DiagnosticItem {
+                line: d.range.start.line,
+                character: d.range.start.character,
+                end_line: d.range.end.line,
+                end_character: d.range.end.character,
+                severity: types::severity_to_u8(d.severity),
+                message: d.message.clone(),
+                source: d.source.clone(),
+                code: d.code.as_ref().map(|c| match c {
+                    NumberOrString::Number(n) => n.to_string(),
+                    NumberOrString::String(s) => s.clone(),
+                }),
+            }).collect());
+        }
+        Ok(vec![])
     }
 
     pub async fn folding_range(&self, uri: &str) -> Result<Vec<types::FoldingRangeItem>> {
@@ -904,8 +1062,11 @@ fn client_capabilities() -> ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
             completion: Some(CompletionClientCapabilities {
                 completion_item: Some(CompletionItemCapability {
-                    snippet_support: Some(false),
+                    snippet_support: Some(true),
                     documentation_format: Some(vec![MarkupKind::PlainText, MarkupKind::Markdown]),
+                    resolve_support: Some(CompletionItemCapabilityResolveSupport {
+                        properties: vec!["documentation".to_string(), "detail".to_string()],
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -981,6 +1142,9 @@ fn client_capabilities() -> ClientCapabilities {
                 ..Default::default()
             }),
             call_hierarchy: Some(CallHierarchyClientCapabilities {
+                ..Default::default()
+            }),
+            type_hierarchy: Some(TypeHierarchyClientCapabilities {
                 ..Default::default()
             }),
             selection_range: Some(SelectionRangeClientCapabilities {

@@ -29,6 +29,11 @@ g:simplecc_sign_hint       = get(g:, 'simplecc_sign_hint', 'H>')
 g:simplecc_auto_install    = get(g:, 'simplecc_auto_install', 0)
 g:simplecc_inlay_hints     = get(g:, 'simplecc_inlay_hints', 1)
 g:simplecc_virtual_diag    = get(g:, 'simplecc_virtual_diag', 1)
+g:simplecc_diag_max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
+g:simplecc_diag_float      = get(g:, 'simplecc_diag_float', 0)
+g:simplecc_diag_min_severity = get(g:, 'simplecc_diag_min_severity', 4)
+g:simplecc_semantic_tokens = get(g:, 'simplecc_semantic_tokens', 0)
+g:simplecc_pull_diagnostics = get(g:, 'simplecc_pull_diagnostics', 0)
 g:simplecc_status          = ''
 
 # ─── Commands ─────────────────────────────────────────────
@@ -62,6 +67,11 @@ command! -nargs=0 SimpleCCSelShrink     simplecc#SelectionShrink()
 command! -nargs=0 SimpleCCSemanticTokens simplecc#SemanticTokens()
 command! -nargs=0 SimpleCCCodeLens      simplecc#CodeLens()
 command! -nargs=0 SimpleCCFold          simplecc#FoldingRange()
+command! -nargs=0 SimpleCCCodeLensRun  simplecc#CodeLensRun()
+command! -nargs=0 SimpleCCPullDiag     simplecc#PullDiagnostics()
+command! -nargs=0 SimpleCCSupertypes   simplecc#Supertypes()
+command! -nargs=0 SimpleCCSubtypes     simplecc#Subtypes()
+command! -nargs=0 SimpleCCWorkspaceSymbolLive simplecc#WorkspaceSymbolLive()
 command! -nargs=? -complete=custom,SimpleCCInstallComplete SimpleCCInstall simplecc#InstallServer(<q-args>)
 command! -nargs=0 SimpleCCServers       simplecc#ListServers()
 
@@ -143,5 +153,6 @@ augroup simplecc
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
   autocmd InsertLeave * simplecc#OnInsertLeave()
   autocmd CompleteChanged * simplecc#OnCompleteChanged()
+  autocmd CompleteDone * simplecc#OnCompleteDone()
   autocmd CursorHold * simplecc#OnCursorHold()
 augroup END

@@ -43,7 +43,10 @@ enum Request {
         id: u64,
         uri: String,
         version: i32,
-        text: String,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default)]
+        changes: Option<Vec<serde_json::Value>>,
     },
     #[serde(rename = "textDocument/didSave")]
     DidSave {
@@ -228,6 +231,50 @@ enum Request {
         line: u32, character: u32,
     },
 
+    // Completion resolve
+    #[serde(rename = "completionItem/resolve")]
+    CompletionResolve {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        index: usize,
+    },
+
+    // Code lens execute
+    #[serde(rename = "codeLens/execute")]
+    ExecuteCodeLens {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        index: usize,
+    },
+
+    // Type hierarchy
+    #[serde(rename = "textDocument/prepareTypeHierarchy")]
+    PrepareTypeHierarchy {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        line: u32, character: u32,
+    },
+    #[serde(rename = "typeHierarchy/supertypes")]
+    Supertypes {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        item: serde_json::Value,
+    },
+    #[serde(rename = "typeHierarchy/subtypes")]
+    Subtypes {
+        id: u64,
+        #[serde(rename = "languageId")] language_id: String,
+        item: serde_json::Value,
+    },
+
+    // Pull diagnostics
+    #[serde(rename = "textDocument/pullDiagnostics")]
+    PullDiagnostics {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+
     // Server install
     #[serde(rename = "server/install")]
     InstallServer {
@@ -348,7 +395,9 @@ async fn handle_request(
             if let Some(ref mut reg) = *r {
                 // Ensure server started for this filetype
                 if let Ok(Some(_name)) = reg.ensure_server(&language_id).await {
-                    if let Some(client) = reg.client_for_filetype(&language_id) {
+                    // Fan out to all servers for this filetype
+                    let clients = reg.clients_for_filetype(&language_id);
+                    for client in clients {
                         let c = client.lock().await;
                         let _ = c.did_open(&uri, &language_id, version, &text).await;
                     }
@@ -356,14 +405,14 @@ async fn handle_request(
             }
         }
 
-        Request::DidChange { id: _, uri, version, text } => {
+        Request::DidChange { id: _, uri, version, text, changes } => {
             let ft = uri_ft.lock().await.get(&uri).cloned();
             if let Some(ft) = ft {
                 let r = registry.lock().await;
                 if let Some(ref reg) = *r {
-                    if let Some(client) = reg.client_for_filetype(&ft) {
+                    for client in reg.clients_for_filetype(&ft) {
                         let c = client.lock().await;
-                        let _ = c.did_change(&uri, version, &text).await;
+                        let _ = c.did_change(&uri, version, text.as_deref(), changes.clone()).await;
                     }
                 }
             }
@@ -374,7 +423,7 @@ async fn handle_request(
             if let Some(ft) = ft {
                 let r = registry.lock().await;
                 if let Some(ref reg) = *r {
-                    if let Some(client) = reg.client_for_filetype(&ft) {
+                    for client in reg.clients_for_filetype(&ft) {
                         let c = client.lock().await;
                         let _ = c.did_save(&uri, text.as_deref()).await;
                     }
@@ -387,7 +436,7 @@ async fn handle_request(
             if let Some(ft) = ft {
                 let r = registry.lock().await;
                 if let Some(ref reg) = *r {
-                    if let Some(client) = reg.client_for_filetype(&ft) {
+                    for client in reg.clients_for_filetype(&ft) {
                         let c = client.lock().await;
                         let _ = c.did_close(&uri).await;
                     }
@@ -738,6 +787,100 @@ async fn handle_request(
                     match c.linked_editing_range(&uri, line, character).await {
                         Ok(Some(ranges)) => send_event(&out, json!({"type": "linkedEditingRange", "id": id, "result": ranges})),
                         Ok(None) => send_event(&out, json!({"type": "linkedEditingRange", "id": id, "result": null})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::CompletionResolve { id, language_id, index } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.completion_resolve(index).await {
+                        Ok(item) => send_event(&out, json!({"type": "completionResolve", "id": id, "item": item})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::ExecuteCodeLens { id, language_id, index } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.execute_code_lens(index).await {
+                        Ok(Some(edit)) => send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit})),
+                        Ok(None) => send_event(&out, json!({"type": "codeLensExecute", "id": id})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::PrepareTypeHierarchy { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.type_hierarchy_prepare(&uri, line, character).await {
+                        Ok(items) => {
+                            let converted: Vec<_> = items.iter().map(|i| json!({
+                                "name": i.name,
+                                "kind": types::symbol_kind_label(i.kind),
+                                "uri": i.uri.to_string(),
+                                "line": i.selection_range.start.line,
+                                "character": i.selection_range.start.character,
+                                "detail": i.detail,
+                                "raw": serde_json::to_value(i).ok(),
+                            })).collect();
+                            send_event(&out, json!({"type": "typeHierarchyPrepare", "id": id, "items": converted}));
+                        }
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::Supertypes { id, language_id, item } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    if let Ok(lsp_item) = serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
+                        match c.type_hierarchy_supertypes(&lsp_item).await {
+                            Ok(items) => send_event(&out, json!({"type": "supertypes", "id": id, "items": items})),
+                            Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        }
+                    }
+                }
+            }
+        }
+
+        Request::Subtypes { id, language_id, item } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    if let Ok(lsp_item) = serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
+                        match c.type_hierarchy_subtypes(&lsp_item).await {
+                            Ok(items) => send_event(&out, json!({"type": "subtypes", "id": id, "items": items})),
+                            Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                        }
+                    }
+                }
+            }
+        }
+
+        Request::PullDiagnostics { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.pull_diagnostics(&uri).await {
+                        Ok(items) => send_event(&out, json!({"type": "diagnostics", "id": id, "uri": uri, "items": items})),
                         Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
                     }
                 }

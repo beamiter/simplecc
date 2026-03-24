@@ -31,6 +31,35 @@ var s_comp_requesting: bool = false
 var s_sig_popup: number = 0
 # Hover popup
 var s_hover_popup: number = 0
+# Kill timer for daemon force-kill
+var s_kill_timer: number = 0
+# Diagnostics float popup
+var s_diag_popup: number = 0
+# Progress tracking
+var s_progress_tokens: dict<dict<any>> = {}
+var s_spinner_timer: number = 0
+var s_spinner_idx: number = 0
+var s_spinner_frames: list<string> = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+# Semantic tokens auto state
+var s_semtok_timer: number = 0
+# Workspace symbol live search state
+var s_ws_input: string = ''
+var s_ws_popup: number = 0
+var s_ws_results_popup: number = 0
+var s_ws_timer: number = 0
+var s_ws_results: list<dict<any>> = []
+var s_ws_live: bool = false
+# Code lens cache for execution
+var s_code_lens_cache: list<dict<any>> = []
+# Snippet state
+var s_snippet_active: bool = false
+var s_snippet_tabstops: list<dict<any>> = []
+var s_snippet_idx: number = -1
+# Incremental sync state
+var s_pending_changes: dict<list<dict<any>>> = {}
+var s_listener_ids: dict<number> = {}
+# Inlay hints version tracking
+var s_inlay_request_version: dict<number> = {}
 
 def NextId(): number
   s_next_id += 1
@@ -99,6 +128,10 @@ def EnsureBackend(): bool
         s_initialized = false
         s_job = null_job
         s_cbs = {}
+        if s_kill_timer > 0
+          timer_stop(s_kill_timer)
+          s_kill_timer = 0
+        endif
         Log('daemon exited with code ' .. string(code))
         g:simplecc_status = ''
       },
@@ -244,6 +277,21 @@ def OnBackendEvent(line: string)
   elseif ev.type ==# 'linkedEditingRange'
     OnLinkedEditingRange(ev)
 
+  elseif ev.type ==# 'completionResolve'
+    OnCompletionResolve(ev)
+
+  elseif ev.type ==# 'codeLensExecute'
+    OnCodeLensExecute(ev)
+
+  elseif ev.type ==# 'typeHierarchyPrepare'
+    OnTypeHierarchyPrepare(ev)
+
+  elseif ev.type ==# 'supertypes'
+    OnSupertypesResult(ev)
+
+  elseif ev.type ==# 'subtypes'
+    OnSubtypesResult(ev)
+
   elseif ev.type ==# 'progress'
     OnProgress(ev)
 
@@ -327,6 +375,8 @@ def SendDidOpen(bufnr: number)
     version: version,
     text: text,
   })
+  # Register listener for incremental sync
+  RegisterListener(bufnr)
 enddef
 
 def SendDidChange()
@@ -338,15 +388,29 @@ def SendDidChange()
   if ft ==# '' || uri ==# 'file://'
     return
   endif
-  var text = join(getline(1, '$'), "\n") .. "\n"
+  listener_flush(bufnr('%'))
   var version = DocVersion(uri)
-  Send({
-    type: 'textDocument/didChange',
-    id: NextId(),
-    uri: uri,
-    version: version,
-    text: text,
-  })
+  # Use incremental changes if available
+  if has_key(s_pending_changes, uri) && !empty(s_pending_changes[uri])
+    var changes = s_pending_changes[uri]
+    s_pending_changes[uri] = []
+    Send({
+      type: 'textDocument/didChange',
+      id: NextId(),
+      uri: uri,
+      version: version,
+      changes: changes,
+    })
+  else
+    var text = join(getline(1, '$'), "\n") .. "\n"
+    Send({
+      type: 'textDocument/didChange',
+      id: NextId(),
+      uri: uri,
+      version: version,
+      text: text,
+    })
+  endif
 enddef
 
 export def OnBufOpen()
@@ -359,6 +423,7 @@ export def OnBufOpen()
   endif
   SendDidOpen(bufnr('%'))
   RequestInlayHintsDebounced()
+  RequestSemanticTokensDebounced()
 enddef
 
 export def OnBufSave()
@@ -372,22 +437,32 @@ export def OnBufSave()
   var text = join(getline(1, '$'), "\n") .. "\n"
   Send({type: 'textDocument/didSave', id: NextId(), uri: uri, text: text})
   RequestInlayHintsDebounced()
+  RequestSemanticTokensDebounced()
+  # F12: Auto pull diagnostics if enabled
+  if g:simplecc_pull_diagnostics
+    PullDiagnostics()
+  endif
 enddef
 
 export def OnBufClose()
   if !s_initialized
     return
   endif
-  var uri = BufUri()
+  var bnr = bufnr('%')
+  var uri = BufUri(bnr)
   if uri ==# 'file://'
     return
   endif
+  UnregisterListener(bnr)
   Send({type: 'textDocument/didClose', id: NextId(), uri: uri})
   if has_key(s_doc_versions, uri)
     remove(s_doc_versions, uri)
   endif
   if has_key(s_diagnostics, uri)
     remove(s_diagnostics, uri)
+  endif
+  if has_key(s_pending_changes, uri)
+    remove(s_pending_changes, uri)
   endif
 enddef
 
@@ -400,6 +475,10 @@ export def OnTextChanged()
   endif
   s_change_timer = timer_start(200, (_) => {
     SendDidChange()
+    # F3: Re-request inlay hints after changes
+    RequestInlayHintsDebounced()
+    # F2: Auto semantic tokens
+    RequestSemanticTokensDebounced()
   })
 enddef
 
@@ -420,7 +499,67 @@ export def OnInsertLeave()
 enddef
 
 export def OnCompleteChanged()
-  # Could show documentation for selected item in preview
+  if !s_initialized
+    return
+  endif
+  var info = complete_info(['selected', 'items'])
+  var sel = get(info, 'selected', -1)
+  if sel < 0
+    return
+  endif
+  var items = get(info, 'items', [])
+  if sel >= len(items)
+    return
+  endif
+  var ci = items[sel]
+  var ud = get(ci, 'user_data', {})
+  if type(ud) != v:t_dict
+    return
+  endif
+  var idx = get(ud, 'index', -1)
+  if idx < 0
+    return
+  endif
+  Send({
+    type: 'completionItem/resolve',
+    id: NextId(),
+    languageId: BufFt(),
+    index: idx,
+  })
+enddef
+
+def OnCompletionResolve(ev: dict<any>)
+  var item = get(ev, 'item', {})
+  if empty(item)
+    return
+  endif
+  var detail = get(item, 'detail', '')
+  var doc = get(item, 'documentation', '')
+  var text = detail
+  if doc !=# ''
+    text = text !=# '' ? text .. "\n\n" .. doc : doc
+  endif
+  if text ==# '' || !pumvisible()
+    return
+  endif
+  # Show resolved info in a popup near the completion menu
+  if s_hover_popup > 0
+    popup_close(s_hover_popup)
+  endif
+  var lines = split(text, "\n")
+  s_hover_popup = popup_create(lines, {
+    border: [1, 1, 1, 1],
+    borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+    padding: [0, 1, 0, 1],
+    maxwidth: 60,
+    maxheight: 15,
+    pos: 'topleft',
+    line: 'cursor-1',
+    col: 'cursor+40',
+    moved: 'any',
+    highlight: 'Normal',
+    borderhighlight: ['SimpleCCFloatBorder'],
+  })
 enddef
 
 def TriggerCompletion()
@@ -492,12 +631,20 @@ def OnCompletion(ev: dict<any>)
 
   # Build Vim complete items
   var complete_items: list<dict<any>> = []
+  var idx = 0
   for item in items
+    var word = get(item, 'insert_text', get(item, 'label', ''))
+    var is_snippet = get(item, 'is_snippet', false)
+    # For snippet items, show the label as word rather than raw snippet text
+    if is_snippet
+      word = get(item, 'label', word)
+    endif
     var ci: dict<any> = {
-      word: get(item, 'insert_text', get(item, 'label', '')),
+      word: word,
       abbr: get(item, 'label', ''),
-      menu: get(item, 'kind', ''),
+      menu: get(item, 'kind', '') .. (is_snippet ? ' ~' : ''),
       dup: 1,
+      user_data: {index: idx, is_snippet: is_snippet, snippet_text: is_snippet ? get(item, 'insert_text', '') : ''},
     }
     var detail = get(item, 'detail', '')
     if detail !=# ''
@@ -508,6 +655,7 @@ def OnCompletion(ev: dict<any>)
       ci.info = get(ci, 'info', '') !=# '' ? ci.info .. "\n\n" .. doc : doc
     endif
     add(complete_items, ci)
+    idx += 1
   endfor
 
   if mode() ==# 'i'
@@ -859,6 +1007,9 @@ def DisplayDiagnostics(uri: string)
   sign_unplace('simplecc', {buffer: bufnr})
 
   var items = get(s_diagnostics, uri, [])
+  # Filter by minimum severity level
+  var min_sev = get(g:, 'simplecc_diag_min_severity', 4)
+  items = filter(copy(items), (_, v) => get(v, 'severity', 3) <= min_sev)
   var sign_id = 1
 
   for item in items
@@ -1203,10 +1354,17 @@ export def Stop()
   timer_start(500, (_) => {
     if s_job != null_job
       job_stop(s_job)
+      # Force kill if still running after 3 seconds
+      s_kill_timer = timer_start(3000, (_) => {
+        s_kill_timer = 0
+        if s_job != null_job && job_status(s_job) ==# 'run'
+          job_stop(s_job, 'kill')
+          Log('daemon force-killed')
+        endif
+      })
     endif
     s_running = false
     s_initialized = false
-    s_job = null_job
     g:simplecc_status = ''
   })
 enddef
@@ -1405,6 +1563,12 @@ enddef
 
 def OnWorkspaceSymbol(ev: dict<any>)
   var symbols = get(ev, 'symbols', [])
+  # Live search mode: update popup instead of quickfix
+  if s_ws_live && s_ws_popup > 0
+    s_ws_results = symbols
+    UpdateWsResults()
+    return
+  endif
   if empty(symbols)
     echo 'No symbols found'
     return
@@ -1825,7 +1989,7 @@ def OnSemanticTokens(ev: dict<any>)
       endtry
     endif
   endfor
-  echo printf('[SimpleCC] Applied %d semantic tokens', len(tokens))
+  Log(printf('applied %d semantic tokens', len(tokens)))
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -1851,6 +2015,8 @@ def OnCodeLens(ev: dict<any>)
     echo 'No code lenses'
     return
   endif
+  # Cache for execution
+  s_code_lens_cache = lenses
   var bnr = bufnr('%')
   try
     prop_type_add('SimpleCCCodeLens', {bufnr: bnr, highlight: 'Comment'})
@@ -1932,23 +2098,66 @@ enddef
 # Progress
 # ═════════════════════════════════════════════════════════
 
+def UpdateProgressStatus()
+  if empty(s_progress_tokens)
+    return
+  endif
+  var frame = s_spinner_frames[s_spinner_idx % len(s_spinner_frames)]
+  s_spinner_idx += 1
+  var parts: list<string> = []
+  for [key, info] in items(s_progress_tokens)
+    var text = get(info, 'title', '')
+    var msg = get(info, 'message', '')
+    var pct = get(info, 'percentage', -1)
+    if msg !=# ''
+      text = msg
+    endif
+    if pct >= 0
+      text ..= ' ' .. pct .. '%'
+    endif
+    add(parts, get(info, 'server', '') .. ': ' .. text)
+  endfor
+  g:simplecc_status = frame .. ' ' .. join(parts, ' | ')
+  redrawstatus
+enddef
+
 def OnProgress(ev: dict<any>)
   var kind = get(ev, 'kind', '')
   var title = get(ev, 'title', '')
   var msg = get(ev, 'message', '')
   var pct = get(ev, 'percentage', -1)
   var server = get(ev, 'server', '')
+  var token = get(ev, 'token', '')
 
   if kind ==# 'begin'
-    g:simplecc_status = printf('%s: %s', server, title)
+    s_progress_tokens[token] = {server: server, title: title, message: msg, percentage: pct}
+    if s_spinner_timer == 0
+      s_spinner_idx = 0
+      s_spinner_timer = timer_start(100, (_) => {
+        UpdateProgressStatus()
+      }, {repeat: -1})
+    endif
   elseif kind ==# 'report'
-    if pct >= 0
-      g:simplecc_status = printf('%s: %s %d%%', server, msg !=# '' ? msg : title, pct)
-    elseif msg !=# ''
-      g:simplecc_status = printf('%s: %s', server, msg)
+    if has_key(s_progress_tokens, token)
+      if msg !=# ''
+        s_progress_tokens[token].message = msg
+      endif
+      if pct >= 0
+        s_progress_tokens[token].percentage = pct
+      endif
     endif
   elseif kind ==# 'end'
-    g:simplecc_status = server
+    if has_key(s_progress_tokens, token)
+      remove(s_progress_tokens, token)
+    endif
+    if empty(s_progress_tokens)
+      if s_spinner_timer > 0
+        timer_stop(s_spinner_timer)
+        s_spinner_timer = 0
+      endif
+      g:simplecc_status = server
+      redrawstatus
+    endif
     if msg !=# ''
       echo printf('[SimpleCC] %s', msg)
     endif
@@ -1971,34 +2180,42 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     prop_remove({type: 'SimpleCCVirtualDiag', bufnr: bufnr, all: true})
   catch
   endtry
-  # Show one diagnostic per line (highest severity)
-  var line_diags: dict<dict<any>> = {}
+  # Group diagnostics by line, sorted by severity
+  var line_diags: dict<list<dict<any>>> = {}
   for item in items
     var lnum = get(item, 'line', 0) + 1
     var key = string(lnum)
-    var sev = get(item, 'severity', 3)
-    if !has_key(line_diags, key) || sev < get(line_diags[key], 'severity', 99)
-      line_diags[key] = item
+    if !has_key(line_diags, key)
+      line_diags[key] = []
     endif
+    add(line_diags[key], item)
   endfor
-  for [key, item] in items(line_diags)
+  var max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
+  for [key, diags] in items(line_diags)
     var lnum = str2nr(key)
-    var sev = get(item, 'severity', 3)
-    var msg = get(item, 'message', '')
-    # Truncate long messages
-    if len(msg) > 60
-      msg = msg[: 57] .. '...'
+    # Sort by severity (error first)
+    sort(diags, (a, b) => get(a, 'severity', 3) - get(b, 'severity', 3))
+    var shown = diags[: max_per_line - 1]
+    var msgs: list<string> = []
+    for d in shown
+      var msg = substitute(get(d, 'message', ''), "\n", ' ', 'g')
+      if len(msg) > 60
+        msg = msg[: 57] .. '...'
+      endif
+      add(msgs, msg)
+    endfor
+    if len(diags) > max_per_line
+      add(msgs, printf('+%d more', len(diags) - max_per_line))
     endif
-    # Replace newlines
-    msg = substitute(msg, "\n", ' ', 'g')
-    var hl = sev <= 1 ? 'SimpleCCVirtualDiagError' : 'SimpleCCVirtualDiagWarn'
+    var best_sev = get(shown[0], 'severity', 3)
+    var hl = best_sev <= 1 ? 'SimpleCCVirtualDiagError' : 'SimpleCCVirtualDiagWarn'
     try
       prop_type_add('SimpleCCVirtualDiag', {bufnr: bufnr, highlight: hl})
     catch
     endtry
     if lnum > 0 && lnum <= getbufinfo(bufnr)[0].linecount
       try
-        prop_add(lnum, 0, {type: 'SimpleCCVirtualDiag', text: '  ' .. msg, text_align: 'after', bufnr: bufnr})
+        prop_add(lnum, 0, {type: 'SimpleCCVirtualDiag', text: '  ' .. join(msgs, ' | '), text_align: 'after', bufnr: bufnr})
       catch
       endtry
     endif
@@ -2017,6 +2234,40 @@ export def OnCursorHold()
   RestoreInlayHints()
   # Clear stale selection ranges
   s_selection_ranges = []
+  # Show diagnostic float if enabled
+  if g:simplecc_diag_float
+    ShowDiagFloat()
+  endif
+enddef
+
+def ShowDiagFloat()
+  if s_diag_popup > 0
+    popup_close(s_diag_popup)
+    s_diag_popup = 0
+  endif
+  var uri = BufUri()
+  var items = get(s_diagnostics, uri, [])
+  if empty(items)
+    return
+  endif
+  var cur_line = line('.') - 1
+  var line_items = filter(copy(items), (_, v) => get(v, 'line', -1) == cur_line)
+  if empty(line_items)
+    return
+  endif
+  var lines: list<string> = []
+  for item in line_items
+    add(lines, DiagMessage(item))
+  endfor
+  s_diag_popup = popup_atcursor(lines, {
+    border: [1, 1, 1, 1],
+    borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+    padding: [0, 1, 0, 1],
+    moved: 'any',
+    maxwidth: 80,
+    highlight: 'Normal',
+    borderhighlight: ['SimpleCCFloatBorder'],
+  })
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -2120,6 +2371,536 @@ def OnInstallableServers(ev: dict<any>)
   setlocal buftype=nofile bufhidden=wipe noswapfile
   setline(1, lines)
   setlocal nomodifiable
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Code Lens Execution (F7)
+# ═════════════════════════════════════════════════════════
+
+export def CodeLensRun()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  if empty(s_code_lens_cache)
+    echo '[SimpleCC] No code lenses cached. Run :SimpleCCCodeLens first.'
+    return
+  endif
+  var cur_line = line('.') - 1
+  # Find lenses on or near current line
+  var nearby: list<dict<any>> = []
+  for l in s_code_lens_cache
+    if abs(get(l, 'line', -999) - cur_line) <= 1
+      add(nearby, l)
+    endif
+  endfor
+  if empty(nearby)
+    # Fall back to all lenses
+    nearby = s_code_lens_cache
+  endif
+  if len(nearby) == 1
+    DoCodeLensExecute(nearby[0])
+  else
+    var titles = mapnew(nearby, (_, l) => get(l, 'command_title', '(untitled)'))
+    popup_menu(titles, {
+      title: ' Run Code Lens ',
+      border: [1, 1, 1, 1],
+      borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+      padding: [0, 1, 0, 1],
+      callback: (_, idx) => {
+        if idx > 0
+          DoCodeLensExecute(nearby[idx - 1])
+        endif
+      },
+    })
+  endif
+enddef
+
+def DoCodeLensExecute(lens: dict<any>)
+  var idx = get(lens, 'index', -1)
+  if idx < 0
+    return
+  endif
+  Send({
+    type: 'codeLens/execute',
+    id: NextId(),
+    languageId: BufFt(),
+    index: idx,
+  })
+enddef
+
+def OnCodeLensExecute(ev: dict<any>)
+  # If there's a workspace edit, it will come as applyEdit
+  Log('code lens executed')
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Pull Diagnostics (F12)
+# ═════════════════════════════════════════════════════════
+
+export def PullDiagnostics()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  var uri = BufUri()
+  if uri ==# 'file://'
+    return
+  endif
+  Send({
+    type: 'textDocument/pullDiagnostics',
+    id: NextId(),
+    uri: uri,
+    languageId: BufFt(),
+  })
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Type Hierarchy (F13)
+# ═════════════════════════════════════════════════════════
+
+var s_type_hierarchy_items: list<any> = []
+
+export def Supertypes()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  s_type_hierarchy_items = []
+  Send({
+    type: 'textDocument/prepareTypeHierarchy',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+  b:simplecc_type_direction = 'supertypes'
+enddef
+
+export def Subtypes()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  s_type_hierarchy_items = []
+  Send({
+    type: 'textDocument/prepareTypeHierarchy',
+    id: NextId(),
+    uri: BufUri(),
+    languageId: BufFt(),
+    line: line('.') - 1,
+    character: col('.') - 1,
+  })
+  b:simplecc_type_direction = 'subtypes'
+enddef
+
+def OnTypeHierarchyPrepare(ev: dict<any>)
+  var items = get(ev, 'items', [])
+  if empty(items)
+    echo 'No type hierarchy item found'
+    return
+  endif
+  s_type_hierarchy_items = items
+  var item = items[0]
+  var raw = get(item, 'raw', {})
+  var direction = get(b:, 'simplecc_type_direction', 'supertypes')
+  var req_type = 'typeHierarchy/' .. direction
+  Send({
+    type: req_type,
+    id: NextId(),
+    languageId: BufFt(),
+    item: raw,
+  })
+enddef
+
+def OnSupertypesResult(ev: dict<any>)
+  var items = get(ev, 'items', [])
+  if empty(items)
+    echo 'No supertypes'
+    return
+  endif
+  TypeHierarchyToQuickfix(items, 'Supertypes')
+enddef
+
+def OnSubtypesResult(ev: dict<any>)
+  var items = get(ev, 'items', [])
+  if empty(items)
+    echo 'No subtypes'
+    return
+  endif
+  TypeHierarchyToQuickfix(items, 'Subtypes')
+enddef
+
+def TypeHierarchyToQuickfix(items: list<any>, title: string)
+  var qf_items: list<dict<any>> = []
+  for item in items
+    var uri = get(item, 'uri', '')
+    var fpath = substitute(uri, '^file://', '', '')
+    add(qf_items, {
+      filename: fpath,
+      lnum: get(item, 'line', 0) + 1,
+      col: get(item, 'character', 0) + 1,
+      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
+    })
+  endfor
+  setqflist(qf_items)
+  copen
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Workspace Symbol Live Search (F6)
+# ═════════════════════════════════════════════════════════
+
+export def WorkspaceSymbolLive()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  s_ws_input = ''
+  s_ws_results = []
+  s_ws_live = true
+
+  s_ws_popup = popup_create(['Type to search workspace symbols...'], {
+    title: ' Workspace Symbol ',
+    border: [1, 1, 1, 1],
+    borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+    padding: [0, 1, 0, 1],
+    pos: 'center',
+    minwidth: 60,
+    maxwidth: 80,
+    minheight: 1,
+    maxheight: 20,
+    filter: (id, key) => WsSymbolFilter(id, key),
+    callback: (id, result) => {
+      s_ws_live = false
+      if s_ws_results_popup > 0
+        popup_close(s_ws_results_popup)
+        s_ws_results_popup = 0
+      endif
+    },
+  })
+enddef
+
+def WsSymbolFilter(id: number, key: string): bool
+  if key ==# "\<Esc>"
+    popup_close(id, -1)
+    return true
+  endif
+  if key ==# "\<CR>"
+    # Jump to selected result
+    if !empty(s_ws_results)
+      var sel = 0  # First result
+      if sel < len(s_ws_results)
+        popup_close(id, sel)
+        var item = s_ws_results[sel]
+        var uri = get(item, 'detail', get(item, 'uri', ''))
+        var fpath = substitute(uri, '^file://', '', '')
+        if fpath !=# '' && filereadable(fpath)
+          execute 'edit ' .. fpath
+          cursor(get(item, 'line', 0) + 1, get(item, 'character', 0) + 1)
+          normal! zz
+        endif
+      endif
+    endif
+    return true
+  endif
+  if key ==# "\<BS>"
+    if len(s_ws_input) > 0
+      s_ws_input = s_ws_input[: -2]
+    endif
+  elseif len(key) == 1 && key =~ '[[:print:]]'
+    s_ws_input ..= key
+  else
+    return false
+  endif
+  # Update popup content to show query
+  popup_settext(id, ['> ' .. s_ws_input])
+  # Debounced request
+  if s_ws_timer > 0
+    timer_stop(s_ws_timer)
+  endif
+  if len(s_ws_input) >= 2
+    s_ws_timer = timer_start(300, (_) => {
+      Send({
+        type: 'workspace/symbol',
+        id: NextId(),
+        languageId: BufFt(),
+        query: s_ws_input,
+      })
+    })
+  endif
+  return true
+enddef
+
+def UpdateWsResults()
+  if !s_ws_live || s_ws_popup == 0
+    return
+  endif
+  var lines = ['> ' .. s_ws_input, '']
+  for item in s_ws_results[: 19]
+    var kind = get(item, 'kind', '')
+    var name = get(item, 'name', '')
+    var detail = get(item, 'detail', '')
+    var fpath = substitute(detail, '^file://', '', '')
+    var short = fnamemodify(fpath, ':t')
+    add(lines, printf('  [%s] %s  %s', kind, name, short))
+  endfor
+  if empty(s_ws_results)
+    add(lines, '  (no results)')
+  endif
+  popup_settext(s_ws_popup, lines)
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Snippet Support (F9)
+# ═════════════════════════════════════════════════════════
+
+export def OnCompleteDone()
+  if !s_initialized
+    return
+  endif
+  var ci = v:completed_item
+  if empty(ci)
+    return
+  endif
+  var ud = get(ci, 'user_data', {})
+  if type(ud) != v:t_dict
+    return
+  endif
+  var is_snippet = get(ud, 'is_snippet', false)
+  if !is_snippet
+    return
+  endif
+  var snippet_text = get(ud, 'snippet_text', '')
+  if snippet_text ==# ''
+    return
+  endif
+  ExpandSnippet(ci, snippet_text)
+enddef
+
+def ExpandSnippet(ci: dict<any>, snippet: string)
+  # Parse snippet: extract $N, ${N:placeholder}, $0
+  var tabstops: list<dict<any>> = []
+  var expanded = ''
+  var i = 0
+  var slen = len(snippet)
+  while i < slen
+    if snippet[i] ==# '$'
+      if i + 1 < slen && snippet[i + 1] ==# '{'
+        # ${N:placeholder} or ${N}
+        var j = i + 2
+        var num_str = ''
+        while j < slen && snippet[j] =~ '\d'
+          num_str ..= snippet[j]
+          j += 1
+        endwhile
+        var placeholder = ''
+        if j < slen && snippet[j] ==# ':'
+          j += 1
+          var depth = 1
+          while j < slen && depth > 0
+            if snippet[j] ==# '}'
+              depth -= 1
+              if depth == 0
+                break
+              endif
+            elseif snippet[j] ==# '$' && j + 1 < slen && snippet[j + 1] ==# '{'
+              depth += 1
+            endif
+            placeholder ..= snippet[j]
+            j += 1
+          endwhile
+        elseif j < slen && snippet[j] ==# '}'
+          # ${N} without placeholder
+        endif
+        if j < slen && snippet[j] ==# '}'
+          j += 1
+        endif
+        add(tabstops, {num: str2nr(num_str), start: len(expanded), text: placeholder})
+        expanded ..= placeholder
+        i = j
+      elseif i + 1 < slen && snippet[i + 1] =~ '\d'
+        # $N
+        var j = i + 1
+        var num_str = ''
+        while j < slen && snippet[j] =~ '\d'
+          num_str ..= snippet[j]
+          j += 1
+        endwhile
+        add(tabstops, {num: str2nr(num_str), start: len(expanded), text: ''})
+        i = j
+      else
+        expanded ..= snippet[i]
+        i += 1
+      endif
+    else
+      expanded ..= snippet[i]
+      i += 1
+    endif
+  endwhile
+
+  if empty(tabstops)
+    return
+  endif
+
+  # Sort tabstops: $1, $2, ... $0 last
+  sort(tabstops, (a, b) => {
+    if a.num == 0
+      return 1
+    endif
+    if b.num == 0
+      return -1
+    endif
+    return a.num - b.num
+  })
+
+  # Replace the completed word with expanded snippet text
+  var word = get(ci, 'word', '')
+  var lnum = line('.')
+  var cur_col = col('.')
+  var line_text = getline(lnum)
+  var word_start = cur_col - len(word) - 1
+  if word_start < 0
+    word_start = 0
+  endif
+  var new_line = line_text[: word_start - 1] .. expanded .. line_text[cur_col - 1 :]
+  setline(lnum, new_line)
+
+  # Setup tabstop navigation
+  s_snippet_active = true
+  s_snippet_tabstops = []
+  for ts in tabstops
+    add(s_snippet_tabstops, {
+      lnum: lnum,
+      col: word_start + ts.start + 1,
+      end_col: word_start + ts.start + len(ts.text) + 1,
+      text: ts.text,
+    })
+  endfor
+  s_snippet_idx = 0
+
+  # Set buffer-local mappings for tab navigation
+  inoremap <buffer> <Tab> <Cmd>call simplecc#SnippetNext()<CR>
+  inoremap <buffer> <S-Tab> <Cmd>call simplecc#SnippetPrev()<CR>
+  snoremap <buffer> <Tab> <Cmd>call simplecc#SnippetNext()<CR>
+  snoremap <buffer> <S-Tab> <Cmd>call simplecc#SnippetPrev()<CR>
+
+  # Jump to first tabstop
+  SnippetJump()
+enddef
+
+export def SnippetNext()
+  if !s_snippet_active || empty(s_snippet_tabstops)
+    SnippetFinish()
+    return
+  endif
+  s_snippet_idx += 1
+  if s_snippet_idx >= len(s_snippet_tabstops)
+    SnippetFinish()
+    return
+  endif
+  SnippetJump()
+enddef
+
+export def SnippetPrev()
+  if !s_snippet_active || empty(s_snippet_tabstops)
+    return
+  endif
+  if s_snippet_idx > 0
+    s_snippet_idx -= 1
+  endif
+  SnippetJump()
+enddef
+
+def SnippetJump()
+  if s_snippet_idx >= len(s_snippet_tabstops)
+    SnippetFinish()
+    return
+  endif
+  var ts = s_snippet_tabstops[s_snippet_idx]
+  cursor(ts.lnum, ts.col)
+  if ts.text !=# '' && ts.end_col > ts.col
+    # Select the placeholder
+    execute printf("normal! v%dl\<C-g>", ts.end_col - ts.col - 1)
+  endif
+enddef
+
+def SnippetFinish()
+  s_snippet_active = false
+  s_snippet_tabstops = []
+  s_snippet_idx = -1
+  try
+    iunmap <buffer> <Tab>
+    iunmap <buffer> <S-Tab>
+    sunmap <buffer> <Tab>
+    sunmap <buffer> <S-Tab>
+  catch
+  endtry
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Incremental Document Sync (F1)
+# ═════════════════════════════════════════════════════════
+
+def RegisterListener(bufnr: number)
+  var key = string(bufnr)
+  if has_key(s_listener_ids, key)
+    return
+  endif
+  var lid = listener_add((bnr, start, end, added, changes) => {
+    OnBufferChange(bnr, start, end, added)
+  }, bufnr)
+  s_listener_ids[key] = lid
+enddef
+
+def UnregisterListener(bufnr: number)
+  var key = string(bufnr)
+  if has_key(s_listener_ids, key)
+    listener_remove(s_listener_ids[key])
+    remove(s_listener_ids, key)
+  endif
+enddef
+
+def OnBufferChange(bufnr: number, start: number, end: number, added: number)
+  var uri = BufUri(bufnr)
+  if !has_key(s_pending_changes, uri)
+    s_pending_changes[uri] = []
+  endif
+  # start is 1-based first changed line, end is 1-based line after last changed (before)
+  # added is lines added (negative means removed)
+  var new_end = start + (end - start) + added
+  if new_end < start
+    new_end = start
+  endif
+  var text_lines = getbufline(bufnr, start, new_end - 1)
+  var text = join(text_lines, "\n")
+  if !empty(text_lines)
+    text ..= "\n"
+  endif
+  add(s_pending_changes[uri], {
+    range: {
+      start: {line: start - 1, character: 0},
+      end: {line: end - 1, character: 0},
+    },
+    text: text,
+  })
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Auto Semantic Tokens (F2)
+# ═════════════════════════════════════════════════════════
+
+def RequestSemanticTokensDebounced()
+  if !g:simplecc_semantic_tokens
+    return
+  endif
+  if s_semtok_timer > 0
+    timer_stop(s_semtok_timer)
+  endif
+  s_semtok_timer = timer_start(1000, (_) => {
+    SemanticTokens()
+  })
 enddef
 
 # ═════════════════════════════════════════════════════════
