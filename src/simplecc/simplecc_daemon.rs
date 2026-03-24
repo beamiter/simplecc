@@ -1,0 +1,428 @@
+mod config;
+mod lsp;
+mod registry;
+
+use anyhow::Result;
+use registry::{EventTx, Registry};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+
+// ─── Vim → Daemon request types ──────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[allow(dead_code)]
+enum Request {
+    #[serde(rename = "initialize")]
+    Initialize {
+        id: u64,
+        root: String,
+        #[serde(default)]
+        config_path: Option<String>,
+    },
+    #[serde(rename = "shutdown")]
+    Shutdown { id: u64 },
+
+    // Document sync
+    #[serde(rename = "textDocument/didOpen")]
+    DidOpen {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        version: i32,
+        text: String,
+    },
+    #[serde(rename = "textDocument/didChange")]
+    DidChange {
+        id: u64,
+        uri: String,
+        version: i32,
+        text: String,
+    },
+    #[serde(rename = "textDocument/didSave")]
+    DidSave {
+        id: u64,
+        uri: String,
+        #[serde(default)]
+        text: Option<String>,
+    },
+    #[serde(rename = "textDocument/didClose")]
+    DidClose { id: u64, uri: String },
+
+    // LSP features
+    #[serde(rename = "textDocument/completion")]
+    Completion {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+    },
+    #[serde(rename = "textDocument/hover")]
+    Hover {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+    },
+    #[serde(rename = "textDocument/definition")]
+    Definition {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+    },
+    #[serde(rename = "textDocument/references")]
+    References {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+    },
+    #[serde(rename = "textDocument/codeAction")]
+    CodeAction {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+        #[serde(default)]
+        end_line: Option<u32>,
+        #[serde(default)]
+        end_character: Option<u32>,
+        #[serde(default)]
+        diagnostics: Value,
+    },
+    #[serde(rename = "textDocument/executeAction")]
+    ExecuteAction {
+        id: u64,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        index: usize,
+    },
+    #[serde(rename = "textDocument/formatting")]
+    Formatting {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        #[serde(default = "default_tab_size")]
+        tab_size: u32,
+        #[serde(default = "default_true")]
+        insert_spaces: bool,
+    },
+    #[serde(rename = "textDocument/rename")]
+    Rename {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+        #[serde(rename = "newName")]
+        new_name: String,
+    },
+    #[serde(rename = "textDocument/signatureHelp")]
+    SignatureHelp {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+    },
+}
+
+fn default_tab_size() -> u32 { 4 }
+fn default_true() -> bool { true }
+
+// ─── stdout writer ───────────────────────────────────────
+
+async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
+    let mut out = tokio::io::stdout();
+    while let Some(line) = rx.recv().await {
+        if out.write_all(line.as_bytes()).await.is_err() { break; }
+        if out.write_all(b"\n").await.is_err() { break; }
+        let _ = out.flush().await;
+    }
+}
+
+fn send_event(tx: &EventTx, event: Value) {
+    let s = serde_json::to_string(&event).unwrap();
+    let _ = tx.try_send(s);
+}
+
+// ─── Main ────────────────────────────────────────────────
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+
+    eprintln!("[simplecc] daemon started");
+
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
+    tokio::spawn(stdout_writer(out_rx));
+
+    let registry: Arc<Mutex<Option<Registry>>> = Arc::new(Mutex::new(None));
+    // Track which filetype a URI belongs to
+    let uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.is_empty() {
+            continue;
+        }
+        let req: Request = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[simplecc] bad request: {e}");
+                continue;
+            }
+        };
+
+        let reg = registry.clone();
+        let out = out_tx.clone();
+        let uft = uri_ft.clone();
+
+        tokio::spawn(async move {
+            handle_request(req, reg, out, uft).await;
+        });
+    }
+
+    // Shutdown
+    let mut r = registry.lock().await;
+    if let Some(ref mut reg) = *r {
+        reg.shutdown_all().await;
+    }
+
+    eprintln!("[simplecc] daemon exiting");
+    Ok(())
+}
+
+async fn handle_request(
+    req: Request,
+    registry: Arc<Mutex<Option<Registry>>>,
+    out: EventTx,
+    uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>>,
+) {
+    match req {
+        Request::Initialize { id, root, config_path } => {
+            let cfg = if let Some(ref p) = config_path {
+                let path = std::path::Path::new(p);
+                if path.exists() {
+                    config::Config::load(path).unwrap_or_else(|_| config::Config::find_and_load(&root))
+                } else {
+                    config::Config::find_and_load(&root)
+                }
+            } else {
+                config::Config::find_and_load(&root)
+            };
+
+            let reg = Registry::new(cfg, root, out.clone());
+            *registry.lock().await = Some(reg);
+
+            send_event(&out, json!({"type": "initialized", "id": id}));
+        }
+
+        Request::Shutdown { id } => {
+            let mut r = registry.lock().await;
+            if let Some(ref mut reg) = *r {
+                reg.shutdown_all().await;
+            }
+            send_event(&out, json!({"type": "shutdown", "id": id}));
+        }
+
+        Request::DidOpen { id: _, uri, language_id, version, text } => {
+            // Track filetype
+            uri_ft.lock().await.insert(uri.clone(), language_id.clone());
+
+            let mut r = registry.lock().await;
+            if let Some(ref mut reg) = *r {
+                // Ensure server started for this filetype
+                if let Ok(Some(_name)) = reg.ensure_server(&language_id).await {
+                    if let Some(client) = reg.client_for_filetype(&language_id) {
+                        let c = client.lock().await;
+                        let _ = c.did_open(&uri, &language_id, version, &text).await;
+                    }
+                }
+            }
+        }
+
+        Request::DidChange { id: _, uri, version, text } => {
+            let ft = uri_ft.lock().await.get(&uri).cloned();
+            if let Some(ft) = ft {
+                let r = registry.lock().await;
+                if let Some(ref reg) = *r {
+                    if let Some(client) = reg.client_for_filetype(&ft) {
+                        let c = client.lock().await;
+                        let _ = c.did_change(&uri, version, &text).await;
+                    }
+                }
+            }
+        }
+
+        Request::DidSave { id: _, uri, text } => {
+            let ft = uri_ft.lock().await.get(&uri).cloned();
+            if let Some(ft) = ft {
+                let r = registry.lock().await;
+                if let Some(ref reg) = *r {
+                    if let Some(client) = reg.client_for_filetype(&ft) {
+                        let c = client.lock().await;
+                        let _ = c.did_save(&uri, text.as_deref()).await;
+                    }
+                }
+            }
+        }
+
+        Request::DidClose { id: _, uri } => {
+            let ft = uri_ft.lock().await.remove(&uri);
+            if let Some(ft) = ft {
+                let r = registry.lock().await;
+                if let Some(ref reg) = *r {
+                    if let Some(client) = reg.client_for_filetype(&ft) {
+                        let c = client.lock().await;
+                        let _ = c.did_close(&uri).await;
+                    }
+                }
+            }
+        }
+
+        Request::Completion { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.completion(&uri, line, character).await {
+                        Ok(items) => send_event(&out, json!({"type": "completion", "id": id, "items": items})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                } else {
+                    send_event(&out, json!({"type": "completion", "id": id, "items": []}));
+                }
+            }
+        }
+
+        Request::Hover { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.hover(&uri, line, character).await {
+                        Ok(Some(contents)) => send_event(&out, json!({"type": "hover", "id": id, "contents": contents})),
+                        Ok(None) => send_event(&out, json!({"type": "hover", "id": id, "contents": null})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::Definition { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.definition(&uri, line, character).await {
+                        Ok(locs) => send_event(&out, json!({"type": "definition", "id": id, "locations": locs})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::References { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.references(&uri, line, character).await {
+                        Ok(locs) => send_event(&out, json!({"type": "references", "id": id, "locations": locs})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::CodeAction { id, uri, language_id, line, character, end_line, end_character, diagnostics } => {
+            let el = end_line.unwrap_or(line);
+            let ec = end_character.unwrap_or(character);
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.code_action(&uri, line, character, el, ec, diagnostics).await {
+                        Ok(actions) => send_event(&out, json!({"type": "codeAction", "id": id, "actions": actions})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::ExecuteAction { id, language_id, index } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.execute_code_action(index).await {
+                        Ok(Some(edit)) => send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit})),
+                        Ok(None) => send_event(&out, json!({"type": "executeAction", "id": id})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::Formatting { id, uri, language_id, tab_size, insert_spaces } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.formatting(&uri, tab_size, insert_spaces).await {
+                        Ok(edits) => send_event(&out, json!({"type": "formatting", "id": id, "edits": edits})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::Rename { id, uri, language_id, line, character, new_name } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.rename(&uri, line, character, &new_name).await {
+                        Ok(Some(edit)) => send_event(&out, json!({"type": "rename", "id": id, "edit": edit})),
+                        Ok(None) => send_event(&out, json!({"type": "rename", "id": id, "edit": null})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::SignatureHelp { id, uri, language_id, line, character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.signature_help(&uri, line, character).await {
+                        Ok(Some(sigs)) => send_event(&out, json!({"type": "signatureHelp", "id": id, "signatures": sigs})),
+                        Ok(None) => send_event(&out, json!({"type": "signatureHelp", "id": id, "signatures": null})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+    }
+}
