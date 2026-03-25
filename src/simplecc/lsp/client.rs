@@ -1203,6 +1203,10 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             ..Default::default()
         }),
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..Default::default()
+        }),
         workspace: Some(WorkspaceClientCapabilities {
             apply_edit: Some(true),
             workspace_edit: Some(WorkspaceEditClientCapabilities {

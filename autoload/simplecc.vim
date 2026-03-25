@@ -2108,7 +2108,8 @@ def UpdateProgressStatus()
   for [key, info] in items(s_progress_tokens)
     var text = get(info, 'title', '')
     var msg = get(info, 'message', '')
-    var pct = get(info, 'percentage', -1)
+    var pct_raw = get(info, 'percentage', -1)
+    var pct = type(pct_raw) == v:t_number ? pct_raw : -1
     if msg !=# ''
       text = msg
     endif
@@ -2125,7 +2126,8 @@ def OnProgress(ev: dict<any>)
   var kind = get(ev, 'kind', '')
   var title = get(ev, 'title', '')
   var msg = get(ev, 'message', '')
-  var pct = get(ev, 'percentage', -1)
+  var pct_raw = get(ev, 'percentage', -1)
+  var pct = type(pct_raw) == v:t_number ? pct_raw : -1
   var server = get(ev, 'server', '')
   var token = get(ev, 'token', '')
 
