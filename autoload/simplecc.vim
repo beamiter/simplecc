@@ -1754,7 +1754,12 @@ def RestoreInlayHints()
   endif
   # Check if hints are still displayed by looking for a prop on a cached hint line
   var check_line = get(s_inlay_cache[0], 'line', 0) + 1
-  var existing = check_line > 0 ? prop_list(check_line, {bufnr: bnr, type: 'SimpleCCInlay'}) : []
+  var existing: list<any> = []
+  try
+    existing = check_line > 0 ? prop_list(check_line, {bufnr: bnr, type: 'SimpleCCInlay'}) : []
+  catch
+    return
+  endtry
   if empty(existing)
     # Hints were lost, restore from cache
     ApplyInlayHints(s_inlay_cache, bnr)
