@@ -214,6 +214,20 @@ enum Request {
         id: u64, uri: String,
         #[serde(rename = "languageId")] language_id: String,
     },
+    #[serde(rename = "textDocument/semanticTokens/delta")]
+    SemanticTokensDelta {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+    },
+    #[serde(rename = "textDocument/semanticTokens/range")]
+    SemanticTokensRange {
+        id: u64, uri: String,
+        #[serde(rename = "languageId")] language_id: String,
+        #[serde(rename = "startLine")] start_line: u32,
+        #[serde(rename = "startCharacter")] start_character: u32,
+        #[serde(rename = "endLine")] end_line: u32,
+        #[serde(rename = "endCharacter")] end_character: u32,
+    },
     #[serde(rename = "textDocument/codeLens")]
     CodeLens {
         id: u64, uri: String,
@@ -746,6 +760,32 @@ async fn handle_request(
                 if let Some(client) = reg.client_for_filetype(&language_id) {
                     let c = client.lock().await;
                     match c.semantic_tokens_full(&uri).await {
+                        Ok(tokens) => send_event(&out, json!({"type": "semanticTokens", "id": id, "tokens": tokens})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::SemanticTokensDelta { id, uri, language_id } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.semantic_tokens_full_delta(&uri).await {
+                        Ok(tokens) => send_event(&out, json!({"type": "semanticTokens", "id": id, "tokens": tokens})),
+                        Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
+                    }
+                }
+            }
+        }
+
+        Request::SemanticTokensRange { id, uri, language_id, start_line, start_character, end_line, end_character } => {
+            let r = registry.lock().await;
+            if let Some(ref reg) = *r {
+                if let Some(client) = reg.client_for_filetype(&language_id) {
+                    let c = client.lock().await;
+                    match c.semantic_tokens_range(&uri, start_line, start_character, end_line, end_character).await {
                         Ok(tokens) => send_event(&out, json!({"type": "semanticTokens", "id": id, "tokens": tokens})),
                         Err(e) => send_event(&out, json!({"type": "error", "id": id, "message": e.to_string()})),
                     }

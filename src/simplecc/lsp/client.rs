@@ -23,6 +23,10 @@ pub struct LspClient {
     pub cached_completions: Arc<Mutex<Vec<lsp_types::CompletionItem>>>,
     /// Cached code lenses for execute
     pub cached_code_lenses: Arc<Mutex<Vec<lsp_types::CodeLens>>>,
+    /// Previous semantic token result_id per URI (for delta requests)
+    semtok_prev_result_id: Arc<Mutex<HashMap<String, String>>>,
+    /// Previous raw semantic token data per URI (for applying delta edits)
+    semtok_prev_data: Arc<Mutex<HashMap<String, Vec<lsp_types::SemanticToken>>>>,
     server_name: String,
 }
 
@@ -116,6 +120,8 @@ impl LspClient {
             cached_actions: Arc::new(Mutex::new(Vec::new())),
             cached_completions: Arc::new(Mutex::new(Vec::new())),
             cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
+            semtok_prev_result_id: Arc::new(Mutex::new(HashMap::new())),
+            semtok_prev_data: Arc::new(Mutex::new(HashMap::new())),
             server_name: server_name.to_string(),
         };
 
@@ -660,12 +666,7 @@ impl LspClient {
         Ok(ranges.iter().map(|r| convert_selection_range(r)).collect())
     }
 
-    pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
-        let result = self.request("textDocument/semanticTokens/full", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
-        let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
+    async fn get_semtok_legend(&self) -> (Vec<String>, Vec<String>) {
         let caps = self.capabilities.lock().await;
         let legend = caps.as_ref()
             .and_then(|c| c.semantic_tokens_provider.as_ref())
@@ -675,12 +676,14 @@ impl LspClient {
             });
         let type_names: Vec<String> = legend.map(|l| l.token_types.iter().map(|t| t.as_str().to_string()).collect()).unwrap_or_default();
         let mod_names: Vec<String> = legend.map(|l| l.token_modifiers.iter().map(|m| m.as_str().to_string()).collect()).unwrap_or_default();
-        drop(caps);
+        (type_names, mod_names)
+    }
 
+    fn decode_raw_tokens(data: &[lsp_types::SemanticToken], type_names: &[String], mod_names: &[String]) -> Vec<types::SemanticTokenItem> {
         let mut decoded = Vec::new();
         let mut line: u32 = 0;
         let mut start: u32 = 0;
-        for token in tokens.data {
+        for token in data {
             if token.delta_line > 0 {
                 line += token.delta_line;
                 start = token.delta_start;
@@ -702,7 +705,117 @@ impl LspClient {
                 modifiers,
             });
         }
-        Ok(decoded)
+        decoded
+    }
+
+    pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
+        let result = self.request("textDocument/semanticTokens/full", json!({
+            "textDocument": { "uri": uri },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
+        let (type_names, mod_names) = self.get_semtok_legend().await;
+
+        // Cache result_id and raw data for delta requests
+        if let Some(ref id) = tokens.result_id {
+            self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+        }
+        self.semtok_prev_data.lock().await.insert(uri.to_string(), tokens.data.clone());
+
+        Ok(Self::decode_raw_tokens(&tokens.data, &type_names, &mod_names))
+    }
+
+    pub async fn semantic_tokens_full_delta(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
+        // Check if we have a previous result_id for this URI
+        let prev_id = self.semtok_prev_result_id.lock().await.get(uri).cloned();
+        let prev_id = match prev_id {
+            Some(id) => id,
+            None => return self.semantic_tokens_full(uri).await,
+        };
+
+        let result = self.request("textDocument/semanticTokens/full/delta", json!({
+            "textDocument": { "uri": uri },
+            "previousResultId": prev_id,
+        })).await;
+
+        // On error, clear cache and fall back to full
+        let result = match result {
+            Ok(r) => r,
+            Err(_) => {
+                self.semtok_prev_result_id.lock().await.remove(uri);
+                self.semtok_prev_data.lock().await.remove(uri);
+                return self.semantic_tokens_full(uri).await;
+            }
+        };
+        if result.is_null() { return Ok(vec![]); }
+
+        let (type_names, mod_names) = self.get_semtok_legend().await;
+
+        // Try to parse as full response first, then as delta
+        if let Ok(full) = serde_json::from_value::<lsp_types::SemanticTokens>(result.clone()) {
+            // Server returned full tokens
+            if let Some(ref id) = full.result_id {
+                self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+            }
+            self.semtok_prev_data.lock().await.insert(uri.to_string(), full.data.clone());
+            Ok(Self::decode_raw_tokens(&full.data, &type_names, &mod_names))
+        } else if let Ok(delta) = serde_json::from_value::<lsp_types::SemanticTokensDelta>(result) {
+            // Server returned delta edits
+            if let Some(ref id) = delta.result_id {
+                self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+            }
+
+            // Apply edits to cached data
+            let mut data_map = self.semtok_prev_data.lock().await;
+            let data = data_map.entry(uri.to_string()).or_insert_with(Vec::new);
+
+            // Sort edits by start in reverse order to avoid index shifting
+            let mut edits = delta.edits;
+            edits.sort_by(|a, b| b.start.cmp(&a.start));
+
+            for edit in &edits {
+                let start = edit.start as usize;
+                let delete_count = edit.delete_count as usize;
+                // Remove old tokens
+                let end = (start + delete_count).min(data.len());
+                data.drain(start..end);
+                // Insert new tokens
+                if let Some(ref new_tokens) = edit.data {
+                    for (i, token) in new_tokens.iter().enumerate() {
+                        data.insert(start + i, token.clone());
+                    }
+                }
+            }
+
+            let decoded = Self::decode_raw_tokens(data, &type_names, &mod_names);
+            Ok(decoded)
+        } else {
+            // Cannot parse response, fall back to full
+            self.semtok_prev_result_id.lock().await.remove(uri);
+            self.semtok_prev_data.lock().await.remove(uri);
+            self.semantic_tokens_full(uri).await
+        }
+    }
+
+    pub async fn semantic_tokens_range(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_char: u32,
+        end_line: u32,
+        end_char: u32,
+    ) -> Result<Vec<types::SemanticTokenItem>> {
+        let result = self.request("textDocument/semanticTokens/range", json!({
+            "textDocument": { "uri": uri },
+            "range": {
+                "start": { "line": start_line, "character": start_char },
+                "end": { "line": end_line, "character": end_char },
+            },
+        })).await?;
+        if result.is_null() { return Ok(vec![]); }
+        let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
+        let (type_names, mod_names) = self.get_semtok_legend().await;
+        Ok(Self::decode_raw_tokens(&tokens.data, &type_names, &mod_names))
     }
 
     pub async fn code_lens(&self, uri: &str) -> Result<Vec<types::CodeLensItem>> {
@@ -1152,7 +1265,8 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             semantic_tokens: Some(SemanticTokensClientCapabilities {
                 requests: SemanticTokensClientCapabilitiesRequests {
-                    full: Some(SemanticTokensFullOptions::Bool(true)),
+                    full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                    range: Some(true),
                     ..Default::default()
                 },
                 token_types: vec![

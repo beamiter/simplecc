@@ -42,6 +42,9 @@ var s_spinner_idx: number = 0
 var s_spinner_frames: list<string> = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 # Semantic tokens auto state
 var s_semtok_timer: number = 0
+var s_semtok_has_full: dict<bool> = {}
+var s_semtok_range_mode: bool = false
+var s_semtok_modifier_cache: dict<bool> = {}
 # Workspace symbol live search state
 var s_ws_input: string = ''
 var s_ws_popup: number = 0
@@ -463,6 +466,9 @@ export def OnBufClose()
   endif
   if has_key(s_pending_changes, uri)
     remove(s_pending_changes, uri)
+  endif
+  if has_key(s_semtok_has_full, uri)
+    remove(s_semtok_has_full, uri)
   endif
 enddef
 
@@ -1939,12 +1945,104 @@ export def SemanticTokens()
     echom '[SimpleCC] not initialized'
     return
   endif
-  Send({
-    type: 'textDocument/semanticTokens',
-    id: NextId(),
-    uri: BufUri(),
-    languageId: BufFt(),
-  })
+  var uri = BufUri()
+  if line('$') > g:simplecc_semtok_range_threshold
+    # Large file: use range request for visible area + buffer
+    var top = max([0, line('w0') - 1 - 100])
+    var bot = min([line('$') - 1, line('w$') - 1 + 100])
+    s_semtok_range_mode = true
+    Send({
+      type: 'textDocument/semanticTokens/range',
+      id: NextId(),
+      uri: uri,
+      languageId: BufFt(),
+      startLine: top,
+      startCharacter: 0,
+      endLine: bot,
+      endCharacter: 0,
+    })
+  elseif has_key(s_semtok_has_full, uri) && s_semtok_has_full[uri]
+    # Subsequent request: use delta
+    s_semtok_range_mode = false
+    Send({
+      type: 'textDocument/semanticTokens/delta',
+      id: NextId(),
+      uri: uri,
+      languageId: BufFt(),
+    })
+  else
+    # First request: full
+    s_semtok_range_mode = false
+    Send({
+      type: 'textDocument/semanticTokens',
+      id: NextId(),
+      uri: uri,
+      languageId: BufFt(),
+    })
+  endif
+enddef
+
+def EnsureModifierHighlight(base_hl: string, mod_suffix: string): string
+  var combined = base_hl .. mod_suffix
+  if has_key(s_semtok_modifier_cache, combined)
+    return combined
+  endif
+  # Get base highlight attributes
+  var base_info = hlget(base_hl, true)
+  var mod_hl = 'SimpleCCSemantic' .. mod_suffix
+  var mod_info = hlget(mod_hl, true)
+  if !empty(base_info) && !empty(mod_info)
+    var base = base_info[0]
+    var mattr = mod_info[0]
+    # Merge: use base colors + modifier gui/cterm attributes
+    var gui_attr = get(mattr, 'gui', {})
+    var cterm_attr = get(mattr, 'cterm', {})
+    var def: dict<any> = {}
+    # Inherit link target's colors via base highlight
+    var base_gui = get(base, 'gui', {})
+    var base_cterm = get(base, 'cterm', {})
+    if has_key(base, 'guifg')
+      def.guifg = base.guifg
+    endif
+    if has_key(base, 'ctermfg')
+      def.ctermfg = base.ctermfg
+    endif
+    # Apply modifier style attributes
+    def.gui = gui_attr
+    def.cterm = cterm_attr
+    hlset([extend({name: combined}, def)])
+  else
+    # Fallback: just link to the modifier-only group
+    execute 'highlight default link ' .. combined .. ' ' .. mod_hl
+  endif
+  s_semtok_modifier_cache[combined] = true
+  return combined
+enddef
+
+def ResolveSemanticHighlight(ttype: string, mods: list<any>): list<any>
+  # Capitalize first letter for highlight group name
+  if empty(ttype)
+    return ['SimpleCCSemanticVariable', 'SimpleCCSemanticVariable']
+  endif
+  var hl_suffix = toupper(ttype[0]) .. ttype[1 :]
+  var base_hl = 'SimpleCCSemantic' .. hl_suffix
+  var ptype = base_hl
+  var hl_group = base_hl
+
+  if !empty(mods)
+    # Check modifiers in priority order
+    var mod_priority = ['deprecated', 'readonly', 'static', 'defaultLibrary', 'declaration']
+    for mod in mod_priority
+      if index(mods, mod) >= 0
+        var mod_suffix = toupper(mod[0]) .. mod[1 :]
+        hl_group = EnsureModifierHighlight(base_hl, mod_suffix)
+        ptype = base_hl .. mod_suffix
+        break
+      endif
+    endfor
+  endif
+
+  return [ptype, hl_group]
 enddef
 
 def OnSemanticTokens(ev: dict<any>)
@@ -1954,33 +2052,61 @@ def OnSemanticTokens(ev: dict<any>)
     return
   endif
   var bnr = bufnr('%')
-  # Clear old semantic highlights
-  for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
-      'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
-      'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
-      'Number', 'Operator', 'Decorator']
-    var ptype = 'SimpleCCSemantic' .. tt
-    try
-      prop_type_add(ptype, {bufnr: bnr, highlight: 'SimpleCCSemantic' .. tt})
-    catch
-    endtry
-    try
-      prop_remove({type: ptype, bufnr: bnr, all: true})
-    catch
-    endtry
-  endfor
+  var uri = BufUri()
+  var prio = g:simplecc_semtok_priority
+
+  if s_semtok_range_mode
+    # Range mode: only clear props in visible region
+    var top = max([1, line('w0') - 100])
+    var bot = min([line('$'), line('w$') + 100])
+    for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
+        'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
+        'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
+        'Number', 'Operator', 'Decorator']
+      var ptype = 'SimpleCCSemantic' .. tt
+      try
+        prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: prio})
+      catch
+      endtry
+      for lnum in range(top, bot)
+        try
+          prop_remove({type: ptype, bufnr: bnr, lnum: lnum})
+        catch
+        endtry
+      endfor
+    endfor
+  else
+    # Full/delta mode: clear all props
+    for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
+        'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
+        'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
+        'Number', 'Operator', 'Decorator']
+      var ptype = 'SimpleCCSemantic' .. tt
+      try
+        prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: prio})
+      catch
+      endtry
+      try
+        prop_remove({type: ptype, bufnr: bnr, all: true})
+      catch
+      endtry
+    endfor
+    # Mark that full tokens have been received for delta support
+    s_semtok_has_full[uri] = true
+  endif
 
   for t in tokens
     var lnum = get(t, 'line', 0) + 1
     var col = get(t, 'start', 0) + 1
     var length = get(t, 'length', 0)
     var ttype = get(t, 'token_type', '')
-    # Capitalize first letter for highlight group name
-    var hl_suffix = toupper(ttype[0]) .. ttype[1 :]
-    var ptype = 'SimpleCCSemantic' .. hl_suffix
+    var mods: list<any> = get(t, 'modifiers', [])
+    var resolved = ResolveSemanticHighlight(ttype, mods)
+    var ptype: string = resolved[0]
+    var hl_group: string = resolved[1]
     if lnum > 0 && col > 0 && length > 0
       try
-        prop_type_add(ptype, {bufnr: bnr, highlight: ptype})
+        prop_type_add(ptype, {bufnr: bnr, highlight: hl_group, priority: prio})
       catch
       endtry
       try
@@ -2903,6 +3029,15 @@ def RequestSemanticTokensDebounced()
   s_semtok_timer = timer_start(1000, (_) => {
     SemanticTokens()
   })
+enddef
+
+export def OnWinScrolled()
+  if !s_initialized || !g:simplecc_semantic_tokens
+    return
+  endif
+  if line('$') > g:simplecc_semtok_range_threshold
+    RequestSemanticTokensDebounced()
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════

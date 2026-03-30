@@ -33,6 +33,8 @@ g:simplecc_diag_max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
 g:simplecc_diag_float      = get(g:, 'simplecc_diag_float', 0)
 g:simplecc_diag_min_severity = get(g:, 'simplecc_diag_min_severity', 4)
 g:simplecc_semantic_tokens = get(g:, 'simplecc_semantic_tokens', 0)
+g:simplecc_semtok_priority = get(g:, 'simplecc_semtok_priority', 100)
+g:simplecc_semtok_range_threshold = get(g:, 'simplecc_semtok_range_threshold', 5000)
 g:simplecc_pull_diagnostics = get(g:, 'simplecc_pull_diagnostics', 0)
 g:simplecc_status          = ''
 
@@ -140,6 +142,12 @@ highlight default link SimpleCCSemanticString    String
 highlight default link SimpleCCSemanticNumber    Number
 highlight default link SimpleCCSemanticOperator  Operator
 highlight default link SimpleCCSemanticDecorator PreProc
+# Modifier-only semantic token highlights
+highlight default SimpleCCSemanticDeprecated gui=strikethrough cterm=strikethrough
+highlight default SimpleCCSemanticReadonly gui=italic cterm=italic
+highlight default SimpleCCSemanticStatic gui=bold cterm=bold
+highlight default SimpleCCSemanticDefaultLibrary gui=italic cterm=italic
+highlight default SimpleCCSemanticDeclaration gui=bold cterm=bold
 
 # ─── Autocmds ─────────────────────────────────────────────
 augroup simplecc
@@ -155,4 +163,5 @@ augroup simplecc
   autocmd CompleteChanged * simplecc#OnCompleteChanged()
   autocmd CompleteDone * simplecc#OnCompleteDone()
   autocmd CursorHold * simplecc#OnCursorHold()
+  autocmd WinScrolled * simplecc#OnWinScrolled()
 augroup END
