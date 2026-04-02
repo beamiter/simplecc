@@ -516,6 +516,24 @@ export def OnInsertLeave()
   s_comp_preview_orig_text = ''
 enddef
 
+export def OnInsertCharPre()
+  # Auto-close completion menu when pressing non-special keys
+  if !pumvisible()
+    return
+  endif
+
+  # Allow navigation keys and special keys to keep the menu open
+  var key = v:char
+  # Allow: letters, digits, underscores, backspace, spaces to continue completion
+  # Close menu for other characters like punctuation, operators, etc.
+  if key =~ '[[:alnum:]_\s]'
+    return
+  endif
+
+  # Close the menu for other characters
+  execute "normal! \<C-e>"
+enddef
+
 export def OnCompleteChanged()
   if !s_initialized
     return
@@ -595,13 +613,53 @@ export def TriggerCompletionManual()
   RequestCompletion()
 enddef
 
-export def HandleTabKey()
+export def SelectTabKey(): string
   if pumvisible()
-    # Menu is open, move to next item (like pressing down arrow)
-    feedkeys("\<C-n>", 'n')
+    # Menu is open, navigate/select in menu
+    return "\<C-n>"
   else
     # Menu is closed, trigger completion
     TriggerCompletionManual()
+    return ""
+  endif
+enddef
+
+export def SelectShiftTabKey(): string
+  if pumvisible()
+    # Menu is open, move to previous item
+    return "\<C-p>"
+  else
+    return ""
+  endif
+enddef
+
+export def SelectDownKey(): string
+  if pumvisible()
+    # Menu is open, move down
+    return "\<C-n>"
+  else
+    # Menu is closed, move cursor down normally
+    return "\<Down>"
+  endif
+enddef
+
+export def SelectUpKey(): string
+  if pumvisible()
+    # Menu is open, move up
+    return "\<C-p>"
+  else
+    # Menu is closed, move cursor up normally
+    return "\<Up>"
+  endif
+enddef
+
+export def SelectEnterKey(): string
+  if pumvisible()
+    # Menu is open, select current item
+    return "\<C-y>"
+  else
+    # Menu is closed, insert newline normally
+    return "\<CR>"
   endif
 enddef
 
@@ -700,10 +758,9 @@ def OnCompletion(ev: dict<any>)
     # Get original text from start position to cursor
     s_comp_preview_orig_text = line[start :]
 
-    # Save original completeopt and set noselect/noinsert to avoid auto-selecting first item
+    # Save original completeopt and configure
     var saved_completeopt = &completeopt
-    set completeopt+=noselect
-    set completeopt+=noinsert
+    set completeopt=menu,menuone,noselect,noinsert
     complete(start + 1, complete_items)
     # Restore after complete() returns
     &completeopt = saved_completeopt

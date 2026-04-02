@@ -95,9 +95,12 @@ if !g:simplecc_no_default_maps
   nnoremap <silent> gy         :SimpleCCTypeDef<CR>
   nnoremap <silent> <leader>o  :SimpleCCOutline<CR>
   nnoremap <silent> <leader>ih :SimpleCCInlayHints<CR>
-  # Insert mode: Tab to enter menu or move down, Shift+Tab to move up
-  imap <silent> <Tab> <C-o>:call simplecc#HandleTabKey()<CR>
-  imap <silent> <S-Tab> <C-p>
+  # Insert mode: Tab to enter menu or move down
+  inoremap <silent> <expr> <Tab> simplecc#SelectTabKey()
+  inoremap <silent> <expr> <S-Tab> simplecc#SelectShiftTabKey()
+  inoremap <silent> <expr> <Down> simplecc#SelectDownKey()
+  inoremap <silent> <expr> <Up> simplecc#SelectUpKey()
+  inoremap <silent> <expr> <CR> simplecc#SelectEnterKey()
 endif
 
 # ─── Signs ────────────────────────────────────────────────
@@ -167,4 +170,5 @@ augroup simplecc
   autocmd CompleteDone * simplecc#OnCompleteDone()
   autocmd CursorHold * simplecc#OnCursorHold()
   autocmd WinScrolled * simplecc#OnWinScrolled()
+  autocmd InsertCharPre * simplecc#OnInsertCharPre()
 augroup END
