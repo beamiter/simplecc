@@ -889,6 +889,10 @@ def OnFormatting(ev: dict<any>)
     echo 'No formatting changes'
     return
   endif
+  # Log edits for debugging
+  for edit in edits
+    Log(printf('Format edit: line %d-%d, char %d-%d: %s', get(edit, 'line', 0), get(edit, 'end_line', 0), get(edit, 'character', 0), get(edit, 'end_character', 0), json_encode(edit)))
+  endfor
   ApplyTextEdits(bufnr('%'), edits)
   echo printf('Applied %d edits', len(edits))
 enddef
@@ -1272,8 +1276,10 @@ def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
     endif
 
     # Build the replacement
-    var prefix = sl > 0 && !empty(lines) ? lines[0][: sc - 2] : ''
-    var suffix = !empty(lines) ? lines[-1][ec - 1 :] : ''
+    # When sc=1 (LSP char 0), we're at the start, so prefix should be empty
+    # When ec=1 (LSP endChar 0), we're at the start, so suffix should be empty
+    var prefix = sl > 0 && !empty(lines) && sc > 1 ? lines[0][: sc - 2] : ''
+    var suffix = !empty(lines) && ec > 1 ? lines[-1][ec - 1 :] : ''
 
     new_lines[0] = prefix .. new_lines[0]
     new_lines[-1] = new_lines[-1] .. suffix
