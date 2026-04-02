@@ -95,6 +95,9 @@ if !g:simplecc_no_default_maps
   nnoremap <silent> gy         :SimpleCCTypeDef<CR>
   nnoremap <silent> <leader>o  :SimpleCCOutline<CR>
   nnoremap <silent> <leader>ih :SimpleCCInlayHints<CR>
+  # Insert mode: Tab to enter menu or move down, Shift+Tab to move up
+  imap <silent> <Tab> <C-o>:call simplecc#HandleTabKey()<CR>
+  imap <silent> <S-Tab> <C-p>
 endif
 
 # ─── Signs ────────────────────────────────────────────────

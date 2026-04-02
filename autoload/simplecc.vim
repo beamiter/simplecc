@@ -63,6 +63,10 @@ var s_pending_changes: dict<list<dict<any>>> = {}
 var s_listener_ids: dict<number> = {}
 # Inlay hints version tracking
 var s_inlay_request_version: dict<number> = {}
+# Completion preview state - for real-time preview of selected completion
+var s_comp_preview_start_line: number = 0
+var s_comp_preview_start_col: number = 0
+var s_comp_preview_orig_text: string = ''
 
 def NextId(): number
   s_next_id += 1
@@ -496,12 +500,20 @@ export def OnCursorMovedI()
   if !s_initialized || !g:simplecc_auto_complete
     return
   endif
+  # Don't trigger completion if menu is open - prevent interference
+  if pumvisible()
+    return
+  endif
   TriggerCompletion()
 enddef
 
 export def OnInsertLeave()
   s_comp_requesting = false
   CloseSignaturePopup()
+  # Clear completion preview state
+  s_comp_preview_start_line = 0
+  s_comp_preview_start_col = 0
+  s_comp_preview_orig_text = ''
 enddef
 
 export def OnCompleteChanged()
@@ -517,21 +529,20 @@ export def OnCompleteChanged()
   if sel >= len(items)
     return
   endif
+
   var ci = items[sel]
   var ud = get(ci, 'user_data', {})
-  if type(ud) != v:t_dict
-    return
+  if type(ud) == v:t_dict
+    var idx = get(ud, 'index', -1)
+    if idx >= 0
+      Send({
+        type: 'completionItem/resolve',
+        id: NextId(),
+        languageId: BufFt(),
+        index: idx,
+      })
+    endif
   endif
-  var idx = get(ud, 'index', -1)
-  if idx < 0
-    return
-  endif
-  Send({
-    type: 'completionItem/resolve',
-    id: NextId(),
-    languageId: BufFt(),
-    index: idx,
-  })
 enddef
 
 def OnCompletionResolve(ev: dict<any>)
@@ -575,6 +586,23 @@ def TriggerCompletion()
   s_comp_timer = timer_start(g:simplecc_complete_delay, (_) => {
     RequestCompletion()
   })
+enddef
+
+export def TriggerCompletionManual()
+  if s_comp_timer > 0
+    timer_stop(s_comp_timer)
+  endif
+  RequestCompletion()
+enddef
+
+export def HandleTabKey()
+  if pumvisible()
+    # Menu is open, move to next item (like pressing down arrow)
+    feedkeys("\<C-n>", 'n')
+  else
+    # Menu is closed, trigger completion
+    TriggerCompletionManual()
+  endif
 enddef
 
 def RequestCompletion()
@@ -665,7 +693,20 @@ def OnCompletion(ev: dict<any>)
   endfor
 
   if mode() ==# 'i'
+    # Save completion start position for preview
+    var current_line_nr = line('.')
+    s_comp_preview_start_line = current_line_nr - 1
+    s_comp_preview_start_col = start
+    # Get original text from start position to cursor
+    s_comp_preview_orig_text = line[start :]
+
+    # Save original completeopt and set noselect/noinsert to avoid auto-selecting first item
+    var saved_completeopt = &completeopt
+    set completeopt+=noselect
+    set completeopt+=noinsert
     complete(start + 1, complete_items)
+    # Restore after complete() returns
+    &completeopt = saved_completeopt
   endif
 enddef
 
@@ -2799,6 +2840,11 @@ export def OnCompleteDone()
   if !s_initialized
     return
   endif
+  # Clear completion preview state
+  s_comp_preview_start_line = 0
+  s_comp_preview_start_col = 0
+  s_comp_preview_orig_text = ''
+
   var ci = v:completed_item
   if empty(ci)
     return
