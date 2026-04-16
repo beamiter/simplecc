@@ -1375,9 +1375,9 @@ def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
 
     # Build the replacement
     # When sc=1 (LSP char 0), we're at the start, so prefix should be empty
-    # When ec=1 (LSP endChar 0), we're at the start, so suffix should be empty
+    # When ec=1 (LSP endChar 0), we're at the start, so suffix is the entire line
     var prefix = sl > 0 && !empty(lines) && sc > 1 ? lines[0][: sc - 2] : ''
-    var suffix = !empty(lines) && ec > 1 ? lines[-1][ec - 1 :] : ''
+    var suffix = !empty(lines) ? lines[-1][ec - 1 :] : ''
 
     new_lines[0] = prefix .. new_lines[0]
     new_lines[-1] = new_lines[-1] .. suffix
