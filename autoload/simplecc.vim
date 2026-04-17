@@ -1346,6 +1346,36 @@ def OnApplyEdit(ev: dict<any>)
   echo printf('Applied %d edits across %d files', total_edits, len(changes))
 enddef
 
+def Utf16ToCharOffset(line: string, utf16_offset: number): number
+  # Convert UTF-16 code unit offset to character offset
+  if utf16_offset <= 0
+    return 0
+  endif
+
+  var utf16_count = 0
+  var char_count = 0
+
+  for char_idx in range(strchars(line))
+    if utf16_count >= utf16_offset
+      break
+    endif
+
+    var char = strcharpart(line, char_idx, 1)
+    var codepoint = char2nr(char)
+
+    # Codepoints >= U+10000 require 2 UTF-16 code units (surrogate pair)
+    if codepoint >= 0x10000
+      utf16_count += 2
+    else
+      utf16_count += 1
+    endif
+
+    char_count = char_idx + 1
+  endfor
+
+  return char_count
+enddef
+
 def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
   # Sort edits in reverse order to avoid offset issues
   var sorted = sort(copy(edits), (a, b) => {
@@ -1357,9 +1387,7 @@ def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
 
   for edit in sorted
     var sl = get(edit, 'line', 0) + 1
-    var sc = get(edit, 'character', 0) + 1
     var el = get(edit, 'end_line', get(edit, 'line', 0)) + 1
-    var ec = get(edit, 'end_character', 0) + 1
     var new_text = get(edit, 'new_text', '')
     var new_lines = split(new_text, "\n", true)
 
@@ -1373,11 +1401,17 @@ def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
       continue
     endif
 
+    # Convert UTF-16 offsets to character offsets (for Vim string slicing)
+    var start_offset = get(edit, 'character', 0)
+    var end_offset = get(edit, 'end_character', 0)
+
+    var sc = Utf16ToCharOffset(lines[0], start_offset)
+    var ec = Utf16ToCharOffset(lines[-1], end_offset)
+
     # Build the replacement
-    # When sc=1 (LSP char 0), we're at the start, so prefix should be empty
-    # When ec=1 (LSP endChar 0), we're at the start, so suffix is the entire line
-    var prefix = sl > 0 && !empty(lines) && sc > 1 ? lines[0][: sc - 2] : ''
-    var suffix = !empty(lines) ? lines[-1][ec - 1 :] : ''
+    # sc and ec are now 0-based character offsets
+    var prefix = sc > 0 ? lines[0][: sc - 1] : ''
+    var suffix = ec > 0 && ec < strchars(lines[-1]) ? lines[-1][ec :] : (ec == 0 ? lines[-1] : '')
 
     new_lines[0] = prefix .. new_lines[0]
     new_lines[-1] = new_lines[-1] .. suffix
