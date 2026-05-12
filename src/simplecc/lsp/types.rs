@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use urlencoding;
 
 /// Simplified completion item sent to Vim.
 #[derive(Debug, Clone, Serialize)]
@@ -300,7 +301,7 @@ pub fn extract_doc(doc: &Option<lsp_types::Documentation>) -> Option<String> {
 /// Convert LSP Location to our simplified Location.
 pub fn from_lsp_location(loc: &lsp_types::Location) -> Location {
     Location {
-        uri: loc.uri.to_string(),
+        uri: decode_uri(&loc.uri.to_string()),
         line: loc.range.start.line,
         character: loc.range.start.character,
         end_line: Some(loc.range.end.line),
@@ -404,4 +405,17 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
         }
     }
     WorkspaceEdit { changes }
+}
+
+/// Decode file:// URI to proper path.
+fn decode_uri(uri: &str) -> String {
+    if let Some(path) = uri.strip_prefix("file://") {
+        // Use urlencoding crate if available, otherwise do basic decoding
+        match urlencoding::decode(path) {
+            Ok(decoded) => decoded.to_string(),
+            Err(_) => path.to_string(),
+        }
+    } else {
+        uri.to_string()
+    }
 }

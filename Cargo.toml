@@ -20,6 +20,7 @@ tar = "0.4"
 zip = "2"
 futures-util = "0.3"
 dirs = "5"
+urlencoding = "2"
 
 [profile.release]
 opt-level = 3
