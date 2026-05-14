@@ -387,6 +387,10 @@ def SendDidOpen(bufnr: number)
     version: version,
     text: text,
   })
+  # Clear any pending changes since we just sent the full document
+  if has_key(s_pending_changes, uri)
+    s_pending_changes[uri] = []
+  endif
   # Register listener for incremental sync
   RegisterListener(bufnr)
 enddef
@@ -427,10 +431,13 @@ def SendDidChange()
   endif
   listener_flush(bufnr('%'))
   var version = DocVersion(uri)
-  # Use incremental changes if available
-  if has_key(s_pending_changes, uri) && !empty(s_pending_changes[uri])
+  # For newly opened documents (version <= 2), always send full text to avoid
+  # incremental sync issues when large content is pasted into an empty file
+  var use_incremental = has_key(s_pending_changes, uri) && !empty(s_pending_changes[uri]) && version > 2
+  if use_incremental
     var changes = s_pending_changes[uri]
     s_pending_changes[uri] = []
+    Log(printf('SendDidChange: incremental, uri=%s, version=%d, changes=%d', uri, version, len(changes)))
     Send({
       type: 'textDocument/didChange',
       id: NextId(),
@@ -440,6 +447,11 @@ def SendDidChange()
     })
   else
     var text = join(getline(1, '$'), "\n") .. "\n"
+    # Clear pending changes since we're sending full text
+    if has_key(s_pending_changes, uri)
+      s_pending_changes[uri] = []
+    endif
+    Log(printf('SendDidChange: full text, uri=%s, version=%d, text_len=%d', uri, version, len(text)))
     Send({
       type: 'textDocument/didChange',
       id: NextId(),
