@@ -364,16 +364,21 @@ def DocVersion(uri: string): number
 enddef
 
 def SendDidOpen(bufnr: number)
+  Log(printf('SendDidOpen called: bufnr=%d', bufnr))
   if !s_initialized
+    Log('SendDidOpen: not initialized')
     return
   endif
   var uri = BufUri(bufnr)
   var ft = BufFt(bufnr)
+  Log(printf('SendDidOpen: uri=%s, ft=%s', uri, ft))
   if ft ==# '' || uri ==# 'file://'
+    Log(printf('SendDidOpen: empty ft or uri, ft=%s, uri=%s', ft, uri))
     return
   endif
   var text = join(getbufline(bufnr, 1, '$'), "\n") .. "\n"
   var version = DocVersion(uri)
+  Log(printf('SendDidOpen: sending didOpen, uri=%s, ft=%s, version=%d, text_len=%d', uri, ft, version, len(text)))
   Send({
     type: 'textDocument/didOpen',
     id: NextId(),
@@ -386,6 +391,25 @@ def SendDidOpen(bufnr: number)
   RegisterListener(bufnr)
 enddef
 
+def EnsureDocumentOpened(bufnr: number = 0)
+  var bnr = bufnr == 0 ? bufnr('%') : bufnr
+  var uri = BufUri(bnr)
+  var ft = BufFt(bnr)
+  # Check if document is already opened
+  if has_key(s_doc_versions, uri)
+    Log(printf('EnsureDocumentOpened: already opened, uri=%s', uri))
+    return
+  endif
+  # Check if valid buffer
+  if ft ==# '' || uri ==# 'file://'
+    Log(printf('EnsureDocumentOpened: invalid buffer, ft=%s, uri=%s', ft, uri))
+    return
+  endif
+  # Send didOpen now
+  Log(printf('EnsureDocumentOpened: sending didOpen for uri=%s', uri))
+  SendDidOpen(bnr)
+enddef
+
 def SendDidChange()
   if !s_initialized
     return
@@ -393,6 +417,12 @@ def SendDidChange()
   var uri = BufUri()
   var ft = BufFt()
   if ft ==# '' || uri ==# 'file://'
+    return
+  endif
+  # Ensure document is opened before sending changes
+  if !has_key(s_doc_versions, uri)
+    Log(printf('SendDidChange: document not opened yet, sending didOpen first, uri=%s', uri))
+    SendDidOpen(bufnr('%'))
     return
   endif
   listener_flush(bufnr('%'))
@@ -421,13 +451,23 @@ def SendDidChange()
 enddef
 
 export def OnBufOpen()
+  Log(printf('OnBufOpen called: buf=%s, ft=%s, name=%s', bufnr('%'), &filetype, bufname('%')))
   if !s_initialized
+    Log('OnBufOpen: not initialized')
     return
   endif
   var ft = &filetype
   if ft ==# '' || bufname('%') ==# ''
+    Log(printf('OnBufOpen: empty ft or bufname, ft=%s, name=%s', ft, bufname('%')))
     return
   endif
+  var uri = BufUri()
+  # Avoid sending duplicate didOpen for the same document
+  if has_key(s_doc_versions, uri)
+    Log(printf('OnBufOpen: document already opened, uri=%s', uri))
+    return
+  endif
+  Log(printf('OnBufOpen: calling SendDidOpen, uri=%s', uri))
   SendDidOpen(bufnr('%'))
   RequestInlayHintsDebounced()
   RequestSemanticTokensDebounced()
@@ -965,17 +1005,24 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 export def Format()
+  var uri = BufUri()
+  var ft = BufFt()
+  Log(printf('Format called: uri=%s, ft=%s, has_version=%d', uri, ft, has_key(s_doc_versions, uri)))
   if !s_initialized
     echom '[SimpleCC] not initialized'
     return
   endif
 
+  # Ensure document is opened before formatting
+  EnsureDocumentOpened()
+
   var id = NextId()
+  Log(printf('Format: sending formatting request, id=%d', id))
   Send({
     type: 'textDocument/formatting',
     id: id,
-    uri: BufUri(),
-    languageId: BufFt(),
+    uri: uri,
+    languageId: ft,
     tab_size: &tabstop,
     insert_spaces: &expandtab,
   })

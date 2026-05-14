@@ -160,7 +160,8 @@ augroup simplecc
   autocmd!
   autocmd VimEnter * if g:simplecc_auto_start | simplecc#Start() | endif
   autocmd VimLeavePre * simplecc#Stop()
-  autocmd BufReadPost * simplecc#OnBufOpen()
+  autocmd BufNewFile,BufReadPost * simplecc#OnBufOpen()
+  autocmd FileType * simplecc#OnBufOpen()
   autocmd BufWritePost * simplecc#OnBufSave()
   autocmd BufUnload * simplecc#OnBufClose()
   autocmd TextChanged,TextChangedI * simplecc#OnTextChanged()
