@@ -36,6 +36,12 @@
       "args": [],
       "filetypes": ["lua"],
       "rootPatterns": [".luarc.json"]
+    },
+    "julia-lsp": {
+      "command": "julia",
+      "args": ["--startup-file=no", "--history-file=no", "-e", "using LanguageServer; runserver()"],
+      "filetypes": ["julia"],
+      "rootPatterns": ["Project.toml", "JuliaProject.toml"]
     }
   }
 }

@@ -138,6 +138,20 @@ impl Default for Config {
             initialization_options: None,
         });
 
+        // LanguageServer.jl runs through the `julia` binary; no standalone install.
+        servers.insert("julia-lsp".to_string(), ServerConfig {
+            command: "julia".to_string(),
+            args: vec![
+                "--startup-file=no".to_string(),
+                "--history-file=no".to_string(),
+                "-e".to_string(),
+                "using LanguageServer; runserver()".to_string(),
+            ],
+            filetypes: vec!["julia".to_string()],
+            root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],
+            initialization_options: None,
+        });
+
         Config { language_servers: servers }
     }
 }
