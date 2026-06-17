@@ -15,6 +15,8 @@ var s_next_id: number = 0
 var s_cbs: dict<func> = {}
 var s_root: string = ''
 var s_log: list<string> = []
+# Servers the user declined to install this session (avoids re-prompting)
+var s_declined_installs: dict<bool> = {}
 
 # Diagnostics state per URI
 var s_diagnostics: dict<list<dict<any>>> = {}
@@ -1356,10 +1358,18 @@ def OnServerStatus(ev: dict<any>)
   elseif status ==# 'notFound' && get(ev, 'installable', false)
     if g:simplecc_auto_install
       DoInstall(server)
-    else
-      echohl WarningMsg
-      echom printf('[SimpleCC] %s not found. Run :SimpleCCInstall %s to install.', server, server)
-      echohl None
+    elseif !get(s_declined_installs, server, false)
+      var prompt = msg !=# ''
+        ? printf("[SimpleCC] %s\nInstall %s now?", msg, server)
+        : printf('[SimpleCC] %s is not installed. Install it now?', server)
+      if confirm(prompt, "&Yes\n&No", 1) == 1
+        DoInstall(server)
+      else
+        s_declined_installs[server] = true
+        echohl WarningMsg
+        echom printf('[SimpleCC] Skipped. Run :SimpleCCInstall %s to install later.', server)
+        echohl None
+      endif
     endif
   elseif status ==# 'error'
     echohl ErrorMsg
@@ -2664,6 +2674,9 @@ def OnInstallResult(ev: dict<any>)
   var status = get(ev, 'status', '')
   if status ==# 'ok'
     var path = get(ev, 'path', '')
+    if has_key(s_declined_installs, server)
+      remove(s_declined_installs, server)
+    endif
     echohl ModeMsg
     echom printf('[SimpleCC] %s installed successfully: %s', server, path)
     echohl None

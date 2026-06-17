@@ -75,6 +75,22 @@ impl Registry {
             }
         };
 
+        // Server-specific readiness check: julia-lsp needs LanguageServer.jl in
+        // the dedicated @simplecc environment. The `julia` binary resolves fine,
+        // so without this check we'd spawn a process that immediately dies.
+        if name == "julia-lsp" && !super::installer::is_julia_lsp_installed() {
+            eprintln!("[simplecc] julia-lsp: LanguageServer.jl not found in @simplecc environment");
+            let event = serde_json::json!({
+                "type": "serverStatus",
+                "server": name,
+                "status": "notFound",
+                "message": "LanguageServer.jl is not installed in the @simplecc environment",
+                "installable": true,
+            });
+            let _ = self.event_tx.send(serde_json::to_string(&event).unwrap()).await;
+            return Ok(None);
+        }
+
         // Start server
         let root_uri = format!("file://{}", self.root_dir);
         let event_tx = self.event_tx.clone();

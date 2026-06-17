@@ -85,6 +85,14 @@ fn julia_lsp_env_project() -> PathBuf {
     julia_depot().join("environments").join("simplecc").join("Project.toml")
 }
 
+/// Whether LanguageServer.jl is installed in the `@simplecc` named environment.
+pub fn is_julia_lsp_installed() -> bool {
+    match std::fs::read_to_string(julia_lsp_env_project()) {
+        Ok(content) => content.contains("LanguageServer"),
+        Err(_) => false,
+    }
+}
+
 pub fn is_known_server(name: &str) -> bool {
     find_server_meta(name).is_some()
 }
