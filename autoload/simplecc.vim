@@ -1535,6 +1535,47 @@ def LocationsToQuickfix(locs: list<dict<any>>, title: string)
   endfor
   setqflist(qf_items)
   copen
+  SetupQfMappings()
+enddef
+
+def SetupQfMappings()
+  # Buffer-local mappings on the quickfix window: <CR> jumps and auto-closes
+  # the list; visual <CR> opens every selected entry (first in the window,
+  # the rest in splits).
+  nnoremap <buffer> <CR> <Cmd>call simplecc#QfEnter()<CR>
+  xnoremap <buffer> <CR> :<C-u>call simplecc#QfEnterMulti()<CR>
+enddef
+
+export def QfEnter()
+  var lnum = line('.')
+  execute 'cc ' .. lnum
+  cclose
+enddef
+
+export def QfEnterMulti()
+  var lstart = line("'<")
+  var lend = line("'>")
+  var items = getqflist()
+  cclose
+  var first = true
+  for i in range(lstart - 1, lend - 1)
+    if i < 0 || i >= len(items)
+      continue
+    endif
+    var it = items[i]
+    if it.bufnr == 0
+      continue
+    endif
+    var fname = bufname(it.bufnr)
+    if first
+      execute 'edit ' .. fnameescape(fname)
+      first = false
+    else
+      execute 'split ' .. fnameescape(fname)
+    endif
+    cursor(it.lnum, it.col > 0 ? it.col : 1)
+    normal! zz
+  endfor
 enddef
 
 # ═════════════════════════════════════════════════════════
