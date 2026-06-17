@@ -78,7 +78,7 @@ command! -nargs=? -complete=custom,SimpleCCInstallComplete SimpleCCInstall simpl
 command! -nargs=0 SimpleCCServers       simplecc#ListServers()
 
 def SimpleCCInstallComplete(arglead: string, cmdline: string, cursorpos: number): string
-  return "rust-analyzer\nclangd\npyright\nlua-language-server\ngopls"
+  return "rust-analyzer\nclangd\npyright\nlua-language-server\ngopls\njulia-lsp"
 enddef
 
 # ─── Keymaps ──────────────────────────────────────────────

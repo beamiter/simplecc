@@ -56,11 +56,33 @@ fn server_install_dir(name: &str) -> PathBuf {
 
 /// Returns the path where the binary would be if installed locally.
 pub fn installed_binary_path(name: &str) -> Option<PathBuf> {
+    // Julia LSP lives in a shared named environment, not a managed binary dir.
+    // Its "installed" marker is the env's Project.toml.
+    if name == "julia-lsp" {
+        return Some(julia_lsp_env_project());
+    }
     let meta = find_server_meta(name)?;
     let plat = current_platform();
     let dir = server_install_dir(name);
     let bin_rel = (meta.binary_rel_path)(&plat);
     Some(dir.join(bin_rel))
+}
+
+/// First Julia depot directory (respects JULIA_DEPOT_PATH, defaults to ~/.julia).
+fn julia_depot() -> PathBuf {
+    if let Some(dp) = std::env::var_os("JULIA_DEPOT_PATH") {
+        let s = dp.to_string_lossy();
+        if let Some(first) = s.split(':').find(|p| !p.is_empty()) {
+            return PathBuf::from(first);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(".julia")
+}
+
+/// Project.toml of the dedicated `@simplecc` named environment.
+fn julia_lsp_env_project() -> PathBuf {
+    julia_depot().join("environments").join("simplecc").join("Project.toml")
 }
 
 pub fn is_known_server(name: &str) -> bool {
@@ -179,6 +201,17 @@ static KNOWN_SERVERS: &[ServerMeta] = &[
             )
         }),
     },
+    // ── julia-lsp (LanguageServer.jl) ──
+    // Installs into the shared `@simplecc` environment via Pkg, not a managed
+    // binary; handled specially in do_install / installed_binary_path.
+    ServerMeta {
+        name: "julia-lsp",
+        github_repo: None,
+        download_url: |_, _| String::new(),
+        archive_kind: ArchiveKind::Command,
+        binary_rel_path: |_| "julia".to_string(),
+        install_command: None,
+    },
 ];
 
 fn find_server_meta(name: &str) -> Option<&'static ServerMeta> {
@@ -248,6 +281,11 @@ pub async fn install_server(name: &str, event_tx: &EventTx) -> Result<PathBuf> {
 // ═════════════════════════════════════════════════════════
 
 async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
+    // Julia LSP is a package installed into a shared environment, not a binary.
+    if meta.name == "julia-lsp" {
+        return install_julia_lsp(event_tx).await;
+    }
+
     let plat = current_platform();
     let install_dir = server_install_dir(meta.name);
 
@@ -374,6 +412,39 @@ async fn install_via_command(
 
     send_progress(event_tx, meta.name, "done", 100).await;
     Ok(())
+}
+
+/// Install LanguageServer.jl into the dedicated `@simplecc` shared environment.
+/// The configured command stays `julia`; we return it so the registry keeps it.
+async fn install_julia_lsp(event_tx: &EventTx) -> Result<PathBuf> {
+    if which::which("julia").is_err() {
+        bail!("'julia' not found in PATH. Please install Julia first.");
+    }
+
+    send_progress(event_tx, "julia-lsp", "setting up @simplecc environment", 0).await;
+
+    let script = "using Pkg; \
+        Pkg.activate(\"simplecc\"; shared=true); \
+        Pkg.add(\"LanguageServer\"); \
+        Pkg.instantiate()";
+
+    let output = tokio::process::Command::new("julia")
+        .args(["--startup-file=no", "--history-file=no", "-e", script])
+        .output()
+        .await
+        .context("failed to run julia")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("julia LanguageServer install failed: {}", stderr);
+    }
+
+    if !julia_lsp_env_project().exists() {
+        bail!("install reported success but {} was not created", julia_lsp_env_project().display());
+    }
+
+    send_progress(event_tx, "julia-lsp", "done", 100).await;
+    Ok(PathBuf::from("julia"))
 }
 
 // ═════════════════════════════════════════════════════════

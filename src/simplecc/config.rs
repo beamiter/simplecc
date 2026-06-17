@@ -22,6 +22,21 @@ pub struct ServerConfig {
     pub initialization_options: Option<serde_json::Value>,
 }
 
+/// Startup script for LanguageServer.jl. Loads the server from the dedicated
+/// `@simplecc` shared environment (~/.julia/environments/simplecc) so it never
+/// pollutes or conflicts with the project being edited, then points the server
+/// at the user's own project (detected from cwd / load path).
+const JULIA_LSP_SCRIPT: &str = concat!(
+    "ls_env = joinpath(get(DEPOT_PATH, 1, joinpath(homedir(), \".julia\")), \"environments\", \"simplecc\"); ",
+    "pushfirst!(LOAD_PATH, ls_env); ",
+    "using LanguageServer; ",
+    "popfirst!(LOAD_PATH); ",
+    "depot = get(ENV, \"JULIA_DEPOT_PATH\", \"\"); ",
+    "project = dirname(something(Base.current_project(pwd()), get(Base.load_path(), 1, nothing), Base.active_project())); ",
+    "server = LanguageServer.LanguageServerInstance(stdin, stdout, project, depot); ",
+    "run(server)"
+);
+
 impl Config {
     /// Load config from a path.
     pub fn load(path: &Path) -> Result<Self> {
@@ -138,14 +153,15 @@ impl Default for Config {
             initialization_options: None,
         });
 
-        // LanguageServer.jl runs through the `julia` binary; no standalone install.
+        // LanguageServer.jl runs through the `julia` binary, loaded from the
+        // dedicated `@simplecc` named environment (see JULIA_LSP_SCRIPT).
         servers.insert("julia-lsp".to_string(), ServerConfig {
             command: "julia".to_string(),
             args: vec![
                 "--startup-file=no".to_string(),
                 "--history-file=no".to_string(),
                 "-e".to_string(),
-                "using LanguageServer; runserver()".to_string(),
+                JULIA_LSP_SCRIPT.to_string(),
             ],
             filetypes: vec!["julia".to_string()],
             root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],

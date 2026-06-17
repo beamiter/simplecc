@@ -2613,7 +2613,7 @@ export def InstallServer(name: string = '')
 
   var server = name
   if server ==# ''
-    var servers = ['rust-analyzer', 'clangd', 'pyright', 'lua-language-server', 'gopls']
+    var servers = ['rust-analyzer', 'clangd', 'pyright', 'lua-language-server', 'gopls', 'julia-lsp']
     popup_menu(servers, {
       title: ' Install Language Server ',
       border: [1, 1, 1, 1],
