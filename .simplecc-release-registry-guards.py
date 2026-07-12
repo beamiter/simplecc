@@ -17,7 +17,7 @@ def replace_exact(old: str, new: str, expected: int = 1) -> None:
 
 def replace_regex(pattern: str, replacement, expected: int) -> None:
     global text
-    text, count = re.subn(pattern, replacement, text, flags=re.S)
+    text, count = re.subn(pattern, replacement, text, flags=re.S | re.M)
     if count != expected:
         raise RuntimeError(
             f"expected {expected} regex matches, found {count}: {pattern[:120]!r}"
@@ -83,48 +83,66 @@ def matching_brace(source: str, open_index: int) -> int:
     raise RuntimeError("unterminated Rust brace block")
 
 
-def collapse_two_level_blocks(prefix: str, replacement_open: str, minimum: int) -> int:
+def unwrap_registry_read_blocks() -> tuple[int, int]:
     global text
+    outer_prefix = '''            let r = registry.read().await;
+            if let Some(ref reg) = *r {'''
+    primary_token = (
+        "if let Some(client) = reg.client_for_filetype(&language_id) {"
+    )
+    fanout_token = "for client in reg.clients_for_filetype(&ft) {"
+
     starts = []
     cursor = 0
     while True:
-        index = text.find(prefix, cursor)
+        index = text.find(outer_prefix, cursor)
         if index < 0:
             break
         starts.append(index)
-        cursor = index + len(prefix)
-    if len(starts) < minimum:
-        raise RuntimeError(
-            f"expected at least {minimum} guarded blocks, found {len(starts)}"
-        )
+        cursor = index + len(outer_prefix)
 
-    first_open_offset = prefix.find("{")
-    second_open_offset = prefix.find("{", first_open_offset + 1)
-    if first_open_offset < 0 or second_open_offset < 0:
-        raise RuntimeError("guard prefix must contain two opening braces")
+    primary_count = 0
+    fanout_count = 0
+    outer_open_offset = outer_prefix.rfind("{")
 
     for start in reversed(starts):
-        outer_open = start + first_open_offset
-        inner_open = start + second_open_offset
+        outer_open = start + outer_open_offset
         outer_close = matching_brace(text, outer_open)
-        inner_close = matching_brace(text, inner_open)
-        if not inner_close < outer_close:
-            raise RuntimeError("unexpected guarded block nesting")
-        if text[inner_close + 1 : outer_close].strip():
-            raise RuntimeError("unexpected content between nested guard closings")
-        body = text[start + len(prefix) : inner_close]
-        text = text[:start] + replacement_open + body + "}" + text[outer_close + 1 :]
-    return len(starts)
+        body = text[start + len(outer_prefix) : outer_close]
+
+        if primary_token in body:
+            if body.count(primary_token) != 1:
+                raise RuntimeError("ambiguous primary-client registry block")
+            body = body.replace(
+                primary_token,
+                "if let Some(client) = primary_client(&registry, &language_id).await {",
+                1,
+            )
+            primary_count += 1
+        elif fanout_token in body:
+            if body.count(fanout_token) != 1:
+                raise RuntimeError("ambiguous filetype fan-out registry block")
+            body = body.replace(
+                fanout_token,
+                "for client in filetype_clients(&registry, &ft).await {",
+                1,
+            )
+            fanout_count += 1
+        else:
+            continue
+
+        # Keep the complete inner block, including optional else branches, and
+        # remove only the outer Registry guard. cargo fmt normalizes indentation.
+        text = text[:start] + body + text[outer_close + 1 :]
+
+    return primary_count, fanout_count
 
 
-# Import the concrete client type used by the short-lived snapshot helpers.
 replace_exact(
     "use lsp::types;\n",
     "use lsp::client::LspClient;\nuse lsp::types;\n",
 )
 
-# Snapshot helpers clone Arc<LspClient> values while the read guard is held and
-# release the registry before any language-server await begins.
 replace_exact(
     '''fn send_event(tx: &EventTx, event: Value) {
     let s = serde_json::to_string(&event).unwrap();
@@ -157,9 +175,8 @@ async fn filetype_clients(
 ''',
 )
 
-# Shutdown takes ownership of the Registry first, releasing the global write
-# guard before waiting for individual language servers to exit.
 shutdown_pattern = r'''(?P<indent>^[ ]*)let mut r = registry\.write\(\)\.await;\n(?P=indent)if let Some\(ref mut reg\) = \*r \{\n(?P=indent)    reg\.shutdown_all\(\)\.await;\n(?P=indent)\}'''
+
 
 def shutdown_replacement(match: re.Match[str]) -> str:
     indent = match.group("indent")
@@ -170,10 +187,9 @@ def shutdown_replacement(match: re.Match[str]) -> str:
         f"{indent}}}"
     )
 
+
 replace_regex(shutdown_pattern, shutdown_replacement, expected=2)
 
-# didOpen may need an exclusive guard while starting a server, but the guard is
-# released before didOpen notifications are fanned out to the clients.
 replace_exact(
     '''            let mut r = registry.write().await;
             if let Some(ref mut reg) = *r {
@@ -208,35 +224,14 @@ replace_exact(
 ''',
 )
 
-# didChange/didSave/didClose clone the client list and release the registry
-# before sending notifications.
-fanout_prefix = '''            let r = registry.read().await;
-            if let Some(ref reg) = *r {
-                for client in reg.clients_for_filetype(&ft) {
-                    let c = client;'''
-fanout_count = collapse_two_level_blocks(
-    fanout_prefix,
-    "            for c in filetype_clients(&registry, &ft).await {",
-    minimum=3,
-)
+primary_count, fanout_count = unwrap_registry_read_blocks()
+if primary_count < 20:
+    raise RuntimeError(f"expected at least 20 primary client blocks, found {primary_count}")
+if fanout_count != 3:
+    raise RuntimeError(f"expected 3 document fan-out blocks, found {fanout_count}")
 
-# All ordinary single-client features now acquire an Arc snapshot through the
-# helper, so hover/definition/semantic tokens/etc. never pin a Registry guard.
-primary_prefix = '''            let r = registry.read().await;
-            if let Some(ref reg) = *r {
-                if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client;'''
-primary_count = collapse_two_level_blocks(
-    primary_prefix,
-    "            if let Some(c) = primary_client(&registry, &language_id).await {",
-    minimum=20,
-)
-
-# The completion and completion-resolve handlers already use a short snapshot
-# block. Keep those explicit blocks, but reject every old long-lived template.
-assert fanout_prefix not in text
-assert primary_prefix not in text
-assert "let c = client;" not in text
+assert "reg.client_for_filetype(&language_id)" not in text
+assert "reg.clients_for_filetype(&ft)" not in text
 assert "registry.write().await.take()" in text
 assert "async fn primary_client(" in text
 assert "async fn filetype_clients(" in text
