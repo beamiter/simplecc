@@ -26,17 +26,27 @@ jobs:
           ref: agent/release-registry-guards
           fetch-depth: 0
 
-      - name: Preserve the two existing short client snapshots
+      - name: Adjust guarded transform assertions
         run: |
           python3 - <<'PY'
           from pathlib import Path
           path = Path('.simplecc-release-registry-guards.py')
           text = path.read_text(encoding='utf-8')
-          old = 'assert "let c = client;" not in text'
-          new = 'assert text.count("let c = client;") == 2'
-          if text.count(old) != 1:
-              raise RuntimeError('could not update short-snapshot assertion')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          replacements = [
+              (
+                  'assert "let c = client;" not in text',
+                  'assert text.count("let c = client;") == 2',
+              ),
+              (
+                  're.subn(pattern, replacement, text, flags=re.S)',
+                  're.subn(pattern, replacement, text, flags=re.S | re.M)',
+              ),
+          ]
+          for old, new in replacements:
+              if text.count(old) != 1:
+                  raise RuntimeError(f'could not update transform token: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
           PY
 
       - name: Apply guarded registry lifetime transform
