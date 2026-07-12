@@ -1,0 +1,41 @@
+name: Apply completion v4 patch
+
+on:
+  push:
+    branches:
+      - agent/completion-context-resolve-v4
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.event.head_commit.message != 'Improve completion context and resolved edits'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply patch
+        run: |
+          git apply --check .simplecc-completion-v4.patch
+          git apply .simplecc-completion-v4.patch
+
+      - name: Format and test
+        run: |
+          cargo fmt
+          cargo check
+          cargo test
+          git diff --check
+
+      - name: Commit source changes and remove bootstrap files
+        run: |
+          rm .simplecc-completion-v4.patch
+          rm .github/workflows/apply-completion-v4.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Improve completion context and resolved edits"
+          git push origin HEAD:agent/completion-context-resolve-v4
