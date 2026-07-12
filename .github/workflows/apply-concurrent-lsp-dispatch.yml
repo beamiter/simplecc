@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - agent/concurrent-lsp-dispatch
+  pull_request:
+    branches:
+      - agent/completion-context-resolve-v4
 
 permissions:
   contents: write
 
 jobs:
   apply-and-validate:
-    if: github.event.head_commit.message != 'Remove outer LSP client locks'
+    if: github.event_name == 'pull_request' || github.event.head_commit.message != 'Remove outer LSP client locks'
     runs-on: ubuntu-latest
     steps:
       - name: Check out branch
