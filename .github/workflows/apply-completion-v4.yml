@@ -1,4 +1,4 @@
-name: Apply completion v4 patch
+name: Apply completion v4 changes
 
 on:
   push:
@@ -22,10 +22,8 @@ jobs:
           ref: agent/completion-context-resolve-v4
           fetch-depth: 0
 
-      - name: Apply patch
-        run: |
-          git apply --check .simplecc-completion-v4.patch
-          git apply .simplecc-completion-v4.patch
+      - name: Apply validated source transforms
+        run: python3 .simplecc-apply-v4.py
 
       - name: Format and test
         run: |
@@ -37,6 +35,7 @@ jobs:
       - name: Commit source changes and remove bootstrap files
         run: |
           rm .simplecc-completion-v4.patch
+          rm .simplecc-apply-v4.py
           rm .github/workflows/apply-completion-v4.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
