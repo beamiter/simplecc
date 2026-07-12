@@ -94,6 +94,13 @@ replace_exact(
     "*registry.read().await = Some(reg);",
     "*registry.write().await = Some(reg);",
 )
+# The background installer captures the registry under a different variable
+# name and mutates server configuration, so it also needs an exclusive guard.
+replace_exact(
+    "src/simplecc/simplecc_daemon.rs",
+    "let mut r = reg_clone.lock().await;",
+    "let mut r = reg_clone.write().await;",
+)
 
 # LspClient already synchronizes transport, pending requests, capabilities and
 # caches internally. Remove every outer per-client lock before an LSP await.
@@ -117,9 +124,11 @@ assert "Arc<Mutex<LspClient>>" not in registry_text
 assert "tokio::sync::Mutex" not in registry_text
 assert "Arc<RwLock<Option<Registry>>>" in daemon_text
 assert "registry.lock().await" not in daemon_text
+assert "reg_clone.lock().await" not in daemon_text
 assert "client.lock().await" not in daemon_text
 assert daemon_text.count("registry.write().await") >= 3
 assert daemon_text.count("registry.read().await") >= 5
+assert "reg_clone.write().await" in daemon_text
 
 print(
     "updated concurrent dispatch:",
