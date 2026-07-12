@@ -74,7 +74,40 @@ jobs:
           ! grep -q 'reg.clients_for_filetype(&ft)' src/simplecc/simplecc_daemon.rs
 
       - name: Format
-        run: cargo fmt
+        id: format
+        continue-on-error: true
+        run: cargo fmt > rustfmt.log 2>&1
+
+      - name: Capture rustfmt context
+        if: steps.format.outcome == 'failure'
+        run: |
+          cat rustfmt.log
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          log = Path('rustfmt.log').read_text(encoding='utf-8')
+          source = Path('src/simplecc/simplecc_daemon.rs').read_text(encoding='utf-8').splitlines()
+          lines = [int(value) for value in re.findall(r'simplecc_daemon\.rs:(\d+):', log)]
+          with Path('rustfmt-context.txt').open('w', encoding='utf-8') as out:
+              out.write(log)
+              for line in lines:
+                  out.write(f'\n--- source around line {line} ---\n')
+                  start = max(1, line - 12)
+                  end = min(len(source), line + 12)
+                  for index in range(start, end + 1):
+                      out.write(f'{index:5}: {source[index - 1]}\n')
+          PY
+
+      - name: Upload rustfmt diagnostics
+        if: steps.format.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-rustfmt-error
+          path: rustfmt-context.txt
+
+      - name: Stop after rustfmt failure
+        if: steps.format.outcome == 'failure'
+        run: exit 1
 
       - name: Compile
         run: cargo check --message-format short
@@ -88,7 +121,7 @@ jobs:
         run: |
           rm .simplecc-release-registry-guards.py
           rm .github/workflows/release-registry-guards.yml
-          rm -f registry-transform.log
+          rm -f registry-transform.log rustfmt.log rustfmt-context.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
