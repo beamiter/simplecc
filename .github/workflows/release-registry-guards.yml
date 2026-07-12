@@ -1,0 +1,71 @@
+name: Release registry guards before LSP awaits
+
+on:
+  push:
+    branches:
+      - agent/release-registry-guards
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: release-registry-guards
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.event_name == 'pull_request' || github.event.head_commit.message != 'Release registry guards before LSP awaits'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/release-registry-guards
+          fetch-depth: 0
+
+      - name: Preserve the two existing short client snapshots
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.simplecc-release-registry-guards.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'assert "let c = client;" not in text'
+          new = 'assert text.count("let c = client;") == 2'
+          if text.count(old) != 1:
+              raise RuntimeError('could not update short-snapshot assertion')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Apply guarded registry lifetime transform
+        run: python3 .simplecc-release-registry-guards.py
+
+      - name: Verify guard lifetimes
+        run: |
+          grep -q 'async fn primary_client' src/simplecc/simplecc_daemon.rs
+          grep -q 'async fn filetype_clients' src/simplecc/simplecc_daemon.rs
+          grep -q 'registry.write().await.take()' src/simplecc/simplecc_daemon.rs
+          ! grep -A3 'let r = registry.read().await;' src/simplecc/simplecc_daemon.rs | grep -q 'if let Some(ref reg) = \*r'
+
+      - name: Format
+        run: cargo fmt
+
+      - name: Compile
+        run: cargo check --message-format short
+
+      - name: Test
+        run: |
+          cargo test
+          git diff --check
+
+      - name: Commit source changes and remove bootstrap files
+        run: |
+          rm .simplecc-release-registry-guards.py
+          rm .github/workflows/release-registry-guards.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Release registry guards before LSP awaits'
+          git push origin HEAD:agent/release-registry-guards
