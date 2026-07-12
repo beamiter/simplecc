@@ -68,3 +68,5 @@ jobs:
           git add -A
           git commit -m 'Cancel superseded completion requests'
           git push origin HEAD:agent/cancel-superseded-completions
+
+# trigger validation
