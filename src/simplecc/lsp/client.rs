@@ -27,6 +27,8 @@ pub struct LspClient {
     next_id: Arc<AtomicI64>,
     /// Pending requests: jsonrpc id -> oneshot sender
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
+    /// Newest in-flight request id per latest-wins feature key.
+    latest_requests: Arc<Mutex<HashMap<String, i64>>>,
     /// Server capabilities after initialize
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
@@ -122,6 +124,7 @@ impl LspClient {
             transport,
             next_id: Arc::new(AtomicI64::new(1)),
             pending,
+            latest_requests: Arc::new(Mutex::new(HashMap::new())),
             capabilities,
             cached_actions: Arc::new(Mutex::new(Vec::new())),
             cached_completions: Arc::new(Mutex::new(CompletionCache::default())),
@@ -157,6 +160,67 @@ impl LspClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        match self
+            .request_with_timeout_inner(None, method, params, timeout)
+            .await?
+        {
+            Some(result) => Ok(result),
+            None => bail!("non-superseding request was unexpectedly cancelled: {method}"),
+        }
+    }
+
+    /// Send a request where only the newest request for `key` is useful.
+    /// Starting a replacement drops the previous response channel and emits
+    /// `$/cancelRequest`. Superseded calls return `Ok(None)` without producing
+    /// a daemon error event.
+    async fn request_latest_with_timeout(
+        &self,
+        key: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>> {
+        self.request_with_timeout_inner(Some(key), method, params, timeout)
+            .await
+    }
+
+    async fn send_message(&self, msg: &Value) -> Result<()> {
+        let mut transport = self.transport.lock().await;
+        transport.send(msg).await
+    }
+
+    async fn cancel_pending_request(&self, id: i64) {
+        let removed = self.pending.lock().await.remove(&id).is_some();
+        if !removed {
+            return;
+        }
+
+        let cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "$/cancelRequest",
+            "params": { "id": id },
+        });
+        let _ = self.send_message(&cancel).await;
+    }
+
+    /// Remove `key` only if it still points at `id`. A false return means a
+    /// newer request replaced this one while it was waiting for the server.
+    async fn clear_latest_request(&self, key: &str, id: i64) -> bool {
+        let mut latest = self.latest_requests.lock().await;
+        if latest.get(key).copied() != Some(id) {
+            return false;
+        }
+        latest.remove(key);
+        true
+    }
+
+    async fn request_with_timeout_inner(
+        &self,
+        latest_key: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Option<Value>> {
         let id = self.next_request_id();
         let msg = json!({
             "jsonrpc": "2.0",
@@ -166,15 +230,25 @@ impl LspClient {
         });
 
         let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self.pending.lock().await;
-            map.insert(id, tx);
-        }
+        self.pending.lock().await.insert(id, tx);
 
-        let send_result = {
-            let mut t = self.transport.lock().await;
-            t.send(&msg).await
+        // Hold the latest-request map while cancelling the previous request and
+        // writing the replacement. This guarantees the server observes
+        // request(old) -> cancel(old) -> request(new), never cancel-before-send.
+        let send_result = if let Some(key) = latest_key {
+            let mut latest = self.latest_requests.lock().await;
+            if let Some(previous_id) = latest.insert(key.to_string(), id) {
+                self.cancel_pending_request(previous_id).await;
+            }
+            let result = self.send_message(&msg).await;
+            if result.is_err() && latest.get(key).copied() == Some(id) {
+                latest.remove(key);
+            }
+            result
+        } else {
+            self.send_message(&msg).await
         };
+
         if let Err(err) = send_result {
             self.pending.lock().await.remove(&id);
             return Err(err);
@@ -184,11 +258,18 @@ impl LspClient {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
                 self.pending.lock().await.remove(&id);
+                if let Some(key) = latest_key {
+                    if !self.clear_latest_request(key, id).await {
+                        return Ok(None);
+                    }
+                }
                 return Err(err.into());
             }
             Err(_) => {
-                self.pending.lock().await.remove(&id);
-                let _ = self.notify("$/cancelRequest", json!({ "id": id })).await;
+                self.cancel_pending_request(id).await;
+                if let Some(key) = latest_key {
+                    self.clear_latest_request(key, id).await;
+                }
                 bail!(
                     "LSP request timed out after {}ms: {}",
                     timeout.as_millis(),
@@ -197,11 +278,17 @@ impl LspClient {
             }
         };
 
+        if let Some(key) = latest_key {
+            if !self.clear_latest_request(key, id).await {
+                return Ok(None);
+            }
+        }
+
         if let Some(err) = resp.get("error") {
             bail!("LSP error: {}", err);
         }
 
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        Ok(Some(resp.get("result").cloned().unwrap_or(Value::Null)))
     }
 
     /// Send a JSON-RPC notification (no response expected).
@@ -211,8 +298,7 @@ impl LspClient {
             "method": method,
             "params": params,
         });
-        let mut t = self.transport.lock().await;
-        t.send(&msg).await
+        self.send_message(&msg).await
     }
 
     // ─── LSP Lifecycle ──────────────────────────────────────
@@ -353,7 +439,7 @@ impl LspClient {
         max_items: usize,
         trigger_kind: u32,
         trigger_character: Option<&str>,
-    ) -> Result<(u64, Vec<types::CompletionItem>)> {
+    ) -> Result<Option<(u64, Vec<types::CompletionItem>)>> {
         // Allocate at request start, not response time. If an older request
         // returns after a newer one, it must never replace the newer cache.
         let generation = self.completion_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -394,8 +480,10 @@ impl LspClient {
             context["triggerCharacter"] = json!(trigger);
         }
 
-        let result = self
-            .request_with_timeout(
+        let request_key = format!("completion:{uri}");
+        let result = match self
+            .request_latest_with_timeout(
+                &request_key,
                 "textDocument/completion",
                 json!({
                     "textDocument": { "uri": uri },
@@ -404,7 +492,11 @@ impl LspClient {
                 }),
                 Duration::from_secs(3),
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
 
         let mut items = if result.is_array() {
             serde_json::from_value::<Vec<lsp_types::CompletionItem>>(result)?
@@ -429,7 +521,7 @@ impl LspClient {
             .map(|(idx, item)| types::from_lsp_completion_item(item, idx))
             .collect();
 
-        Ok((generation, normalized))
+        Ok(Some((generation, normalized)))
     }
 
     pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<String>> {

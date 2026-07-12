@@ -599,13 +599,14 @@ async fn handle_request(
                     )
                     .await
                 {
-                    Ok((generation, items)) => send_event(
+                    Ok(Some((generation, items))) => send_event(
                         &out,
                         json!({
                             "type": "completion", "id": id,
                             "generation": generation, "items": items
                         }),
                     ),
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
