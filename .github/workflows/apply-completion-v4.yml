@@ -4,18 +4,22 @@ on:
   push:
     branches:
       - agent/completion-context-resolve-v4
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   apply-and-validate:
-    if: github.event.head_commit.message != 'Improve completion context and resolved edits'
+    if: github.event_name == 'pull_request' || github.event.head_commit.message != 'Improve completion context and resolved edits'
     runs-on: ubuntu-latest
     steps:
-      - name: Check out branch
+      - name: Check out source branch
         uses: actions/checkout@v4
         with:
+          ref: agent/completion-context-resolve-v4
           fetch-depth: 0
 
       - name: Apply patch
