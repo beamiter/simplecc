@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // ─── Vim → Daemon request types ──────────────────────────
 
@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
     tokio::spawn(stdout_writer(out_rx));
 
-    let registry: Arc<Mutex<Option<Registry>>> = Arc::new(Mutex::new(None));
+    let registry: Arc<RwLock<Option<Registry>>> = Arc::new(RwLock::new(None));
     // Track which filetype a URI belongs to
     let uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -442,7 +442,7 @@ async fn main() -> Result<()> {
     }
 
     // Shutdown
-    let mut r = registry.lock().await;
+    let mut r = registry.write().await;
     if let Some(ref mut reg) = *r {
         reg.shutdown_all().await;
     }
@@ -453,7 +453,7 @@ async fn main() -> Result<()> {
 
 async fn handle_request(
     req: Request,
-    registry: Arc<Mutex<Option<Registry>>>,
+    registry: Arc<RwLock<Option<Registry>>>,
     out: EventTx,
     uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>>,
 ) {
@@ -476,13 +476,13 @@ async fn handle_request(
             };
 
             let reg = Registry::new(cfg, root, out.clone());
-            *registry.lock().await = Some(reg);
+            *registry.write().await = Some(reg);
 
             send_event(&out, json!({"type": "initialized", "id": id}));
         }
 
         Request::Shutdown { id } => {
-            let mut r = registry.lock().await;
+            let mut r = registry.write().await;
             if let Some(ref mut reg) = *r {
                 reg.shutdown_all().await;
             }
@@ -499,14 +499,14 @@ async fn handle_request(
             // Track filetype
             uri_ft.lock().await.insert(uri.clone(), language_id.clone());
 
-            let mut r = registry.lock().await;
+            let mut r = registry.write().await;
             if let Some(ref mut reg) = *r {
                 // Ensure server started for this filetype
                 if let Ok(Some(_name)) = reg.ensure_server(&language_id).await {
                     // Fan out to all servers for this filetype
                     let clients = reg.clients_for_filetype(&language_id);
                     for client in clients {
-                        let c = client.lock().await;
+                        let c = client;
                         let _ = c.did_open(&uri, &language_id, version, &text).await;
                     }
                 }
@@ -522,10 +522,10 @@ async fn handle_request(
         } => {
             let ft = uri_ft.lock().await.get(&uri).cloned();
             if let Some(ft) = ft {
-                let r = registry.lock().await;
+                let r = registry.read().await;
                 if let Some(ref reg) = *r {
                     for client in reg.clients_for_filetype(&ft) {
-                        let c = client.lock().await;
+                        let c = client;
                         let _ = c
                             .did_change(&uri, version, text.as_deref(), changes.clone())
                             .await;
@@ -537,10 +537,10 @@ async fn handle_request(
         Request::DidSave { id: _, uri, text } => {
             let ft = uri_ft.lock().await.get(&uri).cloned();
             if let Some(ft) = ft {
-                let r = registry.lock().await;
+                let r = registry.read().await;
                 if let Some(ref reg) = *r {
                     for client in reg.clients_for_filetype(&ft) {
-                        let c = client.lock().await;
+                        let c = client;
                         let _ = c.did_save(&uri, text.as_deref()).await;
                     }
                 }
@@ -550,10 +550,10 @@ async fn handle_request(
         Request::DidClose { id: _, uri } => {
             let ft = uri_ft.lock().await.remove(&uri);
             if let Some(ft) = ft {
-                let r = registry.lock().await;
+                let r = registry.read().await;
                 if let Some(ref reg) = *r {
                     for client in reg.clients_for_filetype(&ft) {
-                        let c = client.lock().await;
+                        let c = client;
                         let _ = c.did_close(&uri).await;
                     }
                 }
@@ -574,7 +574,7 @@ async fn handle_request(
             // language server. A slow completion must not block unrelated
             // servers, initialization, status, or installation requests.
             let client = {
-                let r = registry.lock().await;
+                let r = registry.read().await;
                 r.as_ref()
                     .and_then(|reg| reg.client_for_filetype(&language_id))
             };
@@ -582,7 +582,7 @@ async fn handle_request(
             if let Some(client) = client {
                 // Clone the internally synchronized client and release the
                 // outer mutex before waiting on the language server.
-                let c = client.lock().await.clone();
+                let c = client;
                 let trigger_character = if trigger_character.is_empty() {
                     None
                 } else {
@@ -630,10 +630,10 @@ async fn handle_request(
                 "[simplecc] hover request: uri={} lang={} line={} char={}",
                 uri, language_id, line, character
             );
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.hover(&uri, line, character).await {
                         Ok(Some(contents)) => {
                             eprintln!("[simplecc] hover result: {} bytes", contents.len());
@@ -671,10 +671,10 @@ async fn handle_request(
                 "[simplecc] definition request: uri={} lang={} line={} char={}",
                 uri, language_id, line, character
             );
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.definition(&uri, line, character).await {
                         Ok(locs) => {
                             eprintln!("[simplecc] definition result: {} locations", locs.len());
@@ -706,10 +706,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.references(&uri, line, character).await {
                         Ok(locs) => send_event(
                             &out,
@@ -736,10 +736,10 @@ async fn handle_request(
         } => {
             let el = end_line.unwrap_or(line);
             let ec = end_character.unwrap_or(character);
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c
                         .code_action(&uri, line, character, el, ec, diagnostics)
                         .await
@@ -762,10 +762,10 @@ async fn handle_request(
             language_id,
             index,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.execute_code_action(index).await {
                         Ok(Some(edit)) => {
                             send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
@@ -787,10 +787,10 @@ async fn handle_request(
             tab_size,
             insert_spaces,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.formatting(&uri, tab_size, insert_spaces).await {
                         Ok(edits) => send_event(
                             &out,
@@ -813,10 +813,10 @@ async fn handle_request(
             character,
             new_name,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.rename(&uri, line, character, &new_name).await {
                         Ok(Some(edit)) => {
                             send_event(&out, json!({"type": "rename", "id": id, "edit": edit}))
@@ -840,10 +840,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.signature_help(&uri, line, character).await {
                         Ok(Some(sigs)) => send_event(
                             &out,
@@ -869,10 +869,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.implementation(&uri, line, character).await {
                         Ok(locs) => send_event(
                             &out,
@@ -894,10 +894,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.type_definition(&uri, line, character).await {
                         Ok(locs) => send_event(
                             &out,
@@ -917,10 +917,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.document_symbol(&uri).await {
                         Ok(symbols) => send_event(
                             &out,
@@ -940,10 +940,10 @@ async fn handle_request(
             language_id,
             query,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.workspace_symbol(&query).await {
                         Ok(symbols) => send_event(
                             &out,
@@ -965,10 +965,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.document_highlight(&uri, line, character).await {
                         Ok(highlights) => send_event(
                             &out,
@@ -990,10 +990,10 @@ async fn handle_request(
             start_line,
             end_line,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.inlay_hints(&uri, start_line, end_line).await {
                         Ok(hints) => {
                             send_event(&out, json!({"type": "inlayHint", "id": id, "hints": hints}))
@@ -1014,10 +1014,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.call_hierarchy_prepare(&uri, line, character).await {
                         Ok(items) => {
                             let converted: Vec<_> = items
@@ -1053,10 +1053,10 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     if let Ok(lsp_item) =
                         serde_json::from_value::<lsp_types::CallHierarchyItem>(item)
                     {
@@ -1080,10 +1080,10 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     if let Ok(lsp_item) =
                         serde_json::from_value::<lsp_types::CallHierarchyItem>(item)
                     {
@@ -1108,10 +1108,10 @@ async fn handle_request(
             language_id,
             positions,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     let pos: Vec<(u32, u32)> = positions
                         .iter()
                         .filter_map(|p| {
@@ -1140,10 +1140,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.semantic_tokens_full(&uri).await {
                         Ok(tokens) => send_event(
                             &out,
@@ -1163,10 +1163,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.semantic_tokens_full_delta(&uri).await {
                         Ok(tokens) => send_event(
                             &out,
@@ -1190,10 +1190,10 @@ async fn handle_request(
             end_line,
             end_character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c
                         .semantic_tokens_range(
                             &uri,
@@ -1222,10 +1222,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.code_lens(&uri).await {
                         Ok(lenses) => send_event(
                             &out,
@@ -1245,10 +1245,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.folding_range(&uri).await {
                         Ok(ranges) => send_event(
                             &out,
@@ -1270,10 +1270,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.linked_editing_range(&uri, line, character).await {
                         Ok(Some(ranges)) => send_event(
                             &out,
@@ -1299,12 +1299,12 @@ async fn handle_request(
             index,
         } => {
             let client = {
-                let r = registry.lock().await;
+                let r = registry.read().await;
                 r.as_ref()
                     .and_then(|reg| reg.client_for_filetype(&language_id))
             };
             if let Some(client) = client {
-                let c = client.lock().await.clone();
+                let c = client;
                 match c.completion_resolve(generation, index).await {
                     Ok(item) => send_event(
                         &out,
@@ -1323,10 +1323,10 @@ async fn handle_request(
             language_id,
             index,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.execute_code_lens(index).await {
                         Ok(Some(edit)) => {
                             send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
@@ -1348,10 +1348,10 @@ async fn handle_request(
             line,
             character,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.type_hierarchy_prepare(&uri, line, character).await {
                         Ok(items) => {
                             let converted: Vec<_> = items
@@ -1387,10 +1387,10 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     if let Ok(lsp_item) =
                         serde_json::from_value::<lsp_types::TypeHierarchyItem>(item)
                     {
@@ -1414,10 +1414,10 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     if let Ok(lsp_item) =
                         serde_json::from_value::<lsp_types::TypeHierarchyItem>(item)
                     {
@@ -1441,10 +1441,10 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            let r = registry.lock().await;
+            let r = registry.read().await;
             if let Some(ref reg) = *r {
                 if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
+                    let c = client;
                     match c.pull_diagnostics(&uri).await {
                         Ok(items) => send_event(
                             &out,
@@ -1477,7 +1477,7 @@ async fn handle_request(
                             }),
                         );
                         // Update registry so the server can be started with the new path
-                        let mut r = reg_clone.lock().await;
+                        let mut r = reg_clone.write().await;
                         if let Some(ref mut reg) = *r {
                             reg.update_server_command(&server, &path.to_string_lossy());
                         }
