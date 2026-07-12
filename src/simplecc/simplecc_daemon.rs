@@ -293,6 +293,7 @@ enum Request {
         id: u64,
         #[serde(rename = "languageId")]
         language_id: String,
+        generation: u64,
         index: usize,
     },
 
@@ -570,11 +571,16 @@ async fn handle_request(
             };
 
             if let Some(client) = client {
-                let c = client.lock().await;
+                // Clone the internally synchronized client and release the
+                // outer mutex before waiting on the language server.
+                let c = client.lock().await.clone();
                 match c.completion(&uri, line, character, max_items).await {
-                    Ok(items) => send_event(
+                    Ok((generation, items)) => send_event(
                         &out,
-                        json!({"type": "completion", "id": id, "items": items}),
+                        json!({
+                            "type": "completion", "id": id,
+                            "generation": generation, "items": items
+                        }),
                     ),
                     Err(e) => send_event(
                         &out,
@@ -582,7 +588,10 @@ async fn handle_request(
                     ),
                 }
             } else {
-                send_event(&out, json!({"type": "completion", "id": id, "items": []}));
+                send_event(
+                    &out,
+                    json!({"type": "completion", "id": id, "generation": 0, "items": []}),
+                );
             }
         }
 
@@ -1262,22 +1271,25 @@ async fn handle_request(
         Request::CompletionResolve {
             id,
             language_id,
+            generation,
             index,
         } => {
-            let r = registry.lock().await;
-            if let Some(ref reg) = *r {
-                if let Some(client) = reg.client_for_filetype(&language_id) {
-                    let c = client.lock().await;
-                    match c.completion_resolve(index).await {
-                        Ok(item) => send_event(
-                            &out,
-                            json!({"type": "completionResolve", "id": id, "item": item}),
-                        ),
-                        Err(e) => send_event(
-                            &out,
-                            json!({"type": "error", "id": id, "message": e.to_string()}),
-                        ),
-                    }
+            let client = {
+                let r = registry.lock().await;
+                r.as_ref()
+                    .and_then(|reg| reg.client_for_filetype(&language_id))
+            };
+            if let Some(client) = client {
+                let c = client.lock().await.clone();
+                match c.completion_resolve(generation, index).await {
+                    Ok(item) => send_event(
+                        &out,
+                        json!({"type": "completionResolve", "id": id, "item": item}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
                 }
             }
         }

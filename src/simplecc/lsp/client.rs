@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use lsp_types::*;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -10,18 +10,30 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use super::transport::LspTransport;
 use super::types;
 
+#[derive(Default)]
+struct CompletionCache {
+    generation: u64,
+    items: Vec<lsp_types::CompletionItem>,
+}
+
 /// A single LSP server client.
+///
+/// The client is cheaply cloneable: all mutable protocol state is already
+/// internally synchronized. The daemon can therefore release its outer client
+/// mutex before awaiting a slow language-server request.
+#[derive(Clone)]
 pub struct LspClient {
     transport: Arc<Mutex<LspTransport>>,
-    next_id: AtomicI64,
+    next_id: Arc<AtomicI64>,
     /// Pending requests: jsonrpc id -> oneshot sender
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
     /// Server capabilities after initialize
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
     pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeAction>>>,
-    /// Cached completion items for resolve
-    pub cached_completions: Arc<Mutex<Vec<lsp_types::CompletionItem>>>,
+    /// Latest completion generation and its raw items for resolve.
+    cached_completions: Arc<Mutex<CompletionCache>>,
+    completion_generation: Arc<AtomicU64>,
     /// Cached code lenses for execute
     pub cached_code_lenses: Arc<Mutex<Vec<lsp_types::CodeLens>>>,
     /// Previous semantic token result_id per URI (for delta requests)
@@ -108,11 +120,12 @@ impl LspClient {
 
         let mut client = Self {
             transport,
-            next_id: AtomicI64::new(1),
+            next_id: Arc::new(AtomicI64::new(1)),
             pending,
             capabilities,
             cached_actions: Arc::new(Mutex::new(Vec::new())),
-            cached_completions: Arc::new(Mutex::new(Vec::new())),
+            cached_completions: Arc::new(Mutex::new(CompletionCache::default())),
+            completion_generation: Arc::new(AtomicU64::new(0)),
             cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
             semtok_prev_result_id: Arc::new(Mutex::new(HashMap::new())),
             semtok_prev_data: Arc::new(Mutex::new(HashMap::new())),
@@ -338,7 +351,11 @@ impl LspClient {
         line: u32,
         character: u32,
         max_items: usize,
-    ) -> Result<Vec<types::CompletionItem>> {
+    ) -> Result<(u64, Vec<types::CompletionItem>)> {
+        // Allocate at request start, not response time. If an older request
+        // returns after a newer one, it must never replace the newer cache.
+        let generation = self.completion_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         let result = self
             .request_with_timeout(
                 "textDocument/completion",
@@ -359,36 +376,21 @@ impl LspClient {
         };
         items.truncate(max_items.max(1).min(500));
 
-        // Cache raw items for resolve
-        *self.cached_completions.lock().await = items.clone();
+        {
+            let mut cache = self.cached_completions.lock().await;
+            if generation >= cache.generation {
+                cache.generation = generation;
+                cache.items = items.clone();
+            }
+        }
 
-        Ok(items
-            .into_iter()
+        let normalized = items
+            .iter()
             .enumerate()
-            .map(|(idx, item)| {
-                let is_snippet = item.insert_text_format == Some(InsertTextFormat::SNIPPET);
-                let insert_text = item.insert_text.clone().or_else(|| {
-                    item.text_edit.as_ref().map(|te| match te {
-                        CompletionTextEdit::Edit(e) => e.new_text.clone(),
-                        CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
-                    })
-                });
-                types::CompletionItem {
-                    label: item.label.clone(),
-                    kind: item
-                        .kind
-                        .map(types::completion_kind_label)
-                        .map(String::from),
-                    detail: item.detail.clone(),
-                    documentation: types::extract_doc(&item.documentation),
-                    insert_text,
-                    sort_text: item.sort_text.clone(),
-                    filter_text: item.filter_text.clone().or(Some(item.label)),
-                    index: idx,
-                    is_snippet: if is_snippet { Some(true) } else { None },
-                }
-            })
-            .collect())
+            .map(|(idx, item)| types::from_lsp_completion_item(item, idx))
+            .collect();
+
+        Ok((generation, normalized))
     }
 
     pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<String>> {
@@ -1247,12 +1249,23 @@ impl LspClient {
             .collect())
     }
 
-    pub async fn completion_resolve(&self, index: usize) -> Result<types::CompletionItem> {
+    pub async fn completion_resolve(
+        &self,
+        generation: u64,
+        index: usize,
+    ) -> Result<types::CompletionItem> {
         // Clone before awaiting: holding the cache mutex across an LSP round
         // trip blocks the next completion response from replacing the cache.
         let item = {
             let cached = self.cached_completions.lock().await;
+            if cached.generation != generation {
+                bail!(
+                    "stale completion generation: requested {generation}, current {}",
+                    cached.generation
+                );
+            }
             cached
+                .items
                 .get(index)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("invalid completion index"))?
@@ -1264,21 +1277,33 @@ impl LspClient {
                 Duration::from_secs(5),
             )
             .await?;
-        let resolved: lsp_types::CompletionItem = serde_json::from_value(result)?;
-        Ok(types::CompletionItem {
-            label: resolved.label.clone(),
-            kind: resolved
-                .kind
-                .map(types::completion_kind_label)
-                .map(String::from),
-            detail: resolved.detail.clone(),
-            documentation: types::extract_doc(&resolved.documentation),
-            insert_text: resolved.insert_text.clone(),
-            sort_text: resolved.sort_text.clone(),
-            filter_text: resolved.filter_text.clone(),
-            index,
-            is_snippet: None,
-        })
+        let mut resolved: lsp_types::CompletionItem = serde_json::from_value(result)?;
+
+        // A resolve response may only fill deferred fields. Preserve edit and
+        // insertion data from the original item when the server omits them.
+        if resolved.insert_text.is_none() {
+            resolved.insert_text = item.insert_text.clone();
+        }
+        if resolved.insert_text_format.is_none() {
+            resolved.insert_text_format = item.insert_text_format;
+        }
+        if resolved.text_edit.is_none() {
+            resolved.text_edit = item.text_edit.clone();
+        }
+        if resolved.additional_text_edits.is_none() {
+            resolved.additional_text_edits = item.additional_text_edits.clone();
+        }
+        if resolved.commit_characters.is_none() {
+            resolved.commit_characters = item.commit_characters.clone();
+        }
+        if resolved.detail.is_none() {
+            resolved.detail = item.detail.clone();
+        }
+        if resolved.documentation.is_none() {
+            resolved.documentation = item.documentation.clone();
+        }
+
+        Ok(types::from_lsp_completion_item(&resolved, index))
     }
 
     pub async fn execute_code_lens(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {

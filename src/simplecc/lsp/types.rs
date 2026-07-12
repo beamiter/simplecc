@@ -13,6 +13,18 @@ pub struct CompletionItem {
     pub documentation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub insert_text: Option<String>,
+    /// Server-provided replacement range. Vim still uses `insert_text` for
+    /// the popup menu, while retaining this metadata for precise application.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_edit: Option<TextEdit>,
+    /// Extra edits associated with accepting the completion, most commonly
+    /// import/include insertion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_text_edits: Vec<TextEdit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_characters: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preselect: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,6 +307,62 @@ pub fn extract_doc(doc: &Option<lsp_types::Documentation>) -> Option<String> {
         Some(lsp_types::Documentation::String(s)) => Some(s.clone()),
         Some(lsp_types::Documentation::MarkupContent(mc)) => Some(mc.value.clone()),
         None => None,
+    }
+}
+
+/// Convert an LSP text edit to the compact wire representation used by Vim.
+pub fn from_lsp_text_edit(edit: &lsp_types::TextEdit) -> TextEdit {
+    TextEdit {
+        line: edit.range.start.line,
+        character: edit.range.start.character,
+        end_line: edit.range.end.line,
+        end_character: edit.range.end.character,
+        new_text: edit.new_text.clone(),
+    }
+}
+
+/// Normalize a full LSP completion item without dropping edit semantics.
+pub fn from_lsp_completion_item(item: &lsp_types::CompletionItem, index: usize) -> CompletionItem {
+    let text_edit = item.text_edit.as_ref().map(|edit| match edit {
+        lsp_types::CompletionTextEdit::Edit(edit) => from_lsp_text_edit(edit),
+        lsp_types::CompletionTextEdit::InsertAndReplace(edit) => TextEdit {
+            // Vim has one replacement range. Prefer the server's replace range;
+            // it is the correct range after the user has already typed a prefix.
+            line: edit.replace.start.line,
+            character: edit.replace.start.character,
+            end_line: edit.replace.end.line,
+            end_character: edit.replace.end.character,
+            new_text: edit.new_text.clone(),
+        },
+    });
+    let insert_text = item
+        .insert_text
+        .clone()
+        .or_else(|| text_edit.as_ref().map(|edit| edit.new_text.clone()));
+    let additional_text_edits = item
+        .additional_text_edits
+        .as_ref()
+        .map(|edits| edits.iter().map(from_lsp_text_edit).collect())
+        .unwrap_or_default();
+    let is_snippet = item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET);
+
+    CompletionItem {
+        label: item.label.clone(),
+        kind: item.kind.map(completion_kind_label).map(String::from),
+        detail: item.detail.clone(),
+        documentation: extract_doc(&item.documentation),
+        insert_text,
+        text_edit,
+        additional_text_edits,
+        commit_characters: item.commit_characters.clone().unwrap_or_default(),
+        preselect: item.preselect,
+        sort_text: item.sort_text.clone(),
+        filter_text: item
+            .filter_text
+            .clone()
+            .or_else(|| Some(item.label.clone())),
+        index,
+        is_snippet: if is_snippet { Some(true) } else { None },
     }
 }
 

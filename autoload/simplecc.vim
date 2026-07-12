@@ -30,6 +30,7 @@ var s_change_timer: number = 0
 var s_comp_timer: number = 0
 # Completion state
 var s_comp_id: number = 0
+var s_comp_generation: number = 0
 var s_comp_requesting: bool = false
 var s_comp_bufnr: number = -1
 var s_comp_changedtick: number = -1
@@ -621,7 +622,7 @@ export def OnInsertCharPre()
   feedkeys("\<C-e>", 'n')
 enddef
 
-def ResolveCompletionItem(key: string, item_index: number, ft: string)
+def ResolveCompletionItem(key: string, generation: number, item_index: number, ft: string)
   s_comp_resolve_timer = 0
   if !pumvisible() || s_comp_resolve_key !=# key
     return
@@ -633,6 +634,7 @@ def ResolveCompletionItem(key: string, item_index: number, ft: string)
     type: 'completionItem/resolve',
     id: resolve_id,
     languageId: ft,
+    generation: generation,
     index: item_index,
   })
 enddef
@@ -661,9 +663,10 @@ export def OnCompleteChanged()
   var ci = items[sel]
   var ud = get(ci, 'user_data', {})
   if type(ud) == v:t_dict
+    var generation = get(ud, 'generation', 0)
     var item_index = get(ud, 'index', -1)
-    if item_index >= 0
-      var key = printf('%d:%d', s_comp_id, item_index)
+    if generation > 0 && item_index >= 0
+      var key = printf('%d:%d', generation, item_index)
       s_comp_resolve_key = key
       if has_key(s_comp_resolved, key)
         return
@@ -672,7 +675,7 @@ export def OnCompleteChanged()
       var ft = BufFt()
       s_comp_resolve_timer = timer_start(
         g:simplecc_complete_resolve_delay,
-        (_) => ResolveCompletionItem(key, item_index, ft))
+        (_) => ResolveCompletionItem(key, generation, item_index, ft))
     endif
   endif
 enddef
@@ -876,6 +879,12 @@ def OnCompletion(ev: dict<any>)
   endif
   s_comp_requesting = false
 
+  var generation = get(ev, 'generation', 0)
+  if generation <= 0
+    return
+  endif
+  s_comp_generation = generation
+
   # A response is only valid for the exact editor snapshot that requested it.
   if mode() !~# '^i' || bufnr('%') != s_comp_bufnr
         || b:changedtick != s_comp_changedtick
@@ -906,14 +915,22 @@ def OnCompletion(ev: dict<any>)
       word = get(item, 'label', word)
     endif
     var item_index = get(item, 'index', idx)
+    var additional_edits = get(item, 'additional_text_edits', [])
     var ci: dict<any> = {
       word: word,
       abbr: get(item, 'label', ''),
       menu: get(item, 'kind', '') .. (is_snippet ? ' ~' : ''),
       dup: 1,
       icase: &ignorecase ? 1 : 0,
-      user_data: {index: item_index, is_snippet: is_snippet,
-        snippet_text: is_snippet ? get(item, 'insert_text', '') : ''},
+      user_data: {
+        generation: generation,
+        index: item_index,
+        is_snippet: is_snippet,
+        snippet_text: is_snippet ? get(item, 'insert_text', '') : '',
+        text_edit: get(item, 'text_edit', {}),
+        additional_text_edits: additional_edits,
+        commit_characters: get(item, 'commit_characters', []),
+      },
     }
     var detail = get(item, 'detail', '')
     if detail !=# ''
@@ -3167,6 +3184,61 @@ enddef
 # Snippet Support (F9)
 # ═════════════════════════════════════════════════════════
 
+def CompletionEditLineDelta(edits: list<dict<any>>, anchor_line: number): number
+  var delta = 0
+  for edit in edits
+    var sl = get(edit, 'line', 0)
+    var el = get(edit, 'end_line', sl)
+    if el < anchor_line
+      var new_text = get(edit, 'new_text', '')
+      delta += count(new_text, "\n") - (el - sl)
+    endif
+  endfor
+  return delta
+enddef
+
+def ApplyCompletionAdditionalEdits(edits: list<dict<any>>)
+  if empty(edits) || s_comp_bufnr != bufnr('%') || s_comp_line <= 0
+    return
+  endif
+
+  # Completion additionalTextEdits must not overlap the main completion edit.
+  # Be defensive: apply edits strictly before or after the completion line and
+  # skip malformed/overlapping server responses rather than corrupting text.
+  var anchor_line = s_comp_line - 1
+  var safe_edits: list<dict<any>> = []
+  for edit in edits
+    var sl = get(edit, 'line', 0)
+    var el = get(edit, 'end_line', sl)
+    if el < anchor_line || sl > anchor_line
+      add(safe_edits, edit)
+    else
+      Log('completion: skipped overlapping additionalTextEdit: ' .. json_encode(edit))
+    endif
+  endfor
+  if empty(safe_edits)
+    return
+  endif
+
+  var old_lnum = line('.')
+  var old_col = col('.')
+  var line_delta = CompletionEditLineDelta(safe_edits, anchor_line)
+  try
+    undojoin
+  catch
+  endtry
+  ApplyTextEdits(bufnr('%'), safe_edits)
+
+  if line_delta != 0
+    cursor(max([1, old_lnum + line_delta]), old_col)
+    if !empty(s_snippet_tabstops)
+      for i in range(len(s_snippet_tabstops) - 1)
+        s_snippet_tabstops[i].lnum += line_delta
+      endfor
+    endif
+  endif
+enddef
+
 export def OnCompleteDone()
   if !s_initialized
     return
@@ -3184,15 +3256,16 @@ export def OnCompleteDone()
   if type(ud) != v:t_dict
     return
   endif
+
   var is_snippet = get(ud, 'is_snippet', false)
-  if !is_snippet
-    return
+  if is_snippet
+    var snippet_text = get(ud, 'snippet_text', '')
+    if snippet_text !=# ''
+      ExpandSnippet(ci, snippet_text)
+    endif
   endif
-  var snippet_text = get(ud, 'snippet_text', '')
-  if snippet_text ==# ''
-    return
-  endif
-  ExpandSnippet(ci, snippet_text)
+
+  ApplyCompletionAdditionalEdits(get(ud, 'additional_text_edits', []))
 enddef
 
 def ExpandSnippet(ci: dict<any>, snippet: string)
