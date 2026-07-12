@@ -37,11 +37,14 @@ var s_comp_changedtick: number = -1
 var s_comp_line: number = -1
 var s_comp_col: number = -1
 var s_comp_start_col: number = 0
+var s_comp_original_line: string = ''
 # Completion item resolve debounce / stale-response protection
 var s_comp_resolve_timer: number = 0
 var s_comp_resolve_id: number = 0
 var s_comp_resolve_key: string = ''
-var s_comp_resolved: dict<bool> = {}
+var s_comp_resolve_request_key: string = ''
+var s_comp_resolve_requested: dict<bool> = {}
+var s_comp_resolved_items: dict<dict<any>> = {}
 # Signature help popup
 var s_sig_popup: number = 0
 # Hover popup
@@ -339,6 +342,14 @@ def OnBackendEvent(line: string)
     Log('[' .. get(ev, 'server', '') .. '] ' .. get(ev, 'message', ''))
 
   elseif ev.type ==# 'error'
+    if id == s_comp_resolve_id
+      if s_comp_resolve_request_key !=# ''
+            && has_key(s_comp_resolve_requested, s_comp_resolve_request_key)
+        remove(s_comp_resolve_requested, s_comp_resolve_request_key)
+      endif
+      s_comp_resolve_id = 0
+      s_comp_resolve_request_key = ''
+    endif
     Log('error(id=' .. string(id) .. '): ' .. get(ev, 'message', ''))
 
   elseif ev.type ==# 'shutdown'
@@ -600,6 +611,10 @@ export def OnInsertLeave()
   s_comp_requesting = false
   s_comp_resolve_id = 0
   s_comp_resolve_key = ''
+  s_comp_resolve_request_key = ''
+  s_comp_resolve_requested = {}
+  s_comp_resolved_items = {}
+  s_comp_original_line = ''
   CloseSignaturePopup()
   # Clear completion preview state
   s_comp_preview_start_line = 0
@@ -629,13 +644,45 @@ def ResolveCompletionItem(key: string, generation: number, item_index: number, f
   endif
   var resolve_id = NextId()
   s_comp_resolve_id = resolve_id
-  s_comp_resolved[key] = true
+  s_comp_resolve_request_key = key
+  s_comp_resolve_requested[key] = true
   Send({
     type: 'completionItem/resolve',
     id: resolve_id,
     languageId: ft,
     generation: generation,
     index: item_index,
+  })
+enddef
+
+def ShowCompletionDocumentation(item: dict<any>)
+  var detail = get(item, 'detail', '')
+  var doc = get(item, 'documentation', '')
+  var text = detail
+  if doc !=# ''
+    text = text !=# '' ? text .. "\n\n" .. doc : doc
+  endif
+
+  if s_hover_popup > 0
+    popup_close(s_hover_popup)
+    s_hover_popup = 0
+  endif
+  if text ==# '' || !pumvisible()
+    return
+  endif
+
+  s_hover_popup = popup_create(split(text, "\n"), {
+    border: [1, 1, 1, 1],
+    borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
+    padding: [0, 1, 0, 1],
+    maxwidth: 60,
+    maxheight: 15,
+    pos: 'topleft',
+    line: 'cursor-1',
+    col: 'cursor+40',
+    moved: 'any',
+    highlight: 'Normal',
+    borderhighlight: ['SimpleCCFloatBorder'],
   })
 enddef
 
@@ -668,7 +715,11 @@ export def OnCompleteChanged()
     if generation > 0 && item_index >= 0
       var key = printf('%d:%d', generation, item_index)
       s_comp_resolve_key = key
-      if has_key(s_comp_resolved, key)
+      if has_key(s_comp_resolved_items, key)
+        ShowCompletionDocumentation(s_comp_resolved_items[key])
+        return
+      endif
+      if get(s_comp_resolve_requested, key, false)
         return
       endif
 
@@ -684,38 +735,21 @@ def OnCompletionResolve(ev: dict<any>)
   if get(ev, 'id', 0) != s_comp_resolve_id
     return
   endif
+  var key = s_comp_resolve_request_key
   s_comp_resolve_id = 0
+  s_comp_resolve_request_key = ''
   var item = get(ev, 'item', {})
   if empty(item)
     return
   endif
-  var detail = get(item, 'detail', '')
-  var doc = get(item, 'documentation', '')
-  var text = detail
-  if doc !=# ''
-    text = text !=# '' ? text .. "\n\n" .. doc : doc
+  if key !=# ''
+    s_comp_resolved_items[key] = item
   endif
-  if text ==# '' || !pumvisible()
-    return
+  # Selection may have changed while the server was resolving the old item.
+  # Cache every valid response, but only display the currently selected one.
+  if key ==# s_comp_resolve_key
+    ShowCompletionDocumentation(item)
   endif
-  # Show resolved info in a popup near the completion menu
-  if s_hover_popup > 0
-    popup_close(s_hover_popup)
-  endif
-  var lines = split(text, "\n")
-  s_hover_popup = popup_create(lines, {
-    border: [1, 1, 1, 1],
-    borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
-    padding: [0, 1, 0, 1],
-    maxwidth: 60,
-    maxheight: 15,
-    pos: 'topleft',
-    line: 'cursor-1',
-    col: 'cursor+40',
-    moved: 'any',
-    highlight: 'Normal',
-    borderhighlight: ['SimpleCCFloatBorder'],
-  })
 enddef
 
 def TriggerCompletion()
@@ -733,7 +767,7 @@ def TriggerCompletion()
           || line('.') != lnum || col('.') != ccol
       return
     endif
-    RequestCompletion()
+    RequestCompletion(false)
   })
 enddef
 
@@ -741,7 +775,7 @@ export def TriggerCompletionManual()
   if s_comp_timer > 0
     timer_stop(s_comp_timer)
   endif
-  RequestCompletion()
+  RequestCompletion(true)
 enddef
 
 export def SelectTabKey(): string
@@ -807,7 +841,7 @@ def SyncDocumentForCompletion()
   endif
 enddef
 
-def RequestCompletion()
+def RequestCompletion(manual: bool = false)
   var ft = BufFt()
   if ft ==# '' || pumvisible()
     return
@@ -835,6 +869,10 @@ def RequestCompletion()
   if strchars(prefix) < g:simplecc_complete_min_chars && !is_trigger
     return
   endif
+  var trigger_character = !manual && is_trigger ? line_text[start - 1] : ''
+  var trigger_kind = manual
+        ? 1
+        : (trigger_character !=# '' ? 2 : 3)
 
   # Queue the latest buffer text before the completion request. Both messages
   # use the same Vim -> daemon channel, eliminating the stale-text window on
@@ -853,9 +891,12 @@ def RequestCompletion()
   s_comp_line = line('.')
   s_comp_col = ccol
   s_comp_start_col = start
+  s_comp_original_line = line_text
   s_comp_resolve_id = 0
   s_comp_resolve_key = ''
-  s_comp_resolved = {}
+  s_comp_resolve_request_key = ''
+  s_comp_resolve_requested = {}
+  s_comp_resolved_items = {}
 
   var max_items = max([1, g:simplecc_complete_max_items])
   Send({
@@ -866,6 +907,8 @@ def RequestCompletion()
     line: lnum,
     character: cchar,
     maxItems: max_items,
+    triggerKind: trigger_kind,
+    triggerCharacter: trigger_character,
   })
 enddef
 
@@ -3184,6 +3227,81 @@ enddef
 # Snippet Support (F9)
 # ═════════════════════════════════════════════════════════
 
+def CompletionData(ud: dict<any>): dict<any>
+  var data = copy(ud)
+  var generation = get(ud, 'generation', 0)
+  var item_index = get(ud, 'index', -1)
+  if generation <= 0 || item_index < 0
+    return data
+  endif
+
+  var key = printf('%d:%d', generation, item_index)
+  if !has_key(s_comp_resolved_items, key)
+    return data
+  endif
+
+  var resolved = s_comp_resolved_items[key]
+  var is_snippet = get(resolved, 'is_snippet', get(data, 'is_snippet', false))
+  data.is_snippet = is_snippet
+  data.snippet_text = is_snippet
+        ? get(resolved, 'insert_text', get(data, 'snippet_text', ''))
+        : ''
+
+  var text_edit = get(resolved, 'text_edit', {})
+  if !empty(text_edit)
+    data.text_edit = text_edit
+  endif
+  var additional_edits = get(resolved, 'additional_text_edits', [])
+  if !empty(additional_edits)
+    data.additional_text_edits = additional_edits
+  endif
+  var commit_characters = get(resolved, 'commit_characters', [])
+  if !empty(commit_characters)
+    data.commit_characters = commit_characters
+  endif
+  return data
+enddef
+
+def ApplyCompletionTextEdit(edit: dict<any>): bool
+  if empty(edit) || s_comp_bufnr != bufnr('%') || s_comp_line <= 0
+        || s_comp_original_line ==# ''
+    return false
+  endif
+
+  # Completion text edits normally replace a range on the cursor line. Restore
+  # the request snapshot first because Vim's complete() has already replaced
+  # its guessed prefix. Multiline source ranges remain on the safe fallback path.
+  var sl = get(edit, 'line', -1)
+  var el = get(edit, 'end_line', sl)
+  if sl != s_comp_line - 1 || el != sl
+    Log('completion: unsupported multiline textEdit, using Vim insertion')
+    return false
+  endif
+
+  var start_offset = get(edit, 'character', 0)
+  var start_chars = Utf16ToCharOffset(s_comp_original_line, start_offset)
+  var prefix = strcharpart(s_comp_original_line, 0, start_chars)
+  var new_text = get(edit, 'new_text', '')
+  var new_lines = split(new_text, "\n", true)
+  if empty(new_lines)
+    new_lines = ['']
+  endif
+
+  try
+    undojoin
+  catch
+  endtry
+  setline(s_comp_line, s_comp_original_line)
+  ApplyTextEdits(bufnr('%'), [edit])
+
+  if len(new_lines) == 1
+    cursor(s_comp_line, strlen(prefix .. new_lines[0]) + 1)
+  else
+    cursor(s_comp_line + len(new_lines) - 1, strlen(new_lines[-1]) + 1)
+  endif
+  return true
+enddef
+
 def CompletionEditLineDelta(edits: list<dict<any>>, anchor_line: number): number
   var delta = 0
   for edit in edits
@@ -3257,15 +3375,22 @@ export def OnCompleteDone()
     return
   endif
 
-  var is_snippet = get(ud, 'is_snippet', false)
+  # Resolve may add textEdit/additionalTextEdits/documentation after the menu
+  # was built. Merge the resolved item before applying the accepted completion.
+  var data = CompletionData(ud)
+  var is_snippet = get(data, 'is_snippet', false)
+  if !is_snippet
+    ApplyCompletionTextEdit(get(data, 'text_edit', {}))
+  endif
+
   if is_snippet
-    var snippet_text = get(ud, 'snippet_text', '')
+    var snippet_text = get(data, 'snippet_text', '')
     if snippet_text !=# ''
       ExpandSnippet(ci, snippet_text)
     endif
   endif
 
-  ApplyCompletionAdditionalEdits(get(ud, 'additional_text_edits', []))
+  ApplyCompletionAdditionalEdits(get(data, 'additional_text_edits', []))
 enddef
 
 def ExpandSnippet(ci: dict<any>, snippet: string)
