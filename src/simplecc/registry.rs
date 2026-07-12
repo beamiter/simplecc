@@ -50,7 +50,10 @@ impl Registry {
 
         // Already started?
         if self.clients.contains_key(&name) {
-            let names = self.ft_map.entry(filetype.to_string()).or_insert_with(Vec::new);
+            let names = self
+                .ft_map
+                .entry(filetype.to_string())
+                .or_insert_with(Vec::new);
             if !names.contains(&name) {
                 names.push(name.clone());
             }
@@ -70,7 +73,10 @@ impl Registry {
                     "message": format!("command not found: {}", cfg.command),
                     "installable": installable,
                 });
-                let _ = self.event_tx.send(serde_json::to_string(&event).unwrap()).await;
+                let _ = self
+                    .event_tx
+                    .send(serde_json::to_string(&event).unwrap())
+                    .await;
                 return Ok(None);
             }
         };
@@ -87,7 +93,10 @@ impl Registry {
                 "message": "LanguageServer.jl is not installed in the @simplecc environment",
                 "installable": true,
             });
-            let _ = self.event_tx.send(serde_json::to_string(&event).unwrap()).await;
+            let _ = self
+                .event_tx
+                .send(serde_json::to_string(&event).unwrap())
+                .await;
             return Ok(None);
         }
 
@@ -101,7 +110,9 @@ impl Registry {
             "server": &name,
             "status": "starting",
         });
-        let _ = event_tx.send(serde_json::to_string(&status_event).unwrap()).await;
+        let _ = event_tx
+            .send(serde_json::to_string(&status_event).unwrap())
+            .await;
 
         match LspClient::start(
             &name,
@@ -110,11 +121,16 @@ impl Registry {
             &root_uri,
             &self.root_dir,
             cfg.initialization_options.clone(),
-        ).await {
+        )
+        .await
+        {
             Ok((client, event_rx)) => {
                 let client = Arc::new(Mutex::new(client));
                 self.clients.insert(name.clone(), client.clone());
-                let names = self.ft_map.entry(filetype.to_string()).or_insert_with(Vec::new);
+                let names = self
+                    .ft_map
+                    .entry(filetype.to_string())
+                    .or_insert_with(Vec::new);
                 if !names.contains(&name) {
                     names.push(name.clone());
                 }
@@ -132,7 +148,9 @@ impl Registry {
                     "server": &name,
                     "status": "running",
                 });
-                let _ = event_tx.send(serde_json::to_string(&status_event).unwrap()).await;
+                let _ = event_tx
+                    .send(serde_json::to_string(&status_event).unwrap())
+                    .await;
 
                 Ok(Some(name))
             }
@@ -144,7 +162,9 @@ impl Registry {
                     "status": "error",
                     "message": e.to_string(),
                 });
-                let _ = event_tx.send(serde_json::to_string(&status_event).unwrap()).await;
+                let _ = event_tx
+                    .send(serde_json::to_string(&status_event).unwrap())
+                    .await;
                 Ok(None)
             }
         }
@@ -160,7 +180,10 @@ impl Registry {
     /// Get all clients for a filetype (for multi-server support).
     pub fn clients_for_filetype(&self, filetype: &str) -> Vec<Arc<Mutex<LspClient>>> {
         if let Some(names) = self.ft_map.get(filetype) {
-            names.iter().filter_map(|n| self.clients.get(n).cloned()).collect()
+            names
+                .iter()
+                .filter_map(|n| self.clients.get(n).cloned())
+                .collect()
         } else {
             vec![]
         }
@@ -230,7 +253,13 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            ServerEvent::Progress { token, kind, title, message, percentage } => {
+            ServerEvent::Progress {
+                token,
+                kind,
+                title,
+                message,
+                percentage,
+            } => {
                 let ev = serde_json::json!({
                     "type": "progress",
                     "server": server_name,

@@ -22,6 +22,8 @@ var s_declined_installs: dict<bool> = {}
 var s_diagnostics: dict<list<dict<any>>> = {}
 # Document versions
 var s_doc_versions: dict<number> = {}
+# Last Vim changedtick known to have been queued to the daemon
+var s_doc_changedticks: dict<number> = {}
 # Change timer for debouncing
 var s_change_timer: number = 0
 # Completion timer
@@ -29,6 +31,16 @@ var s_comp_timer: number = 0
 # Completion state
 var s_comp_id: number = 0
 var s_comp_requesting: bool = false
+var s_comp_bufnr: number = -1
+var s_comp_changedtick: number = -1
+var s_comp_line: number = -1
+var s_comp_col: number = -1
+var s_comp_start_col: number = 0
+# Completion item resolve debounce / stale-response protection
+var s_comp_resolve_timer: number = 0
+var s_comp_resolve_id: number = 0
+var s_comp_resolve_key: string = ''
+var s_comp_resolved: dict<bool> = {}
 # Signature help popup
 var s_sig_popup: number = 0
 # Hover popup
@@ -395,6 +407,7 @@ def SendDidOpen(bufnr: number)
   endif
   # Register listener for incremental sync
   RegisterListener(bufnr)
+  s_doc_changedticks[uri] = getbufvar(bufnr, 'changedtick')
 enddef
 
 def EnsureDocumentOpened(bufnr: number = 0)
@@ -462,6 +475,7 @@ def SendDidChange()
       text: text,
     })
   endif
+  s_doc_changedticks[uri] = b:changedtick
 enddef
 
 export def OnBufOpen()
@@ -525,6 +539,9 @@ export def OnBufClose()
   if has_key(s_pending_changes, uri)
     remove(s_pending_changes, uri)
   endif
+  if has_key(s_doc_changedticks, uri)
+    remove(s_doc_changedticks, uri)
+  endif
   if has_key(s_semtok_has_full, uri)
     remove(s_semtok_has_full, uri)
   endif
@@ -534,16 +551,25 @@ export def OnTextChanged()
   if !s_initialized
     return
   endif
+
   if s_change_timer > 0
     timer_stop(s_change_timer)
   endif
-  s_change_timer = timer_start(200, (_) => {
+  s_change_timer = timer_start(g:simplecc_change_delay, (_) => {
+    s_change_timer = 0
     SendDidChange()
     # F3: Re-request inlay hints after changes
     RequestInlayHintsDebounced()
     # F2: Auto semantic tokens
     RequestSemanticTokensDebounced()
   })
+
+  # TextChangedI is a more accurate completion trigger than relying only on
+  # CursorMovedI. TriggerCompletion itself snapshots the cursor and changedtick,
+  # so duplicate events collapse into one request.
+  if mode() =~# '^i' && g:simplecc_auto_complete && !pumvisible()
+    TriggerCompletion()
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -562,7 +588,17 @@ export def OnCursorMovedI()
 enddef
 
 export def OnInsertLeave()
+  if s_comp_timer > 0
+    timer_stop(s_comp_timer)
+    s_comp_timer = 0
+  endif
+  if s_comp_resolve_timer > 0
+    timer_stop(s_comp_resolve_timer)
+    s_comp_resolve_timer = 0
+  endif
   s_comp_requesting = false
+  s_comp_resolve_id = 0
+  s_comp_resolve_key = ''
   CloseSignaturePopup()
   # Clear completion preview state
   s_comp_preview_start_line = 0
@@ -571,30 +607,50 @@ export def OnInsertLeave()
 enddef
 
 export def OnInsertCharPre()
-  # Auto-close completion menu when pressing non-special keys
   if !pumvisible()
     return
   endif
 
-  # Allow navigation keys and special keys to keep the menu open
   var key = v:char
-  # Allow: letters, digits, underscores, backspace, spaces to continue completion
-  # Close menu for other characters like punctuation, operators, etc.
-  if key =~ '[[:alnum:]_\s]'
+  # Keep filtering while entering an identifier. Whitespace and punctuation
+  # close the old menu; TextChangedI can then request a context-triggered menu.
+  if key =~# '\k'
     return
   endif
 
-  # Close the menu for other characters
-  execute "normal! \<C-e>"
+  feedkeys("\<C-e>", 'n')
+enddef
+
+def ResolveCompletionItem(key: string, item_index: number, ft: string)
+  s_comp_resolve_timer = 0
+  if !pumvisible() || s_comp_resolve_key !=# key
+    return
+  endif
+  var resolve_id = NextId()
+  s_comp_resolve_id = resolve_id
+  s_comp_resolved[key] = true
+  Send({
+    type: 'completionItem/resolve',
+    id: resolve_id,
+    languageId: ft,
+    index: item_index,
+  })
 enddef
 
 export def OnCompleteChanged()
   if !s_initialized
     return
   endif
+
+  if s_comp_resolve_timer > 0
+    timer_stop(s_comp_resolve_timer)
+    s_comp_resolve_timer = 0
+  endif
+
   var info = complete_info(['selected', 'items'])
   var sel = get(info, 'selected', -1)
   if sel < 0
+    s_comp_resolve_key = ''
     return
   endif
   var items = get(info, 'items', [])
@@ -605,19 +661,27 @@ export def OnCompleteChanged()
   var ci = items[sel]
   var ud = get(ci, 'user_data', {})
   if type(ud) == v:t_dict
-    var idx = get(ud, 'index', -1)
-    if idx >= 0
-      Send({
-        type: 'completionItem/resolve',
-        id: NextId(),
-        languageId: BufFt(),
-        index: idx,
-      })
+    var item_index = get(ud, 'index', -1)
+    if item_index >= 0
+      var key = printf('%d:%d', s_comp_id, item_index)
+      s_comp_resolve_key = key
+      if has_key(s_comp_resolved, key)
+        return
+      endif
+
+      var ft = BufFt()
+      s_comp_resolve_timer = timer_start(
+        g:simplecc_complete_resolve_delay,
+        (_) => ResolveCompletionItem(key, item_index, ft))
     endif
   endif
 enddef
 
 def OnCompletionResolve(ev: dict<any>)
+  if get(ev, 'id', 0) != s_comp_resolve_id
+    return
+  endif
+  s_comp_resolve_id = 0
   var item = get(ev, 'item', {})
   if empty(item)
     return
@@ -655,7 +719,17 @@ def TriggerCompletion()
   if s_comp_timer > 0
     timer_stop(s_comp_timer)
   endif
+
+  var bnr = bufnr('%')
+  var tick = b:changedtick
+  var lnum = line('.')
+  var ccol = col('.')
   s_comp_timer = timer_start(g:simplecc_complete_delay, (_) => {
+    s_comp_timer = 0
+    if mode() !~# '^i' || bufnr('%') != bnr || b:changedtick != tick
+          || line('.') != lnum || col('.') != ccol
+      return
+    endif
     RequestCompletion()
   })
 enddef
@@ -708,12 +782,25 @@ export def SelectUpKey(): string
 enddef
 
 export def SelectEnterKey(): string
-  if pumvisible()
-    # Menu is open, select current item
-    return "\<C-y>"
-  else
-    # Menu is closed, insert newline normally
+  if !pumvisible()
     return "\<CR>"
+  endif
+
+  var selected = get(complete_info(['selected']), 'selected', -1)
+  # With completeopt=noselect, Enter must still insert a newline when the user
+  # has not explicitly selected a candidate.
+  return selected >= 0 ? "\<C-y>" : "\<C-e>\<CR>"
+enddef
+
+def SyncDocumentForCompletion()
+  if s_change_timer > 0
+    timer_stop(s_change_timer)
+    s_change_timer = 0
+  endif
+
+  var uri = BufUri()
+  if uri !=# 'file://' && get(s_doc_changedticks, uri, -1) != b:changedtick
+    SendDidChange()
   endif
 enddef
 
@@ -723,25 +810,51 @@ def RequestCompletion()
     return
   endif
 
-  # Check context: only complete after word chars or trigger chars
-  var col = col('.')
-  if col <= 1
+  var ccol = col('.')
+  if ccol <= 1
     return
   endif
-  var line = getline('.')
-  var before = col > 1 ? line[: col - 2] : ''
+  var line_text = getline('.')
+  var before = line_text[: ccol - 2]
   if before ==# '' || before =~ '\s$'
     return
   endif
 
+  # Work in Vim byte columns, matching col() and complete(). Use 'iskeyword'
+  # instead of \w so language-specific identifier characters are respected.
+  var start = ccol - 1
+  while start > 0 && line_text[start - 1] =~# '\k'
+    start -= 1
+  endwhile
+  var prefix = start < ccol - 1 ? line_text[start : ccol - 2] : ''
+  var is_trigger = start > 0
+        && line_text[start - 1] =~# '[^[:alnum:]_[:space:]]'
+  if strchars(prefix) < g:simplecc_complete_min_chars && !is_trigger
+    return
+  endif
+
+  # Queue the latest buffer text before the completion request. Both messages
+  # use the same Vim -> daemon channel, eliminating the stale-text window on
+  # the editor side.
+  SyncDocumentForCompletion()
+
   var uri = BufUri()
   var lnum = line('.') - 1
-  var cchar = col - 1
+  var cchar = ccol - 1
 
   var id = NextId()
   s_comp_id = id
   s_comp_requesting = true
+  s_comp_bufnr = bufnr('%')
+  s_comp_changedtick = b:changedtick
+  s_comp_line = line('.')
+  s_comp_col = ccol
+  s_comp_start_col = start
+  s_comp_resolve_id = 0
+  s_comp_resolve_key = ''
+  s_comp_resolved = {}
 
+  var max_items = max([1, g:simplecc_complete_max_items])
   Send({
     type: 'textDocument/completion',
     id: id,
@@ -749,6 +862,7 @@ def RequestCompletion()
     languageId: ft,
     line: lnum,
     character: cchar,
+    maxItems: max_items,
   })
 enddef
 
@@ -762,35 +876,44 @@ def OnCompletion(ev: dict<any>)
   endif
   s_comp_requesting = false
 
+  # A response is only valid for the exact editor snapshot that requested it.
+  if mode() !~# '^i' || bufnr('%') != s_comp_bufnr
+        || b:changedtick != s_comp_changedtick
+        || line('.') != s_comp_line || col('.') != s_comp_col
+    return
+  endif
+
   var items = get(ev, 'items', [])
   if empty(items)
     return
   endif
 
-  # Find start column for completion
-  var col = col('.')
-  var line = getline('.')
-  var start = col - 1
-  while start > 0 && line[start - 1] =~ '\w'
-    start -= 1
-  endwhile
+  var line_text = getline('.')
+  var start = s_comp_start_col
 
   # Build Vim complete items
   var complete_items: list<dict<any>> = []
   var idx = 0
+  var max_items = max([1, g:simplecc_complete_max_items])
   for item in items
+    if idx >= max_items
+      break
+    endif
     var word = get(item, 'insert_text', get(item, 'label', ''))
     var is_snippet = get(item, 'is_snippet', false)
     # For snippet items, show the label as word rather than raw snippet text
     if is_snippet
       word = get(item, 'label', word)
     endif
+    var item_index = get(item, 'index', idx)
     var ci: dict<any> = {
       word: word,
       abbr: get(item, 'label', ''),
       menu: get(item, 'kind', '') .. (is_snippet ? ' ~' : ''),
       dup: 1,
-      user_data: {index: idx, is_snippet: is_snippet, snippet_text: is_snippet ? get(item, 'insert_text', '') : ''},
+      icase: &ignorecase ? 1 : 0,
+      user_data: {index: item_index, is_snippet: is_snippet,
+        snippet_text: is_snippet ? get(item, 'insert_text', '') : ''},
     }
     var detail = get(item, 'detail', '')
     if detail !=# ''
@@ -804,13 +927,17 @@ def OnCompletion(ev: dict<any>)
     idx += 1
   endfor
 
+  if empty(complete_items)
+    return
+  endif
+
   if mode() ==# 'i'
     # Save completion start position for preview
     var current_line_nr = line('.')
     s_comp_preview_start_line = current_line_nr - 1
     s_comp_preview_start_col = start
-    # Get original text from start position to cursor
-    s_comp_preview_orig_text = line[start :]
+    s_comp_preview_orig_text = start < s_comp_col - 1
+          ? line_text[start : s_comp_col - 2] : ''
 
     # Save original completeopt and configure
     var saved_completeopt = &completeopt

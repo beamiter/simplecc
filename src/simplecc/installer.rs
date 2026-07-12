@@ -1,4 +1,4 @@
-use anyhow::{Result, bail, Context};
+use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -82,7 +82,10 @@ fn julia_depot() -> PathBuf {
 
 /// Project.toml of the dedicated `@simplecc` named environment.
 fn julia_lsp_env_project() -> PathBuf {
-    julia_depot().join("environments").join("simplecc").join("Project.toml")
+    julia_depot()
+        .join("environments")
+        .join("simplecc")
+        .join("Project.toml")
 }
 
 /// Whether LanguageServer.jl is installed in the `@simplecc` named environment.
@@ -111,7 +114,7 @@ enum ArchiveKind {
 
 struct ServerMeta {
     name: &'static str,
-    github_repo: Option<&'static str>, // "owner/repo"
+    github_repo: Option<&'static str>,           // "owner/repo"
     download_url: fn(&Platform, &str) -> String, // (platform, version) -> url
     archive_kind: ArchiveKind,
     binary_rel_path: fn(&Platform) -> String, // relative binary path after extraction
@@ -189,8 +192,14 @@ static KNOWN_SERVERS: &[ServerMeta] = &[
         install_command: Some(|_plat, install_dir| {
             (
                 "go".to_string(),
-                vec!["install".to_string(), "golang.org/x/tools/gopls@latest".to_string()],
-                vec![("GOBIN".to_string(), install_dir.to_string_lossy().to_string())],
+                vec![
+                    "install".to_string(),
+                    "golang.org/x/tools/gopls@latest".to_string(),
+                ],
+                vec![(
+                    "GOBIN".to_string(),
+                    install_dir.to_string_lossy().to_string(),
+                )],
             )
         }),
     },
@@ -204,7 +213,11 @@ static KNOWN_SERVERS: &[ServerMeta] = &[
         install_command: Some(|_plat, _install_dir| {
             (
                 "npm".to_string(),
-                vec!["install".to_string(), "-g".to_string(), "pyright".to_string()],
+                vec![
+                    "install".to_string(),
+                    "-g".to_string(),
+                    "pyright".to_string(),
+                ],
                 vec![],
             )
         }),
@@ -261,8 +274,7 @@ pub fn list_installable() -> Vec<ServerInfo> {
 }
 
 pub async fn install_server(name: &str, event_tx: &EventTx) -> Result<PathBuf> {
-    let meta = find_server_meta(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown server: {}", name))?;
+    let meta = find_server_meta(name).ok_or_else(|| anyhow::anyhow!("unknown server: {}", name))?;
 
     // Guard against concurrent installs
     {
@@ -298,7 +310,8 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
     let install_dir = server_install_dir(meta.name);
 
     // Create install directory
-    tokio::fs::create_dir_all(&install_dir).await
+    tokio::fs::create_dir_all(&install_dir)
+        .await
         .context("failed to create install directory")?;
 
     match meta.archive_kind {
@@ -314,10 +327,18 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
 
     if !bin_path.exists() {
         // Try to find the binary in subdirectories (clangd extracts into clangd_*/bin/)
-        if let Some(found) = find_binary_recursive(&install_dir, &bin_path.file_name().unwrap().to_string_lossy()).await {
+        if let Some(found) = find_binary_recursive(
+            &install_dir,
+            &bin_path.file_name().unwrap().to_string_lossy(),
+        )
+        .await
+        {
             return Ok(found);
         }
-        bail!("binary not found after installation: {}", bin_path.display());
+        bail!(
+            "binary not found after installation: {}",
+            bin_path.display()
+        );
     }
 
     Ok(bin_path)
@@ -392,7 +413,8 @@ async fn install_via_command(
     install_dir: &Path,
     event_tx: &EventTx,
 ) -> Result<()> {
-    let make_cmd = meta.install_command
+    let make_cmd = meta
+        .install_command
         .ok_or_else(|| anyhow::anyhow!("no install command for {}", meta.name))?;
 
     let (cmd, args, envs) = make_cmd(plat, install_dir);
@@ -410,7 +432,9 @@ async fn install_via_command(
         command.env(k, v);
     }
 
-    let output = command.output().await
+    let output = command
+        .output()
+        .await
         .context(format!("failed to run {}", cmd))?;
 
     if !output.status.success() {
@@ -448,7 +472,10 @@ async fn install_julia_lsp(event_tx: &EventTx) -> Result<PathBuf> {
     }
 
     if !julia_lsp_env_project().exists() {
-        bail!("install reported success but {} was not created", julia_lsp_env_project().display());
+        bail!(
+            "install reported success but {} was not created",
+            julia_lsp_env_project().display()
+        );
     }
 
     send_progress(event_tx, "julia-lsp", "done", 100).await;
@@ -644,7 +671,11 @@ async fn find_binary_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
             if let Some(found) = Box::pin(find_binary_recursive(&path, name)).await {
                 return Some(found);
             }
-        } else if path.file_name().map(|f| f.to_string_lossy() == name).unwrap_or(false) {
+        } else if path
+            .file_name()
+            .map(|f| f.to_string_lossy() == name)
+            .unwrap_or(false)
+        {
             set_executable(&path).ok();
             return Some(path);
         }

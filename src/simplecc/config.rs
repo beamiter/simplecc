@@ -91,7 +91,8 @@ impl Config {
     /// Find all servers that handle a given filetype.
     #[allow(dead_code)]
     pub fn servers_for_filetype(&self, filetype: &str) -> Vec<(&str, &ServerConfig)> {
-        self.language_servers.iter()
+        self.language_servers
+            .iter()
             .filter(|(_, cfg)| cfg.filetypes.iter().any(|ft| ft == filetype))
             .map(|(name, cfg)| (name.as_str(), cfg))
             .collect()
@@ -102,72 +103,97 @@ impl Default for Config {
     fn default() -> Self {
         let mut servers = HashMap::new();
 
-        servers.insert("rust-analyzer".to_string(), ServerConfig {
-            command: "rust-analyzer".to_string(),
-            args: vec![],
-            filetypes: vec!["rust".to_string()],
-            root_patterns: vec!["Cargo.toml".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "rust-analyzer".to_string(),
+            ServerConfig {
+                command: "rust-analyzer".to_string(),
+                args: vec![],
+                filetypes: vec!["rust".to_string()],
+                root_patterns: vec!["Cargo.toml".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        servers.insert("clangd".to_string(), ServerConfig {
-            command: "clangd".to_string(),
-            args: vec![],
-            filetypes: vec!["c".to_string(), "cpp".to_string()],
-            root_patterns: vec!["compile_commands.json".to_string(), ".clangd".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "clangd".to_string(),
+            ServerConfig {
+                command: "clangd".to_string(),
+                args: vec![],
+                filetypes: vec!["c".to_string(), "cpp".to_string()],
+                root_patterns: vec!["compile_commands.json".to_string(), ".clangd".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        servers.insert("pyright".to_string(), ServerConfig {
-            command: "pyright-langserver".to_string(),
-            args: vec!["--stdio".to_string()],
-            filetypes: vec!["python".to_string()],
-            root_patterns: vec!["pyproject.toml".to_string(), "setup.py".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "pyright".to_string(),
+            ServerConfig {
+                command: "pyright-langserver".to_string(),
+                args: vec!["--stdio".to_string()],
+                filetypes: vec!["python".to_string()],
+                root_patterns: vec!["pyproject.toml".to_string(), "setup.py".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        servers.insert("typescript-language-server".to_string(), ServerConfig {
-            command: "typescript-language-server".to_string(),
-            args: vec!["--stdio".to_string()],
-            filetypes: vec![
-                "typescript".to_string(), "javascript".to_string(),
-                "typescriptreact".to_string(), "javascriptreact".to_string(),
-            ],
-            root_patterns: vec!["package.json".to_string(), "tsconfig.json".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "typescript-language-server".to_string(),
+            ServerConfig {
+                command: "typescript-language-server".to_string(),
+                args: vec!["--stdio".to_string()],
+                filetypes: vec![
+                    "typescript".to_string(),
+                    "javascript".to_string(),
+                    "typescriptreact".to_string(),
+                    "javascriptreact".to_string(),
+                ],
+                root_patterns: vec!["package.json".to_string(), "tsconfig.json".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        servers.insert("lua-language-server".to_string(), ServerConfig {
-            command: "lua-language-server".to_string(),
-            args: vec![],
-            filetypes: vec!["lua".to_string()],
-            root_patterns: vec![".luarc.json".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "lua-language-server".to_string(),
+            ServerConfig {
+                command: "lua-language-server".to_string(),
+                args: vec![],
+                filetypes: vec!["lua".to_string()],
+                root_patterns: vec![".luarc.json".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        servers.insert("gopls".to_string(), ServerConfig {
-            command: "gopls".to_string(),
-            args: vec![],
-            filetypes: vec!["go".to_string(), "gomod".to_string()],
-            root_patterns: vec!["go.mod".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "gopls".to_string(),
+            ServerConfig {
+                command: "gopls".to_string(),
+                args: vec![],
+                filetypes: vec!["go".to_string(), "gomod".to_string()],
+                root_patterns: vec!["go.mod".to_string()],
+                initialization_options: None,
+            },
+        );
 
         // LanguageServer.jl runs through the `julia` binary, loaded from the
         // dedicated `@simplecc` named environment (see JULIA_LSP_SCRIPT).
-        servers.insert("julia-lsp".to_string(), ServerConfig {
-            command: "julia".to_string(),
-            args: vec![
-                "--startup-file=no".to_string(),
-                "--history-file=no".to_string(),
-                "-e".to_string(),
-                JULIA_LSP_SCRIPT.to_string(),
-            ],
-            filetypes: vec!["julia".to_string()],
-            root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],
-            initialization_options: None,
-        });
+        servers.insert(
+            "julia-lsp".to_string(),
+            ServerConfig {
+                command: "julia".to_string(),
+                args: vec![
+                    "--startup-file=no".to_string(),
+                    "--history-file=no".to_string(),
+                    "-e".to_string(),
+                    JULIA_LSP_SCRIPT.to_string(),
+                ],
+                filetypes: vec!["julia".to_string()],
+                root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],
+                initialization_options: None,
+            },
+        );
 
-        Config { language_servers: servers }
+        Config {
+            language_servers: servers,
+        }
     }
 }

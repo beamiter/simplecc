@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
@@ -27,7 +27,9 @@ impl LspTransport {
             command.current_dir(dir);
         }
 
-        let mut child = command.spawn().with_context(|| format!("failed to spawn {cmd}"))?;
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn {cmd}"))?;
 
         let stdout = child.stdout.take().context("no stdout")?;
         let writer = child.stdin.take().context("no stdin")?;
@@ -56,7 +58,13 @@ impl LspTransport {
             });
         }
 
-        Ok((Self { writer, _child: child }, rx))
+        Ok((
+            Self {
+                writer,
+                _child: child,
+            },
+            rx,
+        ))
     }
 
     /// Send a JSON-RPC message with Content-Length header.

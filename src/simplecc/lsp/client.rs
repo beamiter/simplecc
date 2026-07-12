@@ -1,10 +1,11 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use lsp_types::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::transport::LspTransport;
 use super::types;
@@ -70,14 +71,12 @@ impl LspClient {
         root_path: &str,
         init_options: Option<Value>,
     ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
-        let (transport, mut incoming) =
-            LspTransport::spawn(cmd, args, Some(root_path))?;
+        let (transport, mut incoming) = LspTransport::spawn(cmd, args, Some(root_path))?;
 
         let transport = Arc::new(Mutex::new(transport));
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let capabilities: Arc<Mutex<Option<ServerCapabilities>>> =
-            Arc::new(Mutex::new(None));
+        let capabilities: Arc<Mutex<Option<ServerCapabilities>>> = Arc::new(Mutex::new(None));
 
         let (event_tx, event_rx) = mpsc::channel::<ServerEvent>(256);
 
@@ -91,12 +90,7 @@ impl LspClient {
                 if let Some(id) = msg.get("id") {
                     if msg.get("method").is_some() {
                         // Server request (e.g. workspace/applyEdit)
-                        handle_server_request(
-                            &msg,
-                            &transport_clone,
-                            &event_tx_clone,
-                        )
-                        .await;
+                        handle_server_request(&msg, &transport_clone, &event_tx_clone).await;
                     } else {
                         // Response to our request
                         let id = id.as_i64().unwrap_or(0);
@@ -137,6 +131,19 @@ impl LspClient {
 
     /// Send a JSON-RPC request and wait for response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, Duration::from_secs(120))
+            .await
+    }
+
+    /// Send a JSON-RPC request with a feature-specific timeout. Timed-out
+    /// requests are removed from the pending map and cancelled at the server,
+    /// preventing leaked senders and very late responses from accumulating.
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_request_id();
         let msg = json!({
             "jsonrpc": "2.0",
@@ -151,12 +158,31 @@ impl LspClient {
             map.insert(id, tx);
         }
 
-        {
+        let send_result = {
             let mut t = self.transport.lock().await;
-            t.send(&msg).await?;
+            t.send(&msg).await
+        };
+        if let Err(err) = send_result {
+            self.pending.lock().await.remove(&id);
+            return Err(err);
         }
 
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(120), rx).await??;
+        let resp = match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(err.into());
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                let _ = self.notify("$/cancelRequest", json!({ "id": id })).await;
+                bail!(
+                    "LSP request timed out after {}ms: {}",
+                    timeout.as_millis(),
+                    method,
+                );
+            }
+        };
 
         if let Some(err) = resp.get("error") {
             bail!("LSP error: {}", err);
@@ -219,28 +245,49 @@ impl LspClient {
 
     // ─── Document Sync ──────────────────────────────────────
 
-    pub async fn did_open(&self, uri: &str, language_id: &str, version: i32, text: &str) -> Result<()> {
-        self.notify("textDocument/didOpen", json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": language_id,
-                "version": version,
-                "text": text,
-            }
-        })).await
+    pub async fn did_open(
+        &self,
+        uri: &str,
+        language_id: &str,
+        version: i32,
+        text: &str,
+    ) -> Result<()> {
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": version,
+                    "text": text,
+                }
+            }),
+        )
+        .await
     }
 
-    pub async fn did_change(&self, uri: &str, version: i32, text: Option<&str>, changes: Option<Vec<Value>>) -> Result<()> {
+    pub async fn did_change(
+        &self,
+        uri: &str,
+        version: i32,
+        text: Option<&str>,
+        changes: Option<Vec<Value>>,
+    ) -> Result<()> {
         let content_changes = if let Some(changes) = changes {
             // Check if server supports incremental sync
             let caps = self.capabilities.lock().await;
-            let supports_incremental = caps.as_ref().and_then(|c| {
-                match &c.text_document_sync {
-                    Some(TextDocumentSyncCapability::Kind(kind)) => Some(*kind == TextDocumentSyncKind::INCREMENTAL),
-                    Some(TextDocumentSyncCapability::Options(opts)) => opts.change.map(|k| k == TextDocumentSyncKind::INCREMENTAL),
+            let supports_incremental = caps
+                .as_ref()
+                .and_then(|c| match &c.text_document_sync {
+                    Some(TextDocumentSyncCapability::Kind(kind)) => {
+                        Some(*kind == TextDocumentSyncKind::INCREMENTAL)
+                    }
+                    Some(TextDocumentSyncCapability::Options(opts)) => {
+                        opts.change.map(|k| k == TextDocumentSyncKind::INCREMENTAL)
+                    }
                     None => None,
-                }
-            }).unwrap_or(false);
+                })
+                .unwrap_or(false);
             drop(caps);
             if supports_incremental {
                 json!(changes)
@@ -255,10 +302,14 @@ impl LspClient {
             json!([{ "text": "" }])
         };
 
-        self.notify("textDocument/didChange", json!({
-            "textDocument": { "uri": uri, "version": version },
-            "contentChanges": content_changes
-        })).await
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": uri, "version": version },
+                "contentChanges": content_changes
+            }),
+        )
+        .await
     }
 
     pub async fn did_save(&self, uri: &str, text: Option<&str>) -> Result<()> {
@@ -270,56 +321,86 @@ impl LspClient {
     }
 
     pub async fn did_close(&self, uri: &str) -> Result<()> {
-        self.notify("textDocument/didClose", json!({
-            "textDocument": { "uri": uri }
-        })).await
+        self.notify(
+            "textDocument/didClose",
+            json!({
+                "textDocument": { "uri": uri }
+            }),
+        )
+        .await
     }
 
     // ─── LSP Features ───────────────────────────────────────
 
-    pub async fn completion(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::CompletionItem>> {
-        let result = self.request("textDocument/completion", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+    pub async fn completion(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        max_items: usize,
+    ) -> Result<Vec<types::CompletionItem>> {
+        let result = self
+            .request_with_timeout(
+                "textDocument/completion",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+                Duration::from_secs(3),
+            )
+            .await?;
 
-        let items = if result.is_array() {
+        let mut items = if result.is_array() {
             serde_json::from_value::<Vec<lsp_types::CompletionItem>>(result)?
         } else if let Ok(list) = serde_json::from_value::<CompletionList>(result.clone()) {
             list.items
         } else {
             vec![]
         };
+        items.truncate(max_items.max(1).min(500));
 
         // Cache raw items for resolve
         *self.cached_completions.lock().await = items.clone();
 
-        Ok(items.into_iter().enumerate().map(|(idx, item)| {
-            let is_snippet = item.insert_text_format == Some(InsertTextFormat::SNIPPET);
-            let insert_text = item.insert_text.clone()
-                .or_else(|| item.text_edit.as_ref().map(|te| match te {
-                    CompletionTextEdit::Edit(e) => e.new_text.clone(),
-                    CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
-                }));
-            types::CompletionItem {
-                label: item.label.clone(),
-                kind: item.kind.map(types::completion_kind_label).map(String::from),
-                detail: item.detail.clone(),
-                documentation: types::extract_doc(&item.documentation),
-                insert_text,
-                sort_text: item.sort_text.clone(),
-                filter_text: item.filter_text.clone().or(Some(item.label)),
-                index: idx,
-                is_snippet: if is_snippet { Some(true) } else { None },
-            }
-        }).collect())
+        Ok(items
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let is_snippet = item.insert_text_format == Some(InsertTextFormat::SNIPPET);
+                let insert_text = item.insert_text.clone().or_else(|| {
+                    item.text_edit.as_ref().map(|te| match te {
+                        CompletionTextEdit::Edit(e) => e.new_text.clone(),
+                        CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
+                    })
+                });
+                types::CompletionItem {
+                    label: item.label.clone(),
+                    kind: item
+                        .kind
+                        .map(types::completion_kind_label)
+                        .map(String::from),
+                    detail: item.detail.clone(),
+                    documentation: types::extract_doc(&item.documentation),
+                    insert_text,
+                    sort_text: item.sort_text.clone(),
+                    filter_text: item.filter_text.clone().or(Some(item.label)),
+                    index: idx,
+                    is_snippet: if is_snippet { Some(true) } else { None },
+                }
+            })
+            .collect())
     }
 
     pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<String>> {
-        let result = self.request("textDocument/hover", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+        let result = self
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
 
         if result.is_null() {
             return Ok(None);
@@ -329,51 +410,92 @@ impl LspClient {
         let text = match hover.contents {
             HoverContents::Scalar(mc) => match mc {
                 MarkedString::String(s) => s,
-                MarkedString::LanguageString(ls) => format!("```{}\n{}\n```", ls.language, ls.value),
+                MarkedString::LanguageString(ls) => {
+                    format!("```{}\n{}\n```", ls.language, ls.value)
+                }
             },
-            HoverContents::Array(arr) => arr.into_iter().map(|mc| match mc {
-                MarkedString::String(s) => s,
-                MarkedString::LanguageString(ls) => format!("```{}\n{}\n```", ls.language, ls.value),
-            }).collect::<Vec<_>>().join("\n\n"),
+            HoverContents::Array(arr) => arr
+                .into_iter()
+                .map(|mc| match mc {
+                    MarkedString::String(s) => s,
+                    MarkedString::LanguageString(ls) => {
+                        format!("```{}\n{}\n```", ls.language, ls.value)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             HoverContents::Markup(mc) => mc.value,
         };
         Ok(Some(text))
     }
 
-    pub async fn definition(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
-        let result = self.request("textDocument/definition", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+    pub async fn definition(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<types::Location>> {
+        let result = self
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
 
         parse_locations(result)
     }
 
-    pub async fn references(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
-        let result = self.request("textDocument/references", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-            "context": { "includeDeclaration": true },
-        })).await?;
+    pub async fn references(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<types::Location>> {
+        let result = self
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "context": { "includeDeclaration": true },
+                }),
+            )
+            .await?;
 
         parse_locations(result)
     }
 
-    pub async fn code_action(&self, uri: &str, line: u32, character: u32, end_line: u32, end_character: u32, diag_json: Value) -> Result<Vec<types::CodeAction>> {
+    pub async fn code_action(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        end_line: u32,
+        end_character: u32,
+        diag_json: Value,
+    ) -> Result<Vec<types::CodeAction>> {
         let diagnostics: Vec<lsp_types::Diagnostic> = if diag_json.is_array() {
             serde_json::from_value(diag_json).unwrap_or_default()
         } else {
             vec![]
         };
 
-        let result = self.request("textDocument/codeAction", json!({
-            "textDocument": { "uri": uri },
-            "range": {
-                "start": { "line": line, "character": character },
-                "end": { "line": end_line, "character": end_character },
-            },
-            "context": { "diagnostics": diagnostics },
-        })).await?;
+        let result = self
+            .request(
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": line, "character": character },
+                        "end": { "line": end_line, "character": end_character },
+                    },
+                    "context": { "diagnostics": diagnostics },
+                }),
+            )
+            .await?;
 
         if result.is_null() {
             return Ok(vec![]);
@@ -386,9 +508,17 @@ impl LspClient {
         for (i, item) in raw.into_iter().enumerate() {
             // Could be Command or CodeAction
             if item.get("edit").is_some() || item.get("command").is_some() {
-                let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                let title = item
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let kind = item.get("kind").and_then(|k| k.as_str()).map(String::from);
-                actions.push(types::CodeAction { title, kind, index: i });
+                actions.push(types::CodeAction {
+                    title,
+                    kind,
+                    index: i,
+                });
                 if let Ok(ca) = serde_json::from_value::<lsp_types::CodeAction>(item) {
                     cached.push(ca);
                 } else {
@@ -399,8 +529,16 @@ impl LspClient {
                 }
             } else {
                 // It's a Command
-                let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                actions.push(types::CodeAction { title, kind: None, index: i });
+                let title = item
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                actions.push(types::CodeAction {
+                    title,
+                    kind: None,
+                    index: i,
+                });
                 cached.push(lsp_types::CodeAction {
                     title: actions.last().unwrap().title.clone(),
                     ..Default::default()
@@ -414,51 +552,82 @@ impl LspClient {
 
     pub async fn execute_code_action(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
         let cached = self.cached_actions.lock().await;
-        let action = cached.get(index).ok_or_else(|| anyhow::anyhow!("invalid action index"))?;
+        let action = cached
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("invalid action index"))?;
 
         // Apply workspace edit if present
         let ws_edit = action.edit.as_ref().map(types::from_lsp_workspace_edit);
 
         // Execute command if present
         if let Some(ref cmd) = action.command {
-            let _ = self.request("workspace/executeCommand", json!({
-                "command": cmd.command,
-                "arguments": cmd.arguments,
-            })).await;
+            let _ = self
+                .request(
+                    "workspace/executeCommand",
+                    json!({
+                        "command": cmd.command,
+                        "arguments": cmd.arguments,
+                    }),
+                )
+                .await;
         }
 
         Ok(ws_edit)
     }
 
-    pub async fn formatting(&self, uri: &str, tab_size: u32, insert_spaces: bool) -> Result<Vec<types::TextEdit>> {
-        let result = self.request("textDocument/formatting", json!({
-            "textDocument": { "uri": uri },
-            "options": {
-                "tabSize": tab_size,
-                "insertSpaces": insert_spaces,
-            },
-        })).await?;
+    pub async fn formatting(
+        &self,
+        uri: &str,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Vec<types::TextEdit>> {
+        let result = self
+            .request(
+                "textDocument/formatting",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "options": {
+                        "tabSize": tab_size,
+                        "insertSpaces": insert_spaces,
+                    },
+                }),
+            )
+            .await?;
 
         if result.is_null() {
             return Ok(vec![]);
         }
 
         let edits: Vec<lsp_types::TextEdit> = serde_json::from_value(result)?;
-        Ok(edits.iter().map(|e| types::TextEdit {
-            line: e.range.start.line,
-            character: e.range.start.character,
-            end_line: e.range.end.line,
-            end_character: e.range.end.character,
-            new_text: e.new_text.clone(),
-        }).collect())
+        Ok(edits
+            .iter()
+            .map(|e| types::TextEdit {
+                line: e.range.start.line,
+                character: e.range.start.character,
+                end_line: e.range.end.line,
+                end_character: e.range.end.character,
+                new_text: e.new_text.clone(),
+            })
+            .collect())
     }
 
-    pub async fn rename(&self, uri: &str, line: u32, character: u32, new_name: &str) -> Result<Option<types::WorkspaceEdit>> {
-        let result = self.request("textDocument/rename", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-            "newName": new_name,
-        })).await?;
+    pub async fn rename(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+        new_name: &str,
+    ) -> Result<Option<types::WorkspaceEdit>> {
+        let result = self
+            .request(
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                    "newName": new_name,
+                }),
+            )
+            .await?;
 
         if result.is_null() {
             return Ok(None);
@@ -468,11 +637,21 @@ impl LspClient {
         Ok(Some(types::from_lsp_workspace_edit(&edit)))
     }
 
-    pub async fn signature_help(&self, uri: &str, line: u32, character: u32) -> Result<Option<Vec<types::SignatureInfo>>> {
-        let result = self.request("textDocument/signatureHelp", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+    pub async fn signature_help(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Vec<types::SignatureInfo>>> {
+        let result = self
+            .request(
+                "textDocument/signatureHelp",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
 
         if result.is_null() {
             return Ok(None);
@@ -483,203 +662,374 @@ impl LspClient {
             return Ok(None);
         }
 
-        let sigs: Vec<types::SignatureInfo> = sh.signatures.into_iter().enumerate().map(|(_i, sig)| {
-            let params: Vec<types::ParameterInfo> = sig.parameters.unwrap_or_default().into_iter().map(|p| {
-                let label = match p.label {
-                    ParameterLabel::Simple(s) => s,
-                    ParameterLabel::LabelOffsets([start, end]) => {
-                        sig.label.get(start as usize..end as usize).unwrap_or("").to_string()
-                    }
-                };
-                types::ParameterInfo {
-                    label,
-                    documentation: types::extract_doc(&p.documentation),
+        let sigs: Vec<types::SignatureInfo> = sh
+            .signatures
+            .into_iter()
+            .enumerate()
+            .map(|(_i, sig)| {
+                let params: Vec<types::ParameterInfo> = sig
+                    .parameters
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| {
+                        let label = match p.label {
+                            ParameterLabel::Simple(s) => s,
+                            ParameterLabel::LabelOffsets([start, end]) => sig
+                                .label
+                                .get(start as usize..end as usize)
+                                .unwrap_or("")
+                                .to_string(),
+                        };
+                        types::ParameterInfo {
+                            label,
+                            documentation: types::extract_doc(&p.documentation),
+                        }
+                    })
+                    .collect();
+                types::SignatureInfo {
+                    label: sig.label,
+                    documentation: types::extract_doc(&sig.documentation),
+                    active_parameter: sig.active_parameter.or(sh.active_parameter),
+                    parameters: params,
                 }
-            }).collect();
-            types::SignatureInfo {
-                label: sig.label,
-                documentation: types::extract_doc(&sig.documentation),
-                active_parameter: sig.active_parameter.or(sh.active_parameter),
-                parameters: params,
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(Some(sigs))
     }
 
-    pub async fn implementation(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
-        let result = self.request("textDocument/implementation", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+    pub async fn implementation(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<types::Location>> {
+        let result = self
+            .request(
+                "textDocument/implementation",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
         parse_locations(result)
     }
 
-    pub async fn type_definition(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::Location>> {
-        let result = self.request("textDocument/typeDefinition", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
+    pub async fn type_definition(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<types::Location>> {
+        let result = self
+            .request(
+                "textDocument/typeDefinition",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
         parse_locations(result)
     }
 
     pub async fn document_symbol(&self, uri: &str) -> Result<Vec<types::DocumentSymbolItem>> {
-        let result = self.request("textDocument/documentSymbol", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/documentSymbol",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         // Try DocumentSymbol[] first, then SymbolInformation[]
         if let Ok(syms) = serde_json::from_value::<Vec<lsp_types::DocumentSymbol>>(result.clone()) {
             return Ok(convert_doc_symbols(&syms));
         }
         if let Ok(infos) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result) {
-            return Ok(infos.iter().map(|i| types::DocumentSymbolItem {
-                name: i.name.clone(),
-                kind: types::symbol_kind_label(i.kind).to_string(),
-                detail: None,
-                line: i.location.range.start.line,
-                character: i.location.range.start.character,
-                end_line: i.location.range.end.line,
-                end_character: i.location.range.end.character,
-                children: vec![],
-            }).collect());
+            return Ok(infos
+                .iter()
+                .map(|i| types::DocumentSymbolItem {
+                    name: i.name.clone(),
+                    kind: types::symbol_kind_label(i.kind).to_string(),
+                    detail: None,
+                    line: i.location.range.start.line,
+                    character: i.location.range.start.character,
+                    end_line: i.location.range.end.line,
+                    end_character: i.location.range.end.character,
+                    children: vec![],
+                })
+                .collect());
         }
         Ok(vec![])
     }
 
     pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<types::DocumentSymbolItem>> {
-        let result = self.request("workspace/symbol", json!({
-            "query": query,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "workspace/symbol",
+                json!({
+                    "query": query,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         if let Ok(infos) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result) {
-            return Ok(infos.iter().map(|i| types::DocumentSymbolItem {
-                name: i.name.clone(),
-                kind: types::symbol_kind_label(i.kind).to_string(),
-                detail: Some(i.location.uri.to_string()),
-                line: i.location.range.start.line,
-                character: i.location.range.start.character,
-                end_line: i.location.range.end.line,
-                end_character: i.location.range.end.character,
-                children: vec![],
-            }).collect());
+            return Ok(infos
+                .iter()
+                .map(|i| types::DocumentSymbolItem {
+                    name: i.name.clone(),
+                    kind: types::symbol_kind_label(i.kind).to_string(),
+                    detail: Some(i.location.uri.to_string()),
+                    line: i.location.range.start.line,
+                    character: i.location.range.start.character,
+                    end_line: i.location.range.end.line,
+                    end_character: i.location.range.end.character,
+                    children: vec![],
+                })
+                .collect());
         }
         Ok(vec![])
     }
 
-    pub async fn document_highlight(&self, uri: &str, line: u32, character: u32) -> Result<Vec<types::DocumentHighlightItem>> {
-        let result = self.request("textDocument/documentHighlight", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn document_highlight(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<types::DocumentHighlightItem>> {
+        let result = self
+            .request(
+                "textDocument/documentHighlight",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let highlights: Vec<lsp_types::DocumentHighlight> = serde_json::from_value(result)?;
-        Ok(highlights.iter().map(|h| types::DocumentHighlightItem {
-            line: h.range.start.line,
-            character: h.range.start.character,
-            end_line: h.range.end.line,
-            end_character: h.range.end.character,
-            kind: types::highlight_kind_label(h.kind).to_string(),
-        }).collect())
+        Ok(highlights
+            .iter()
+            .map(|h| types::DocumentHighlightItem {
+                line: h.range.start.line,
+                character: h.range.start.character,
+                end_line: h.range.end.line,
+                end_character: h.range.end.character,
+                kind: types::highlight_kind_label(h.kind).to_string(),
+            })
+            .collect())
     }
 
-    pub async fn inlay_hints(&self, uri: &str, start_line: u32, end_line: u32) -> Result<Vec<types::InlayHintItem>> {
-        let result = self.request("textDocument/inlayHint", json!({
-            "textDocument": { "uri": uri },
-            "range": {
-                "start": { "line": start_line, "character": 0 },
-                "end": { "line": end_line, "character": 0 },
-            },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn inlay_hints(
+        &self,
+        uri: &str,
+        start_line: u32,
+        end_line: u32,
+    ) -> Result<Vec<types::InlayHintItem>> {
+        let result = self
+            .request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start_line, "character": 0 },
+                        "end": { "line": end_line, "character": 0 },
+                    },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let hints: Vec<lsp_types::InlayHint> = serde_json::from_value(result)?;
-        Ok(hints.iter().map(|h| {
-            let label = match &h.label {
-                lsp_types::InlayHintLabel::String(s) => s.clone(),
-                lsp_types::InlayHintLabel::LabelParts(parts) => {
-                    parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join("")
+        Ok(hints
+            .iter()
+            .map(|h| {
+                let label = match &h.label {
+                    lsp_types::InlayHintLabel::String(s) => s.clone(),
+                    lsp_types::InlayHintLabel::LabelParts(parts) => parts
+                        .iter()
+                        .map(|p| p.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(""),
+                };
+                let kind = match h.kind {
+                    Some(lsp_types::InlayHintKind::TYPE) => "type",
+                    Some(lsp_types::InlayHintKind::PARAMETER) => "parameter",
+                    _ => "other",
+                };
+                types::InlayHintItem {
+                    line: h.position.line,
+                    character: h.position.character,
+                    label,
+                    kind: kind.to_string(),
+                    padding_left: h.padding_left.unwrap_or(false),
+                    padding_right: h.padding_right.unwrap_or(false),
                 }
-            };
-            let kind = match h.kind {
-                Some(lsp_types::InlayHintKind::TYPE) => "type",
-                Some(lsp_types::InlayHintKind::PARAMETER) => "parameter",
-                _ => "other",
-            };
-            types::InlayHintItem {
-                line: h.position.line,
-                character: h.position.character,
-                label,
-                kind: kind.to_string(),
-                padding_left: h.padding_left.unwrap_or(false),
-                padding_right: h.padding_right.unwrap_or(false),
-            }
-        }).collect())
+            })
+            .collect())
     }
 
-    pub async fn call_hierarchy_prepare(&self, uri: &str, line: u32, character: u32) -> Result<Vec<lsp_types::CallHierarchyItem>> {
-        let result = self.request("textDocument/prepareCallHierarchy", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn call_hierarchy_prepare(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<lsp_types::CallHierarchyItem>> {
+        let result = self
+            .request(
+                "textDocument/prepareCallHierarchy",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         Ok(serde_json::from_value(result)?)
     }
 
-    pub async fn call_hierarchy_incoming(&self, item: &lsp_types::CallHierarchyItem) -> Result<Vec<types::CallHierarchyCall>> {
-        let result = self.request("callHierarchy/incomingCalls", json!({
-            "item": item,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn call_hierarchy_incoming(
+        &self,
+        item: &lsp_types::CallHierarchyItem,
+    ) -> Result<Vec<types::CallHierarchyCall>> {
+        let result = self
+            .request(
+                "callHierarchy/incomingCalls",
+                json!({
+                    "item": item,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let calls: Vec<lsp_types::CallHierarchyIncomingCall> = serde_json::from_value(result)?;
-        Ok(calls.iter().map(|c| types::CallHierarchyCall {
-            item: convert_call_hierarchy_item(&c.from),
-            from_ranges: c.from_ranges.iter().map(|r| types::RangeItem {
-                line: r.start.line, character: r.start.character,
-                end_line: r.end.line, end_character: r.end.character,
-            }).collect(),
-        }).collect())
+        Ok(calls
+            .iter()
+            .map(|c| types::CallHierarchyCall {
+                item: convert_call_hierarchy_item(&c.from),
+                from_ranges: c
+                    .from_ranges
+                    .iter()
+                    .map(|r| types::RangeItem {
+                        line: r.start.line,
+                        character: r.start.character,
+                        end_line: r.end.line,
+                        end_character: r.end.character,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
-    pub async fn call_hierarchy_outgoing(&self, item: &lsp_types::CallHierarchyItem) -> Result<Vec<types::CallHierarchyCall>> {
-        let result = self.request("callHierarchy/outgoingCalls", json!({
-            "item": item,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn call_hierarchy_outgoing(
+        &self,
+        item: &lsp_types::CallHierarchyItem,
+    ) -> Result<Vec<types::CallHierarchyCall>> {
+        let result = self
+            .request(
+                "callHierarchy/outgoingCalls",
+                json!({
+                    "item": item,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let calls: Vec<lsp_types::CallHierarchyOutgoingCall> = serde_json::from_value(result)?;
-        Ok(calls.iter().map(|c| types::CallHierarchyCall {
-            item: convert_call_hierarchy_item(&c.to),
-            from_ranges: c.from_ranges.iter().map(|r| types::RangeItem {
-                line: r.start.line, character: r.start.character,
-                end_line: r.end.line, end_character: r.end.character,
-            }).collect(),
-        }).collect())
+        Ok(calls
+            .iter()
+            .map(|c| types::CallHierarchyCall {
+                item: convert_call_hierarchy_item(&c.to),
+                from_ranges: c
+                    .from_ranges
+                    .iter()
+                    .map(|r| types::RangeItem {
+                        line: r.start.line,
+                        character: r.start.character,
+                        end_line: r.end.line,
+                        end_character: r.end.character,
+                    })
+                    .collect(),
+            })
+            .collect())
     }
 
-    pub async fn selection_range(&self, uri: &str, positions: &[(u32, u32)]) -> Result<Vec<types::SelectionRangeItem>> {
-        let pos_arr: Vec<_> = positions.iter().map(|(l, c)| json!({"line": l, "character": c})).collect();
-        let result = self.request("textDocument/selectionRange", json!({
-            "textDocument": { "uri": uri },
-            "positions": pos_arr,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn selection_range(
+        &self,
+        uri: &str,
+        positions: &[(u32, u32)],
+    ) -> Result<Vec<types::SelectionRangeItem>> {
+        let pos_arr: Vec<_> = positions
+            .iter()
+            .map(|(l, c)| json!({"line": l, "character": c}))
+            .collect();
+        let result = self
+            .request(
+                "textDocument/selectionRange",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "positions": pos_arr,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let ranges: Vec<lsp_types::SelectionRange> = serde_json::from_value(result)?;
         Ok(ranges.iter().map(|r| convert_selection_range(r)).collect())
     }
 
     async fn get_semtok_legend(&self) -> (Vec<String>, Vec<String>) {
         let caps = self.capabilities.lock().await;
-        let legend = caps.as_ref()
+        let legend = caps
+            .as_ref()
             .and_then(|c| c.semantic_tokens_provider.as_ref())
             .and_then(|p| match p {
-                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(o) => Some(&o.legend),
-                lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(o) => Some(&o.semantic_tokens_options.legend),
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(o) => {
+                    Some(&o.legend)
+                }
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                    o,
+                ) => Some(&o.semantic_tokens_options.legend),
             });
-        let type_names: Vec<String> = legend.map(|l| l.token_types.iter().map(|t| t.as_str().to_string()).collect()).unwrap_or_default();
-        let mod_names: Vec<String> = legend.map(|l| l.token_modifiers.iter().map(|m| m.as_str().to_string()).collect()).unwrap_or_default();
+        let type_names: Vec<String> = legend
+            .map(|l| {
+                l.token_types
+                    .iter()
+                    .map(|t| t.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mod_names: Vec<String> = legend
+            .map(|l| {
+                l.token_modifiers
+                    .iter()
+                    .map(|m| m.as_str().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
         (type_names, mod_names)
     }
 
-    fn decode_raw_tokens(data: &[lsp_types::SemanticToken], type_names: &[String], mod_names: &[String]) -> Vec<types::SemanticTokenItem> {
+    fn decode_raw_tokens(
+        data: &[lsp_types::SemanticToken],
+        type_names: &[String],
+        mod_names: &[String],
+    ) -> Vec<types::SemanticTokenItem> {
         let mut decoded = Vec::new();
         let mut line: u32 = 0;
         let mut start: u32 = 0;
@@ -690,7 +1040,10 @@ impl LspClient {
             } else {
                 start += token.delta_start;
             }
-            let token_type = type_names.get(token.token_type as usize).cloned().unwrap_or_else(|| format!("type_{}", token.token_type));
+            let token_type = type_names
+                .get(token.token_type as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("type_{}", token.token_type));
             let mut modifiers = Vec::new();
             for (i, name) in mod_names.iter().enumerate() {
                 if token.token_modifiers_bitset & (1 << i) != 0 {
@@ -709,23 +1062,43 @@ impl LspClient {
     }
 
     pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
-        let result = self.request("textDocument/semanticTokens/full", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/semanticTokens/full",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
         let (type_names, mod_names) = self.get_semtok_legend().await;
 
         // Cache result_id and raw data for delta requests
         if let Some(ref id) = tokens.result_id {
-            self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+            self.semtok_prev_result_id
+                .lock()
+                .await
+                .insert(uri.to_string(), id.clone());
         }
-        self.semtok_prev_data.lock().await.insert(uri.to_string(), tokens.data.clone());
+        self.semtok_prev_data
+            .lock()
+            .await
+            .insert(uri.to_string(), tokens.data.clone());
 
-        Ok(Self::decode_raw_tokens(&tokens.data, &type_names, &mod_names))
+        Ok(Self::decode_raw_tokens(
+            &tokens.data,
+            &type_names,
+            &mod_names,
+        ))
     }
 
-    pub async fn semantic_tokens_full_delta(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
+    pub async fn semantic_tokens_full_delta(
+        &self,
+        uri: &str,
+    ) -> Result<Vec<types::SemanticTokenItem>> {
         // Check if we have a previous result_id for this URI
         let prev_id = self.semtok_prev_result_id.lock().await.get(uri).cloned();
         let prev_id = match prev_id {
@@ -733,10 +1106,15 @@ impl LspClient {
             None => return self.semantic_tokens_full(uri).await,
         };
 
-        let result = self.request("textDocument/semanticTokens/full/delta", json!({
-            "textDocument": { "uri": uri },
-            "previousResultId": prev_id,
-        })).await;
+        let result = self
+            .request(
+                "textDocument/semanticTokens/full/delta",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "previousResultId": prev_id,
+                }),
+            )
+            .await;
 
         // On error, clear cache and fall back to full
         let result = match result {
@@ -747,7 +1125,9 @@ impl LspClient {
                 return self.semantic_tokens_full(uri).await;
             }
         };
-        if result.is_null() { return Ok(vec![]); }
+        if result.is_null() {
+            return Ok(vec![]);
+        }
 
         let (type_names, mod_names) = self.get_semtok_legend().await;
 
@@ -755,14 +1135,23 @@ impl LspClient {
         if let Ok(full) = serde_json::from_value::<lsp_types::SemanticTokens>(result.clone()) {
             // Server returned full tokens
             if let Some(ref id) = full.result_id {
-                self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+                self.semtok_prev_result_id
+                    .lock()
+                    .await
+                    .insert(uri.to_string(), id.clone());
             }
-            self.semtok_prev_data.lock().await.insert(uri.to_string(), full.data.clone());
+            self.semtok_prev_data
+                .lock()
+                .await
+                .insert(uri.to_string(), full.data.clone());
             Ok(Self::decode_raw_tokens(&full.data, &type_names, &mod_names))
         } else if let Ok(delta) = serde_json::from_value::<lsp_types::SemanticTokensDelta>(result) {
             // Server returned delta edits
             if let Some(ref id) = delta.result_id {
-                self.semtok_prev_result_id.lock().await.insert(uri.to_string(), id.clone());
+                self.semtok_prev_result_id
+                    .lock()
+                    .await
+                    .insert(uri.to_string(), id.clone());
             }
 
             // Apply edits to cached data
@@ -805,45 +1194,83 @@ impl LspClient {
         end_line: u32,
         end_char: u32,
     ) -> Result<Vec<types::SemanticTokenItem>> {
-        let result = self.request("textDocument/semanticTokens/range", json!({
-            "textDocument": { "uri": uri },
-            "range": {
-                "start": { "line": start_line, "character": start_char },
-                "end": { "line": end_line, "character": end_char },
-            },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/semanticTokens/range",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start_line, "character": start_char },
+                        "end": { "line": end_line, "character": end_char },
+                    },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
         let (type_names, mod_names) = self.get_semtok_legend().await;
-        Ok(Self::decode_raw_tokens(&tokens.data, &type_names, &mod_names))
+        Ok(Self::decode_raw_tokens(
+            &tokens.data,
+            &type_names,
+            &mod_names,
+        ))
     }
 
     pub async fn code_lens(&self, uri: &str) -> Result<Vec<types::CodeLensItem>> {
-        let result = self.request("textDocument/codeLens", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/codeLens",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let lenses: Vec<lsp_types::CodeLens> = serde_json::from_value(result)?;
         // Cache for later execution
         *self.cached_code_lenses.lock().await = lenses.clone();
-        Ok(lenses.iter().enumerate().map(|(idx, l)| types::CodeLensItem {
-            line: l.range.start.line,
-            character: l.range.start.character,
-            end_line: l.range.end.line,
-            end_character: l.range.end.character,
-            command_title: l.command.as_ref().map(|c| c.title.clone()),
-            index: idx,
-        }).collect())
+        Ok(lenses
+            .iter()
+            .enumerate()
+            .map(|(idx, l)| types::CodeLensItem {
+                line: l.range.start.line,
+                character: l.range.start.character,
+                end_line: l.range.end.line,
+                end_character: l.range.end.character,
+                command_title: l.command.as_ref().map(|c| c.title.clone()),
+                index: idx,
+            })
+            .collect())
     }
 
     pub async fn completion_resolve(&self, index: usize) -> Result<types::CompletionItem> {
-        let cached = self.cached_completions.lock().await;
-        let item = cached.get(index).ok_or_else(|| anyhow::anyhow!("invalid completion index"))?;
-        let result = self.request("completionItem/resolve", serde_json::to_value(item)?).await?;
+        // Clone before awaiting: holding the cache mutex across an LSP round
+        // trip blocks the next completion response from replacing the cache.
+        let item = {
+            let cached = self.cached_completions.lock().await;
+            cached
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("invalid completion index"))?
+        };
+        let result = self
+            .request_with_timeout(
+                "completionItem/resolve",
+                serde_json::to_value(&item)?,
+                Duration::from_secs(5),
+            )
+            .await?;
         let resolved: lsp_types::CompletionItem = serde_json::from_value(result)?;
         Ok(types::CompletionItem {
             label: resolved.label.clone(),
-            kind: resolved.kind.map(types::completion_kind_label).map(String::from),
+            kind: resolved
+                .kind
+                .map(types::completion_kind_label)
+                .map(String::from),
             detail: resolved.detail.clone(),
             documentation: types::extract_doc(&resolved.documentation),
             insert_text: resolved.insert_text.clone(),
@@ -856,20 +1283,29 @@ impl LspClient {
 
     pub async fn execute_code_lens(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
         let cached = self.cached_code_lenses.lock().await;
-        let lens = cached.get(index).ok_or_else(|| anyhow::anyhow!("invalid code lens index"))?;
+        let lens = cached
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("invalid code lens index"))?;
         // Resolve if no command yet
         let lens = if lens.command.is_none() {
-            let resolved = self.request("codeLens/resolve", serde_json::to_value(lens)?).await?;
+            let resolved = self
+                .request("codeLens/resolve", serde_json::to_value(lens)?)
+                .await?;
             serde_json::from_value::<lsp_types::CodeLens>(resolved)?
         } else {
             lens.clone()
         };
         drop(cached);
         if let Some(ref cmd) = lens.command {
-            let result = self.request("workspace/executeCommand", json!({
-                "command": cmd.command,
-                "arguments": cmd.arguments,
-            })).await;
+            let result = self
+                .request(
+                    "workspace/executeCommand",
+                    json!({
+                        "command": cmd.command,
+                        "arguments": cmd.arguments,
+                    }),
+                )
+                .await;
             // Command may return a workspace edit
             if let Ok(val) = result {
                 if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(val) {
@@ -882,56 +1318,102 @@ impl LspClient {
 
     // ─── Type Hierarchy (LSP 3.17) ─────────────────────────
 
-    pub async fn type_hierarchy_prepare(&self, uri: &str, line: u32, character: u32) -> Result<Vec<lsp_types::TypeHierarchyItem>> {
-        let result = self.request("textDocument/prepareTypeHierarchy", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn type_hierarchy_prepare(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<lsp_types::TypeHierarchyItem>> {
+        let result = self
+            .request(
+                "textDocument/prepareTypeHierarchy",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         Ok(serde_json::from_value(result)?)
     }
 
-    pub async fn type_hierarchy_supertypes(&self, item: &lsp_types::TypeHierarchyItem) -> Result<Vec<types::CallHierarchyItem>> {
-        let result = self.request("typeHierarchy/supertypes", json!({
-            "item": item,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn type_hierarchy_supertypes(
+        &self,
+        item: &lsp_types::TypeHierarchyItem,
+    ) -> Result<Vec<types::CallHierarchyItem>> {
+        let result = self
+            .request(
+                "typeHierarchy/supertypes",
+                json!({
+                    "item": item,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let items: Vec<lsp_types::TypeHierarchyItem> = serde_json::from_value(result)?;
-        Ok(items.iter().map(|i| types::CallHierarchyItem {
-            name: i.name.clone(),
-            kind: types::symbol_kind_label(i.kind).to_string(),
-            uri: i.uri.to_string(),
-            line: i.selection_range.start.line,
-            character: i.selection_range.start.character,
-            detail: i.detail.clone(),
-        }).collect())
+        Ok(items
+            .iter()
+            .map(|i| types::CallHierarchyItem {
+                name: i.name.clone(),
+                kind: types::symbol_kind_label(i.kind).to_string(),
+                uri: i.uri.to_string(),
+                line: i.selection_range.start.line,
+                character: i.selection_range.start.character,
+                detail: i.detail.clone(),
+            })
+            .collect())
     }
 
-    pub async fn type_hierarchy_subtypes(&self, item: &lsp_types::TypeHierarchyItem) -> Result<Vec<types::CallHierarchyItem>> {
-        let result = self.request("typeHierarchy/subtypes", json!({
-            "item": item,
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+    pub async fn type_hierarchy_subtypes(
+        &self,
+        item: &lsp_types::TypeHierarchyItem,
+    ) -> Result<Vec<types::CallHierarchyItem>> {
+        let result = self
+            .request(
+                "typeHierarchy/subtypes",
+                json!({
+                    "item": item,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let items: Vec<lsp_types::TypeHierarchyItem> = serde_json::from_value(result)?;
-        Ok(items.iter().map(|i| types::CallHierarchyItem {
-            name: i.name.clone(),
-            kind: types::symbol_kind_label(i.kind).to_string(),
-            uri: i.uri.to_string(),
-            line: i.selection_range.start.line,
-            character: i.selection_range.start.character,
-            detail: i.detail.clone(),
-        }).collect())
+        Ok(items
+            .iter()
+            .map(|i| types::CallHierarchyItem {
+                name: i.name.clone(),
+                kind: types::symbol_kind_label(i.kind).to_string(),
+                uri: i.uri.to_string(),
+                line: i.selection_range.start.line,
+                character: i.selection_range.start.character,
+                detail: i.detail.clone(),
+            })
+            .collect())
     }
 
     // ─── Pull Diagnostics (LSP 3.17) ───────────────────────
 
     pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<types::DiagnosticItem>> {
-        let result = self.request("textDocument/diagnostic", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/diagnostic",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         // Parse DocumentDiagnosticReport
-        let items_val = result.get("items")
+        let items_val = result
+            .get("items")
             .or_else(|| result.get("relatedDocuments"))
             .cloned()
             .unwrap_or_else(|| {
@@ -939,53 +1421,84 @@ impl LspClient {
                 result.get("items").cloned().unwrap_or(Value::Array(vec![]))
             });
         if let Ok(diags) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(items_val) {
-            return Ok(diags.iter().map(|d| types::DiagnosticItem {
-                line: d.range.start.line,
-                character: d.range.start.character,
-                end_line: d.range.end.line,
-                end_character: d.range.end.character,
-                severity: types::severity_to_u8(d.severity),
-                message: d.message.clone(),
-                source: d.source.clone(),
-                code: d.code.as_ref().map(|c| match c {
-                    NumberOrString::Number(n) => n.to_string(),
-                    NumberOrString::String(s) => s.clone(),
-                }),
-            }).collect());
+            return Ok(diags
+                .iter()
+                .map(|d| types::DiagnosticItem {
+                    line: d.range.start.line,
+                    character: d.range.start.character,
+                    end_line: d.range.end.line,
+                    end_character: d.range.end.character,
+                    severity: types::severity_to_u8(d.severity),
+                    message: d.message.clone(),
+                    source: d.source.clone(),
+                    code: d.code.as_ref().map(|c| match c {
+                        NumberOrString::Number(n) => n.to_string(),
+                        NumberOrString::String(s) => s.clone(),
+                    }),
+                })
+                .collect());
         }
         Ok(vec![])
     }
 
     pub async fn folding_range(&self, uri: &str) -> Result<Vec<types::FoldingRangeItem>> {
-        let result = self.request("textDocument/foldingRange", json!({
-            "textDocument": { "uri": uri },
-        })).await?;
-        if result.is_null() { return Ok(vec![]); }
+        let result = self
+            .request(
+                "textDocument/foldingRange",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
         let ranges: Vec<lsp_types::FoldingRange> = serde_json::from_value(result)?;
-        Ok(ranges.iter().map(|r| types::FoldingRangeItem {
-            start_line: r.start_line,
-            end_line: r.end_line,
-            kind: r.kind.as_ref().map(|k| match k {
-                lsp_types::FoldingRangeKind::Comment => "comment".to_string(),
-                lsp_types::FoldingRangeKind::Imports => "imports".to_string(),
-                lsp_types::FoldingRangeKind::Region => "region".to_string(),
-                _ => "other".to_string(),
-            }),
-        }).collect())
+        Ok(ranges
+            .iter()
+            .map(|r| types::FoldingRangeItem {
+                start_line: r.start_line,
+                end_line: r.end_line,
+                kind: r.kind.as_ref().map(|k| match k {
+                    lsp_types::FoldingRangeKind::Comment => "comment".to_string(),
+                    lsp_types::FoldingRangeKind::Imports => "imports".to_string(),
+                    lsp_types::FoldingRangeKind::Region => "region".to_string(),
+                    _ => "other".to_string(),
+                }),
+            })
+            .collect())
     }
 
-    pub async fn linked_editing_range(&self, uri: &str, line: u32, character: u32) -> Result<Option<types::LinkedEditingRangeItem>> {
-        let result = self.request("textDocument/linkedEditingRange", json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-        })).await?;
-        if result.is_null() { return Ok(None); }
+    pub async fn linked_editing_range(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<types::LinkedEditingRangeItem>> {
+        let result = self
+            .request(
+                "textDocument/linkedEditingRange",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
         let ler: lsp_types::LinkedEditingRanges = serde_json::from_value(result)?;
         Ok(Some(types::LinkedEditingRangeItem {
-            ranges: ler.ranges.iter().map(|r| types::RangeItem {
-                line: r.start.line, character: r.start.character,
-                end_line: r.end.line, end_character: r.end.character,
-            }).collect(),
+            ranges: ler
+                .ranges
+                .iter()
+                .map(|r| types::RangeItem {
+                    line: r.start.line,
+                    character: r.start.character,
+                    end_line: r.end.line,
+                    end_character: r.end.character,
+                })
+                .collect(),
             word_pattern: ler.word_pattern,
         }))
     }
@@ -1006,28 +1519,37 @@ fn parse_locations(result: Value) -> Result<Vec<types::Location>> {
     }
     // Array of LocationLink
     if let Ok(links) = serde_json::from_value::<Vec<LocationLink>>(result) {
-        return Ok(links.iter().map(|l| types::Location {
-            uri: l.target_uri.to_string(),
-            line: l.target_selection_range.start.line,
-            character: l.target_selection_range.start.character,
-            end_line: Some(l.target_selection_range.end.line),
-            end_character: Some(l.target_selection_range.end.character),
-        }).collect());
+        return Ok(links
+            .iter()
+            .map(|l| types::Location {
+                uri: l.target_uri.to_string(),
+                line: l.target_selection_range.start.line,
+                character: l.target_selection_range.start.character,
+                end_line: Some(l.target_selection_range.end.line),
+                end_character: Some(l.target_selection_range.end.character),
+            })
+            .collect());
     }
     Ok(vec![])
 }
 
 fn convert_doc_symbols(syms: &[lsp_types::DocumentSymbol]) -> Vec<types::DocumentSymbolItem> {
-    syms.iter().map(|s| types::DocumentSymbolItem {
-        name: s.name.clone(),
-        kind: types::symbol_kind_label(s.kind).to_string(),
-        detail: s.detail.clone(),
-        line: s.selection_range.start.line,
-        character: s.selection_range.start.character,
-        end_line: s.range.end.line,
-        end_character: s.range.end.character,
-        children: s.children.as_ref().map(|c| convert_doc_symbols(c)).unwrap_or_default(),
-    }).collect()
+    syms.iter()
+        .map(|s| types::DocumentSymbolItem {
+            name: s.name.clone(),
+            kind: types::symbol_kind_label(s.kind).to_string(),
+            detail: s.detail.clone(),
+            line: s.selection_range.start.line,
+            character: s.selection_range.start.character,
+            end_line: s.range.end.line,
+            end_character: s.range.end.character,
+            children: s
+                .children
+                .as_ref()
+                .map(|c| convert_doc_symbols(c))
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn convert_call_hierarchy_item(item: &lsp_types::CallHierarchyItem) -> types::CallHierarchyItem {
@@ -1047,7 +1569,10 @@ fn convert_selection_range(r: &lsp_types::SelectionRange) -> types::SelectionRan
         character: r.range.start.character,
         end_line: r.range.end.line,
         end_character: r.range.end.character,
-        parent: r.parent.as_ref().map(|p| Box::new(convert_selection_range(p))),
+        parent: r
+            .parent
+            .as_ref()
+            .map(|p| Box::new(convert_selection_range(p))),
     }
 }
 
@@ -1067,7 +1592,12 @@ async fn handle_server_request(
                     params.get("edit").cloned().unwrap_or(Value::Null),
                 ) {
                     let ws_edit = types::from_lsp_workspace_edit(&edit);
-                    let _ = event_tx.send(ServerEvent::ApplyEdit { id: id.clone(), edit: ws_edit }).await;
+                    let _ = event_tx
+                        .send(ServerEvent::ApplyEdit {
+                            id: id.clone(),
+                            edit: ws_edit,
+                        })
+                        .await;
                 }
             }
             // Respond with applied=true
@@ -1079,7 +1609,9 @@ async fn handle_server_request(
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
         }
-        "window/workDoneProgress/create" | "workspace/configuration" | "client/registerCapability" => {
+        "window/workDoneProgress/create"
+        | "workspace/configuration"
+        | "client/registerCapability" => {
             // Acknowledge with null result
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
             let mut t = transport.lock().await;
@@ -1108,8 +1640,10 @@ async fn handle_server_notification(
     match method {
         "textDocument/publishDiagnostics" => {
             if let Ok(pd) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
-                let items: Vec<types::DiagnosticItem> = pd.diagnostics.iter().map(|d| {
-                    types::DiagnosticItem {
+                let items: Vec<types::DiagnosticItem> = pd
+                    .diagnostics
+                    .iter()
+                    .map(|d| types::DiagnosticItem {
                         line: d.range.start.line,
                         character: d.range.start.character,
                         end_line: d.range.end.line,
@@ -1121,12 +1655,14 @@ async fn handle_server_notification(
                             NumberOrString::Number(n) => n.to_string(),
                             NumberOrString::String(s) => s.clone(),
                         }),
-                    }
-                }).collect();
-                let _ = event_tx.send(ServerEvent::Diagnostics {
-                    uri: pd.uri.to_string(),
-                    diagnostics: items,
-                }).await;
+                    })
+                    .collect();
+                let _ = event_tx
+                    .send(ServerEvent::Diagnostics {
+                        uri: pd.uri.to_string(),
+                        diagnostics: items,
+                    })
+                    .await;
             }
         }
         "window/logMessage" | "window/showMessage" => {
@@ -1136,11 +1672,21 @@ async fn handle_server_notification(
                 Some(3) => "info",
                 _ => "debug",
             };
-            let message = params.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+            let message = params
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
             let event = if method == "window/logMessage" {
-                ServerEvent::LogMessage { level: level.to_string(), message }
+                ServerEvent::LogMessage {
+                    level: level.to_string(),
+                    message,
+                }
             } else {
-                ServerEvent::ShowMessage { level: level.to_string(), message }
+                ServerEvent::ShowMessage {
+                    level: level.to_string(),
+                    message,
+                }
             };
             let _ = event_tx.send(event).await;
         }
@@ -1152,13 +1698,15 @@ async fn handle_server_notification(
                     let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
                     let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
                     let percentage = value.get("percentage").and_then(|p| p.as_u64());
-                    let _ = event_tx.send(ServerEvent::Progress {
-                        token: token.to_string(),
-                        kind: kind.to_string(),
-                        title: title.to_string(),
-                        message: message.to_string(),
-                        percentage,
-                    }).await;
+                    let _ = event_tx
+                        .send(ServerEvent::Progress {
+                            token: token.to_string(),
+                            kind: kind.to_string(),
+                            title: title.to_string(),
+                            message: message.to_string(),
+                            percentage,
+                        })
+                        .await;
                 }
             }
         }
