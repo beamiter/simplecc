@@ -26,6 +26,31 @@ jobs:
           ref: agent/release-registry-guards
           fetch-depth: 0
 
+      - name: Unify explicit short client snapshots
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.simplecc-release-registry-guards.py')
+          text = path.read_text(encoding='utf-8')
+          marker = 'primary_count, fanout_count = unwrap_registry_read_blocks()'
+          insertion = '''replace_exact(
+              """            let client = {
+                          let r = registry.read().await;
+                          r.as_ref()
+                              .and_then(|reg| reg.client_for_filetype(&language_id))
+                      };
+              """,
+              """            let client = primary_client(&registry, &language_id).await;
+              """,
+              expected=2,
+          )
+
+          primary_count, fanout_count = unwrap_registry_read_blocks()'''
+          if text.count(marker) != 1:
+              raise RuntimeError('could not locate registry snapshot insertion point')
+          path.write_text(text.replace(marker, insertion, 1), encoding='utf-8')
+          PY
+
       - name: Apply guarded registry lifetime transform
         run: python3 .simplecc-release-registry-guards.py
 
