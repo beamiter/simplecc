@@ -83,6 +83,22 @@ def matching_brace(source: str, open_index: int) -> int:
     raise RuntimeError("unterminated Rust brace block")
 
 
+def outer_if_end(source: str, branch_close: int) -> int:
+    """Return the end of an optional plain `else { ... }` after a branch."""
+    cursor = branch_close + 1
+    while cursor < len(source) and source[cursor].isspace():
+        cursor += 1
+    if not source.startswith("else", cursor):
+        return branch_close
+
+    cursor += len("else")
+    while cursor < len(source) and source[cursor].isspace():
+        cursor += 1
+    if cursor >= len(source) or source[cursor] != "{":
+        raise RuntimeError("unexpected registry else-if form")
+    return matching_brace(source, cursor)
+
+
 def unwrap_registry_read_blocks() -> tuple[int, int]:
     global text
     prefixes = [
@@ -111,6 +127,7 @@ def unwrap_registry_read_blocks() -> tuple[int, int]:
     for start, prefix in sorted(candidates, reverse=True):
         outer_open = start + prefix.rfind("{")
         outer_close = matching_brace(text, outer_open)
+        removal_end = outer_if_end(text, outer_close)
         body = text[start + len(prefix) : outer_close]
 
         if primary_token in body:
@@ -134,7 +151,9 @@ def unwrap_registry_read_blocks() -> tuple[int, int]:
         else:
             continue
 
-        text = text[:start] + body + text[outer_close + 1 :]
+        # Drop only the outer registry branch and its optional registry-missing
+        # else branch. Inner client-specific else branches remain in `body`.
+        text = text[:start] + body + text[removal_end + 1 :]
 
     return primary_count, fanout_count
 
