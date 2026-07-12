@@ -31,10 +31,14 @@ jobs:
           ! grep -R 'client\.lock()\.await' src/simplecc
           grep -q 'Arc<RwLock<Option<Registry>>>' src/simplecc/simplecc_daemon.rs
 
-      - name: Format and test
+      - name: Format
+        run: cargo fmt
+
+      - name: Compile with concise diagnostics
+        run: cargo check --message-format short
+
+      - name: Test
         run: |
-          cargo fmt
-          cargo check
           cargo test
           git diff --check
 
