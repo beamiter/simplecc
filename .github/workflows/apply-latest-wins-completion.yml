@@ -4,16 +4,23 @@ on:
   push:
     branches:
       - agent/cancel-superseded-completions
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: latest-wins-completion-bootstrap
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 jobs:
   apply-and-validate:
-    if: github.event.head_commit.message != 'Cancel superseded completion requests'
+    if: github.event_name == 'pull_request' || github.event.head_commit.message != 'Cancel superseded completion requests'
     runs-on: ubuntu-latest
     steps:
-      - name: Check out branch
+      - name: Check out source branch
         uses: actions/checkout@v4
         with:
           ref: agent/cancel-superseded-completions
@@ -61,6 +68,7 @@ jobs:
 
       - name: Commit source changes and remove bootstrap files
         run: |
+          rm -f .noop
           rm .simplecc-apply-latest-wins.py
           rm .github/workflows/apply-latest-wins-completion.yml
           git config user.name 'github-actions[bot]'
@@ -68,5 +76,3 @@ jobs:
           git add -A
           git commit -m 'Cancel superseded completion requests'
           git push origin HEAD:agent/cancel-superseded-completions
-
-# trigger validation
