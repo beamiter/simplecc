@@ -32,17 +32,11 @@ jobs:
           from pathlib import Path
           path = Path('.simplecc-apply-latest-wins.py')
           text = path.read_text(encoding='utf-8')
-          old = '''    if count != 1:
-              raise RuntimeError(
-                  f"{path}: expected one exact match, found {count}: {old[:120]!r}"
-              )'''
-          new = '''    if count < 1:
-              raise RuntimeError(
-                  f"{path}: expected at least one exact match, found {count}: {old[:120]!r}"
-              )'''
-          if text.count(old) != 1:
-              raise RuntimeError('could not relax replace_once assertion')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          if text.count('if count != 1:') != 1:
+              raise RuntimeError('unexpected replace_once assertion count')
+          text = text.replace('if count != 1:', 'if count < 1:', 1)
+          text = text.replace('expected one exact match', 'expected at least one exact match', 1)
+          path.write_text(text, encoding='utf-8')
           PY
 
       - name: Apply guarded source transform
