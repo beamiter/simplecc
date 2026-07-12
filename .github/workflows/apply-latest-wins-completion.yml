@@ -1,0 +1,70 @@
+name: Apply latest-wins completion cancellation
+
+on:
+  push:
+    branches:
+      - agent/cancel-superseded-completions
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.event.head_commit.message != 'Cancel superseded completion requests'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/cancel-superseded-completions
+          fetch-depth: 0
+
+      - name: Allow first-match replacement for repeated daemon template
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.simplecc-apply-latest-wins.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    if count != 1:
+              raise RuntimeError(
+                  f"{path}: expected one exact match, found {count}: {old[:120]!r}"
+              )'''
+          new = '''    if count < 1:
+              raise RuntimeError(
+                  f"{path}: expected at least one exact match, found {count}: {old[:120]!r}"
+              )'''
+          if text.count(old) != 1:
+              raise RuntimeError('could not relax replace_once assertion')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Apply guarded source transform
+        run: python3 .simplecc-apply-latest-wins.py
+
+      - name: Verify cancellation structure
+        run: |
+          grep -q 'latest_requests: Arc<Mutex<HashMap<String, i64>>>' src/simplecc/lsp/client.rs
+          grep -q 'request_latest_with_timeout' src/simplecc/lsp/client.rs
+          grep -q '\$/cancelRequest' src/simplecc/lsp/client.rs
+          grep -q 'Ok(None) => {}' src/simplecc/simplecc_daemon.rs
+
+      - name: Format
+        run: cargo fmt
+
+      - name: Compile
+        run: cargo check --message-format short
+
+      - name: Test
+        run: |
+          cargo test
+          git diff --check
+
+      - name: Commit source changes and remove bootstrap files
+        run: |
+          rm .simplecc-apply-latest-wins.py
+          rm .github/workflows/apply-latest-wins-completion.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Cancel superseded completion requests'
+          git push origin HEAD:agent/cancel-superseded-completions
