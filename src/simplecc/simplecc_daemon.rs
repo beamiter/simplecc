@@ -69,6 +69,10 @@ enum Request {
         character: u32,
         #[serde(rename = "maxItems", default = "default_completion_max_items")]
         max_items: usize,
+        #[serde(rename = "triggerKind", default = "default_completion_trigger_kind")]
+        trigger_kind: u32,
+        #[serde(rename = "triggerCharacter", default)]
+        trigger_character: String,
     },
     #[serde(rename = "textDocument/hover")]
     Hover {
@@ -368,6 +372,9 @@ fn default_true() -> bool {
 fn default_completion_max_items() -> usize {
     100
 }
+fn default_completion_trigger_kind() -> u32 {
+    1
+}
 
 // ─── stdout writer ───────────────────────────────────────
 
@@ -560,6 +567,8 @@ async fn handle_request(
             line,
             character,
             max_items,
+            trigger_kind,
+            trigger_character,
         } => {
             // Do not retain the global registry lock while waiting for a
             // language server. A slow completion must not block unrelated
@@ -574,7 +583,22 @@ async fn handle_request(
                 // Clone the internally synchronized client and release the
                 // outer mutex before waiting on the language server.
                 let c = client.lock().await.clone();
-                match c.completion(&uri, line, character, max_items).await {
+                let trigger_character = if trigger_character.is_empty() {
+                    None
+                } else {
+                    Some(trigger_character.as_str())
+                };
+                match c
+                    .completion(
+                        &uri,
+                        line,
+                        character,
+                        max_items,
+                        trigger_kind,
+                        trigger_character,
+                    )
+                    .await
+                {
                     Ok((generation, items)) => send_event(
                         &out,
                         json!({

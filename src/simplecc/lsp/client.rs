@@ -351,10 +351,48 @@ impl LspClient {
         line: u32,
         character: u32,
         max_items: usize,
+        trigger_kind: u32,
+        trigger_character: Option<&str>,
     ) -> Result<(u64, Vec<types::CompletionItem>)> {
         // Allocate at request start, not response time. If an older request
         // returns after a newer one, it must never replace the newer cache.
         let generation = self.completion_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // Vim can cheaply infer punctuation-triggered requests, but only the
+        // server knows which trigger characters it advertised. Downgrade an
+        // unsupported trigger-character request to TriggerForIncompleteCompletions
+        // so servers never receive an invalid CompletionContext.
+        let mut effective_trigger_kind = trigger_kind.clamp(1, 3);
+        let mut effective_trigger_character = trigger_character
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if effective_trigger_kind == 2 {
+            let supported = match effective_trigger_character.as_deref() {
+                Some(trigger) => {
+                    let capabilities = self.capabilities.lock().await;
+                    capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.completion_provider.as_ref())
+                        .and_then(|options| options.trigger_characters.as_ref())
+                        .map(|characters| characters.iter().any(|value| value == trigger))
+                        .unwrap_or(false)
+                }
+                None => false,
+            };
+            if !supported {
+                effective_trigger_kind = 3;
+                effective_trigger_character = None;
+            }
+        } else {
+            effective_trigger_character = None;
+        }
+
+        let mut context = json!({
+            "triggerKind": effective_trigger_kind,
+        });
+        if let Some(trigger) = effective_trigger_character {
+            context["triggerCharacter"] = json!(trigger);
+        }
 
         let result = self
             .request_with_timeout(
@@ -362,6 +400,7 @@ impl LspClient {
                 json!({
                     "textDocument": { "uri": uri },
                     "position": { "line": line, "character": character },
+                    "context": context,
                 }),
                 Duration::from_secs(3),
             )
