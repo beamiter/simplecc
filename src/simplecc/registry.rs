@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 use super::config::Config;
 use super::lsp::client::{LspClient, ServerEvent};
@@ -13,7 +12,7 @@ pub type EventTx = tokio::sync::mpsc::Sender<String>;
 pub struct Registry {
     config: Config,
     /// server_name -> LspClient
-    clients: HashMap<String, Arc<Mutex<LspClient>>>,
+    clients: HashMap<String, Arc<LspClient>>,
     /// filetype -> list of server_names (supports multi-server per filetype)
     ft_map: HashMap<String, Vec<String>>,
     root_dir: String,
@@ -125,7 +124,7 @@ impl Registry {
         .await
         {
             Ok((client, event_rx)) => {
-                let client = Arc::new(Mutex::new(client));
+                let client = Arc::new(client);
                 self.clients.insert(name.clone(), client.clone());
                 let names = self
                     .ft_map
@@ -171,14 +170,14 @@ impl Registry {
     }
 
     /// Get the primary client for a filetype, if started.
-    pub fn client_for_filetype(&self, filetype: &str) -> Option<Arc<Mutex<LspClient>>> {
+    pub fn client_for_filetype(&self, filetype: &str) -> Option<Arc<LspClient>> {
         let names = self.ft_map.get(filetype)?;
         let name = names.first()?;
         self.clients.get(name).cloned()
     }
 
     /// Get all clients for a filetype (for multi-server support).
-    pub fn clients_for_filetype(&self, filetype: &str) -> Vec<Arc<Mutex<LspClient>>> {
+    pub fn clients_for_filetype(&self, filetype: &str) -> Vec<Arc<LspClient>> {
         if let Some(names) = self.ft_map.get(filetype) {
             names
                 .iter()
@@ -191,7 +190,7 @@ impl Registry {
 
     /// Get the client for a server name.
     #[allow(dead_code)]
-    pub fn client_by_name(&self, name: &str) -> Option<Arc<Mutex<LspClient>>> {
+    pub fn client_by_name(&self, name: &str) -> Option<Arc<LspClient>> {
         self.clients.get(name).cloned()
     }
 
@@ -199,8 +198,7 @@ impl Registry {
     pub async fn shutdown_all(&mut self) {
         for (name, client) in self.clients.drain() {
             eprintln!("[simplecc] shutting down {name}");
-            let c = client.lock().await;
-            let _ = c.shutdown().await;
+            let _ = client.shutdown().await;
         }
     }
 
