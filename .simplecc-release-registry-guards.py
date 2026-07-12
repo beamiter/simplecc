@@ -85,30 +85,33 @@ def matching_brace(source: str, open_index: int) -> int:
 
 def unwrap_registry_read_blocks() -> tuple[int, int]:
     global text
-    outer_prefix = '''            let r = registry.read().await;
-            if let Some(ref reg) = *r {'''
+    prefixes = [
+        '''            let r = registry.read().await;
+            if let Some(ref reg) = *r {''',
+        '''                let r = registry.read().await;
+                if let Some(ref reg) = *r {''',
+    ]
     primary_token = (
         "if let Some(client) = reg.client_for_filetype(&language_id) {"
     )
     fanout_token = "for client in reg.clients_for_filetype(&ft) {"
 
-    starts = []
-    cursor = 0
-    while True:
-        index = text.find(outer_prefix, cursor)
-        if index < 0:
-            break
-        starts.append(index)
-        cursor = index + len(outer_prefix)
+    candidates: list[tuple[int, str]] = []
+    for prefix in prefixes:
+        cursor = 0
+        while True:
+            index = text.find(prefix, cursor)
+            if index < 0:
+                break
+            candidates.append((index, prefix))
+            cursor = index + len(prefix)
 
     primary_count = 0
     fanout_count = 0
-    outer_open_offset = outer_prefix.rfind("{")
-
-    for start in reversed(starts):
-        outer_open = start + outer_open_offset
+    for start, prefix in sorted(candidates, reverse=True):
+        outer_open = start + prefix.rfind("{")
         outer_close = matching_brace(text, outer_open)
-        body = text[start + len(outer_prefix) : outer_close]
+        body = text[start + len(prefix) : outer_close]
 
         if primary_token in body:
             if body.count(primary_token) != 1:
@@ -131,8 +134,6 @@ def unwrap_registry_read_blocks() -> tuple[int, int]:
         else:
             continue
 
-        # Keep the complete inner block, including optional else branches, and
-        # remove only the outer Registry guard. cargo fmt normalizes indentation.
         text = text[:start] + body + text[outer_close + 1 :]
 
     return primary_count, fanout_count
