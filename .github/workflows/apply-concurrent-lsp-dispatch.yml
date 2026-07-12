@@ -1,0 +1,46 @@
+name: Apply concurrent LSP dispatch
+
+on:
+  push:
+    branches:
+      - agent/concurrent-lsp-dispatch
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    if: github.event.head_commit.message != 'Remove outer LSP client locks'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/concurrent-lsp-dispatch
+          fetch-depth: 0
+
+      - name: Apply validated concurrency transform
+        run: python3 .simplecc-apply-concurrency.py
+
+      - name: Verify lock structure
+        run: |
+          ! grep -R 'Arc<Mutex<LspClient>>' src/simplecc
+          ! grep -R 'client\.lock()\.await' src/simplecc
+          grep -q 'Arc<RwLock<Option<Registry>>>' src/simplecc/simplecc_daemon.rs
+
+      - name: Format and test
+        run: |
+          cargo fmt
+          cargo check
+          cargo test
+          git diff --check
+
+      - name: Commit source changes and remove bootstrap files
+        run: |
+          rm .simplecc-apply-concurrency.py
+          rm .github/workflows/apply-concurrent-lsp-dispatch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Remove outer LSP client locks'
+          git push origin HEAD:agent/concurrent-lsp-dispatch
