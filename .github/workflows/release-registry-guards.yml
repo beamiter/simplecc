@@ -26,29 +26,6 @@ jobs:
           ref: agent/release-registry-guards
           fetch-depth: 0
 
-      - name: Adjust guarded transform assertions
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.simplecc-release-registry-guards.py')
-          text = path.read_text(encoding='utf-8')
-          replacements = [
-              (
-                  'assert "let c = client;" not in text',
-                  'assert text.count("let c = client;") == 2',
-              ),
-              (
-                  're.subn(pattern, replacement, text, flags=re.S)',
-                  're.subn(pattern, replacement, text, flags=re.S | re.M)',
-              ),
-          ]
-          for old, new in replacements:
-              if text.count(old) != 1:
-                  raise RuntimeError(f'could not update transform token: {old}')
-              text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
-          PY
-
       - name: Apply guarded registry lifetime transform
         run: python3 .simplecc-release-registry-guards.py
 
@@ -57,7 +34,8 @@ jobs:
           grep -q 'async fn primary_client' src/simplecc/simplecc_daemon.rs
           grep -q 'async fn filetype_clients' src/simplecc/simplecc_daemon.rs
           grep -q 'registry.write().await.take()' src/simplecc/simplecc_daemon.rs
-          ! grep -A3 'let r = registry.read().await;' src/simplecc/simplecc_daemon.rs | grep -q 'if let Some(ref reg) = \*r'
+          ! grep -q 'reg.client_for_filetype(&language_id)' src/simplecc/simplecc_daemon.rs
+          ! grep -q 'reg.clients_for_filetype(&ft)' src/simplecc/simplecc_daemon.rs
 
       - name: Format
         run: cargo fmt
