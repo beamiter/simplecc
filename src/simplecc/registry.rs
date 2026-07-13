@@ -119,7 +119,8 @@ impl Registry {
             &cfg.args,
             &root_uri,
             &self.root_dir,
-            cfg.initialization_options.clone(),
+            cfg.effective_initialization_options(&name),
+            cfg.effective_settings(&name),
         )
         .await
         {
@@ -186,6 +187,13 @@ impl Registry {
         } else {
             vec![]
         }
+    }
+
+    /// All running clients. Used for notifications (such as watched-file
+    /// changes) whose routing is determined by dynamic server registration
+    /// rather than the saved buffer's filetype.
+    pub fn active_clients(&self) -> Vec<Arc<LspClient>> {
+        self.clients.values().cloned().collect()
     }
 
     /// Get the client for a server name.

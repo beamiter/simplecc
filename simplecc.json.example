@@ -41,7 +41,27 @@
       "command": "julia",
       "args": ["--startup-file=no", "--history-file=no", "-e", "ls_env = joinpath(get(DEPOT_PATH, 1, joinpath(homedir(), \".julia\")), \"environments\", \"simplecc\"); pushfirst!(LOAD_PATH, ls_env); using LanguageServer; popfirst!(LOAD_PATH); depot = get(ENV, \"JULIA_DEPOT_PATH\", \"\"); project = dirname(something(Base.current_project(pwd()), get(Base.load_path(), 1, nothing), Base.active_project())); server = LanguageServer.LanguageServerInstance(stdin, stdout, project, depot); run(server)"],
       "filetypes": ["julia"],
-      "rootPatterns": ["Project.toml", "JuliaProject.toml"]
+      "rootPatterns": ["Project.toml", "JuliaProject.toml"],
+      "initializationOptions": {
+        "useFormatterConfigDefaults": true
+      },
+      "settings": {
+        "julia": {
+          "lint": {
+            "run": true,
+            "missingrefs": "none",
+            "disabledDirs": ["docs", "test"]
+          },
+          "completionmode": "qualify",
+          "inlayHints": {
+            "static": {
+              "enabled": true,
+              "variableTypes": {"enabled": true},
+              "parameterNames": {"enabled": "literals"}
+            }
+          }
+        }
+      }
     }
   }
 }

@@ -2,6 +2,7 @@ mod config;
 mod installer;
 mod lsp;
 mod registry;
+mod workspace_watcher;
 
 use anyhow::Result;
 use lsp::client::LspClient;
@@ -12,6 +13,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
+use workspace_watcher::WorkspaceWatcher;
 
 // ─── Vim → Daemon request types ──────────────────────────
 
@@ -431,6 +433,7 @@ async fn main() -> Result<()> {
     tokio::spawn(stdout_writer(out_rx));
 
     let registry: Arc<RwLock<Option<Registry>>> = Arc::new(RwLock::new(None));
+    let workspace_watcher: Arc<Mutex<Option<WorkspaceWatcher>>> = Arc::new(Mutex::new(None));
     // Track which filetype a URI belongs to
     let uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -450,20 +453,22 @@ async fn main() -> Result<()> {
         let reg = registry.clone();
         let out = out_tx.clone();
         let uft = uri_ft.clone();
+        let watcher = workspace_watcher.clone();
 
         // Document notifications must reach the LSP in input order. Spawning
         // didChange and completion independently lets completion win the race
         // and query stale text.
         if req.preserves_document_order() {
-            handle_request(req, reg, out, uft).await;
+            handle_request(req, reg, out, uft, watcher).await;
         } else {
             tokio::spawn(async move {
-                handle_request(req, reg, out, uft).await;
+                handle_request(req, reg, out, uft, watcher).await;
             });
         }
     }
 
     // Shutdown
+    workspace_watcher.lock().await.take();
     let mut registry_to_shutdown = registry.write().await.take();
     if let Some(ref mut reg) = registry_to_shutdown {
         reg.shutdown_all().await;
@@ -478,6 +483,7 @@ async fn handle_request(
     registry: Arc<RwLock<Option<Registry>>>,
     out: EventTx,
     uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    workspace_watcher: Arc<Mutex<Option<WorkspaceWatcher>>>,
 ) {
     match req {
         Request::Initialize {
@@ -497,13 +503,24 @@ async fn handle_request(
                 config::Config::find_and_load(&root)
             };
 
-            let reg = Registry::new(cfg, root, out.clone());
+            let reg = Registry::new(cfg, root.clone(), out.clone());
             *registry.write().await = Some(reg);
+
+            match WorkspaceWatcher::start(&root, registry.clone()) {
+                Ok(watcher) => {
+                    *workspace_watcher.lock().await = Some(watcher);
+                    eprintln!("[simplecc] watching workspace: {root}");
+                }
+                Err(err) => {
+                    eprintln!("[simplecc] workspace watcher unavailable: {err}");
+                }
+            }
 
             send_event(&out, json!({"type": "initialized", "id": id}));
         }
 
         Request::Shutdown { id } => {
+            workspace_watcher.lock().await.take();
             let mut registry_to_shutdown = registry.write().await.take();
             if let Some(ref mut reg) = registry_to_shutdown {
                 reg.shutdown_all().await;
@@ -563,6 +580,20 @@ async fn handle_request(
                     let c = client;
                     let _ = c.did_save(&uri, text.as_deref()).await;
                 }
+            }
+
+            // A save can affect a different language client: Project.toml,
+            // Manifest.toml, and closed Julia source files all invalidate the
+            // Julia workspace index. Each client filters this through methods
+            // it dynamically registered during initialization.
+            let clients = registry
+                .read()
+                .await
+                .as_ref()
+                .map(Registry::active_clients)
+                .unwrap_or_default();
+            for client in clients {
+                let _ = client.did_change_watched_file(&uri).await;
             }
         }
 

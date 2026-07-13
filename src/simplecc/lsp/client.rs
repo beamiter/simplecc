@@ -1,10 +1,10 @@
 use anyhow::{bail, Result};
 use lsp_types::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::transport::LspTransport;
@@ -42,6 +42,12 @@ pub struct LspClient {
     semtok_prev_result_id: Arc<Mutex<HashMap<String, String>>>,
     /// Previous raw semantic token data per URI (for applying delta edits)
     semtok_prev_data: Arc<Mutex<HashMap<String, Vec<lsp_types::SemanticToken>>>>,
+    /// Methods dynamically registered by the server, such as workspace file
+    /// watching requested by LanguageServer.jl.
+    registered_methods: Arc<Mutex<HashSet<String>>>,
+    /// Recent watched-file notifications, used to collapse the duplicate
+    /// event commonly produced by Vim's save hook and the platform watcher.
+    watched_file_notifications: Arc<Mutex<HashMap<(String, u32), Instant>>>,
     server_name: String,
 }
 
@@ -84,6 +90,7 @@ impl LspClient {
         root_uri: &str,
         root_path: &str,
         init_options: Option<Value>,
+        settings: Option<Value>,
     ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
         let (transport, mut incoming) = LspTransport::spawn(cmd, args, Some(root_path))?;
 
@@ -98,13 +105,24 @@ impl LspClient {
         let pending_clone = pending.clone();
         let transport_clone = transport.clone();
         let event_tx_clone = event_tx.clone();
+        let settings = Arc::new(settings.unwrap_or_else(|| json!({})));
+        let settings_clone = settings.clone();
+        let registered_methods = Arc::new(Mutex::new(HashSet::new()));
+        let registered_methods_clone = registered_methods.clone();
         tokio::spawn(async move {
             while let Some(msg) = incoming.recv().await {
                 // Is it a response?
                 if let Some(id) = msg.get("id") {
                     if msg.get("method").is_some() {
                         // Server request (e.g. workspace/applyEdit)
-                        handle_server_request(&msg, &transport_clone, &event_tx_clone).await;
+                        handle_server_request(
+                            &msg,
+                            &transport_clone,
+                            &event_tx_clone,
+                            &settings_clone,
+                            &registered_methods_clone,
+                        )
+                        .await;
                     } else {
                         // Response to our request
                         let id = id.as_i64().unwrap_or(0);
@@ -132,6 +150,8 @@ impl LspClient {
             cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
             semtok_prev_result_id: Arc::new(Mutex::new(HashMap::new())),
             semtok_prev_data: Arc::new(Mutex::new(HashMap::new())),
+            registered_methods,
+            watched_file_notifications: Arc::new(Mutex::new(HashMap::new())),
             server_name: server_name.to_string(),
         };
 
@@ -311,6 +331,10 @@ impl LspClient {
     ) -> Result<()> {
         let params = json!({
             "processId": std::process::id(),
+            "clientInfo": {
+                "name": "SimpleCC",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
             "rootUri": root_uri,
             "rootPath": root_path,
             "capabilities": client_capabilities(),
@@ -417,6 +441,49 @@ impl LspClient {
             params["text"] = json!(t);
         }
         self.notify("textDocument/didSave", params).await
+    }
+
+    pub async fn did_change_watched_file(&self, uri: &str) -> Result<()> {
+        self.did_change_watched_files(&[(uri.to_string(), 2)]).await
+    }
+
+    pub async fn did_change_watched_files(&self, changes: &[(String, u32)]) -> Result<()> {
+        if !self
+            .registered_methods
+            .lock()
+            .await
+            .contains("workspace/didChangeWatchedFiles")
+        {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let mut recent = self.watched_file_notifications.lock().await;
+        recent.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(2));
+        let changes: Vec<_> = changes
+            .iter()
+            .filter_map(|(uri, change_type)| {
+                let key = (uri.clone(), *change_type);
+                if recent
+                    .get(&key)
+                    .is_some_and(|seen| now.duration_since(*seen) < Duration::from_millis(250))
+                {
+                    return None;
+                }
+                recent.insert(key, now);
+                Some(json!({ "uri": uri, "type": change_type }))
+            })
+            .collect();
+        drop(recent);
+        if changes.is_empty() {
+            return Ok(());
+        }
+
+        self.notify(
+            "workspace/didChangeWatchedFiles",
+            json!({ "changes": changes }),
+        )
+        .await
     }
 
     pub async fn did_close(&self, uri: &str) -> Result<()> {
@@ -1691,7 +1758,6 @@ impl LspClient {
                     lsp_types::FoldingRangeKind::Comment => "comment".to_string(),
                     lsp_types::FoldingRangeKind::Imports => "imports".to_string(),
                     lsp_types::FoldingRangeKind::Region => "region".to_string(),
-                    _ => "other".to_string(),
                 }),
             })
             .collect())
@@ -1750,7 +1816,7 @@ fn parse_locations(result: Value) -> Result<Vec<types::Location>> {
         return Ok(links
             .iter()
             .map(|l| types::Location {
-                uri: l.target_uri.to_string(),
+                uri: types::decode_uri(&l.target_uri.to_string()),
                 line: l.target_selection_range.start.line,
                 character: l.target_selection_range.start.character,
                 end_line: Some(l.target_selection_range.end.line),
@@ -1849,6 +1915,23 @@ mod document_link_tests {
         let links = vec![link(8, 29, "file:///tmp/core/transformer.jl")];
         assert!(select_document_link(&links, 3, 8).is_none());
     }
+
+    #[test]
+    fn decodes_location_link_target_paths() {
+        let result = json!([{
+            "targetUri": "file:///tmp/My%20Project/source.jl",
+            "targetRange": {
+                "start": { "line": 1, "character": 0 },
+                "end": { "line": 2, "character": 0 }
+            },
+            "targetSelectionRange": {
+                "start": { "line": 1, "character": 4 },
+                "end": { "line": 1, "character": 10 }
+            }
+        }]);
+        let locations = parse_locations(result).unwrap();
+        assert_eq!(locations[0].uri, "/tmp/My Project/source.jl");
+    }
 }
 
 fn convert_doc_symbols(syms: &[lsp_types::DocumentSymbol]) -> Vec<types::DocumentSymbolItem> {
@@ -1899,6 +1982,8 @@ async fn handle_server_request(
     msg: &Value,
     transport: &Arc<Mutex<LspTransport>>,
     event_tx: &mpsc::Sender<ServerEvent>,
+    settings: &Value,
+    registered_methods: &Arc<Mutex<HashSet<String>>>,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -1927,9 +2012,20 @@ async fn handle_server_request(
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
         }
-        "window/workDoneProgress/create"
-        | "workspace/configuration"
-        | "client/registerCapability" => {
+        "workspace/configuration" => {
+            let result = configuration_response(msg.get("params"), settings);
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "client/registerCapability" => {
+            let methods = registration_methods(msg.get("params"));
+            registered_methods.lock().await.extend(methods);
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "window/workDoneProgress/create" => {
             // Acknowledge with null result
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
             let mut t = transport.lock().await;
@@ -1945,6 +2041,103 @@ async fn handle_server_request(
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
         }
+    }
+}
+
+fn registration_methods(params: Option<&Value>) -> Vec<String> {
+    params
+        .and_then(|params| params.get("registrations"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|registration| registration.get("method")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn configuration_response(params: Option<&Value>, settings: &Value) -> Vec<Value> {
+    params
+        .and_then(|params| params.get("items"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.get("section")
+                        .and_then(Value::as_str)
+                        .map(|section| configuration_value(settings, section))
+                        .unwrap_or_else(|| settings.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn configuration_value(settings: &Value, section: &str) -> Value {
+    // Exact dotted keys allow compact overrides and take precedence over the
+    // equivalent path in a nested settings object.
+    if let Some(value) = settings.get(section) {
+        return value.clone();
+    }
+
+    section
+        .split('.')
+        .try_fold(settings, |value, key| value.get(key))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn returns_configuration_items_in_request_order() {
+        let settings = json!({
+            "julia": {
+                "lint": { "run": true },
+                "completionmode": "qualify"
+            }
+        });
+        let params = json!({
+            "items": [
+                { "section": "julia.completionmode" },
+                { "section": "julia.lint.run" },
+                { "section": "julia.unknown" }
+            ]
+        });
+        assert_eq!(
+            configuration_response(Some(&params), &settings),
+            vec![json!("qualify"), json!(true), Value::Null]
+        );
+    }
+
+    #[test]
+    fn exact_dotted_setting_overrides_nested_value() {
+        let settings = json!({
+            "julia": { "lint": { "run": true } },
+            "julia.lint.run": false
+        });
+        assert_eq!(
+            configuration_value(&settings, "julia.lint.run"),
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn records_dynamic_registration_methods() {
+        let params = json!({
+            "registrations": [
+                { "id": "files", "method": "workspace/didChangeWatchedFiles" },
+                { "id": "config", "method": "workspace/didChangeConfiguration" }
+            ]
+        });
+        assert_eq!(
+            registration_methods(Some(&params)),
+            vec![
+                "workspace/didChangeWatchedFiles".to_string(),
+                "workspace/didChangeConfiguration".to_string()
+            ]
+        );
     }
 }
 
@@ -2198,6 +2391,11 @@ fn client_capabilities() -> ClientCapabilities {
                 ..Default::default()
             }),
             workspace_folders: Some(true),
+            configuration: Some(true),
+            did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
+            }),
             symbol: Some(WorkspaceSymbolClientCapabilities {
                 ..Default::default()
             }),

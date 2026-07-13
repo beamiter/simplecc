@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,82 @@ pub struct ServerConfig {
     pub root_patterns: Vec<String>,
     #[serde(rename = "initializationOptions")]
     pub initialization_options: Option<serde_json::Value>,
+    /// Values returned for server-initiated `workspace/configuration`
+    /// requests. Nested objects and exact dotted keys are both supported.
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+}
+
+impl ServerConfig {
+    /// Apply editor-compatible defaults while preserving explicit user
+    /// overrides from simplecc.json.
+    pub fn effective_initialization_options(&self, server_name: &str) -> Option<Value> {
+        let defaults = match server_name {
+            "julia-lsp" => json!({ "useFormatterConfigDefaults": true }),
+            _ => Value::Null,
+        };
+        merge_json(defaults, self.initialization_options.clone())
+    }
+
+    pub fn effective_settings(&self, server_name: &str) -> Option<Value> {
+        let defaults = match server_name {
+            // Mirrors the Julia VS Code extension's language-server settings.
+            // Hints remain enabled server-side because SimpleCC owns the
+            // client-side display toggle.
+            "julia-lsp" => json!({
+                "julia": {
+                    "lint": {
+                        "call": true,
+                        "iter": true,
+                        "nothingcomp": true,
+                        "constif": true,
+                        "lazy": true,
+                        "datadecl": true,
+                        "typeparam": true,
+                        "modname": true,
+                        "pirates": true,
+                        "useoffuncargs": true,
+                        "run": true,
+                        "missingrefs": "none",
+                        "disabledDirs": ["docs", "test"]
+                    },
+                    "completionmode": "qualify",
+                    "inlayHints": {
+                        "static": {
+                            "enabled": true,
+                            "variableTypes": { "enabled": true },
+                            "parameterNames": { "enabled": "literals" }
+                        }
+                    }
+                }
+            }),
+            _ => Value::Null,
+        };
+        merge_json(defaults, self.settings.clone())
+    }
+}
+
+fn merge_json(mut defaults: Value, overrides: Option<Value>) -> Option<Value> {
+    let Some(overrides) = overrides else {
+        return (!defaults.is_null()).then_some(defaults);
+    };
+    merge_json_value(&mut defaults, overrides);
+    Some(defaults)
+}
+
+fn merge_json_value(base: &mut Value, override_value: Value) {
+    match (base, override_value) {
+        (Value::Object(base), Value::Object(overrides)) => {
+            for (key, value) in overrides {
+                if let Some(current) = base.get_mut(&key) {
+                    merge_json_value(current, value);
+                } else {
+                    base.insert(key, value);
+                }
+            }
+        }
+        (base, value) => *base = value,
+    }
 }
 
 /// Startup script for LanguageServer.jl. Loads the server from the dedicated
@@ -111,6 +188,7 @@ impl Default for Config {
                 filetypes: vec!["rust".to_string()],
                 root_patterns: vec!["Cargo.toml".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -122,6 +200,7 @@ impl Default for Config {
                 filetypes: vec!["c".to_string(), "cpp".to_string()],
                 root_patterns: vec!["compile_commands.json".to_string(), ".clangd".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -133,6 +212,7 @@ impl Default for Config {
                 filetypes: vec!["python".to_string()],
                 root_patterns: vec!["pyproject.toml".to_string(), "setup.py".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -149,6 +229,7 @@ impl Default for Config {
                 ],
                 root_patterns: vec!["package.json".to_string(), "tsconfig.json".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -160,6 +241,7 @@ impl Default for Config {
                 filetypes: vec!["lua".to_string()],
                 root_patterns: vec![".luarc.json".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -171,6 +253,7 @@ impl Default for Config {
                 filetypes: vec!["go".to_string(), "gomod".to_string()],
                 root_patterns: vec!["go.mod".to_string()],
                 initialization_options: None,
+                settings: None,
             },
         );
 
@@ -188,12 +271,42 @@ impl Default for Config {
                 ],
                 filetypes: vec!["julia".to_string()],
                 root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],
-                initialization_options: None,
+                initialization_options: Some(json!({ "useFormatterConfigDefaults": true })),
+                settings: None,
             },
         );
 
         Config {
             language_servers: servers,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn julia_defaults_are_merged_with_user_overrides() {
+        let config = ServerConfig {
+            command: "julia".to_string(),
+            args: vec![],
+            filetypes: vec!["julia".to_string()],
+            root_patterns: vec!["Project.toml".to_string()],
+            initialization_options: Some(json!({ "custom": true })),
+            settings: Some(json!({
+                "julia": { "lint": { "missingrefs": "symbols" } }
+            })),
+        };
+
+        let init = config
+            .effective_initialization_options("julia-lsp")
+            .unwrap();
+        assert_eq!(init["useFormatterConfigDefaults"], json!(true));
+        assert_eq!(init["custom"], json!(true));
+
+        let settings = config.effective_settings("julia-lsp").unwrap();
+        assert_eq!(settings["julia"]["lint"]["missingrefs"], json!("symbols"));
+        assert_eq!(settings["julia"]["completionmode"], json!("qualify"));
     }
 }
