@@ -31,6 +31,22 @@ enum Request {
     #[serde(rename = "shutdown")]
     Shutdown { id: u64 },
 
+    // LanguageServer.jl extension requests
+    #[serde(rename = "julia/activateEnvironment")]
+    JuliaActivateEnvironment {
+        id: u64,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        #[serde(rename = "envPath")]
+        env_path: String,
+    },
+    #[serde(rename = "workspace/reloadConfiguration")]
+    ReloadConfiguration {
+        id: u64,
+        #[serde(rename = "configPath", default)]
+        config_path: Option<String>,
+    },
+
     // Document sync
     #[serde(rename = "textDocument/didOpen")]
     DidOpen {
@@ -364,6 +380,8 @@ impl Request {
                 | Self::DidChange { .. }
                 | Self::DidSave { .. }
                 | Self::DidClose { .. }
+                | Self::JuliaActivateEnvironment { .. }
+                | Self::ReloadConfiguration { .. }
         )
     }
 }
@@ -526,6 +544,74 @@ async fn handle_request(
                 reg.shutdown_all().await;
             }
             send_event(&out, json!({"type": "shutdown", "id": id}));
+        }
+
+        Request::JuliaActivateEnvironment {
+            id,
+            language_id,
+            env_path,
+        } => {
+            if language_id != "julia" {
+                send_event(
+                    &out,
+                    json!({
+                        "type": "error",
+                        "id": id,
+                        "message": "Julia environment activation requires a Julia buffer",
+                    }),
+                );
+                return;
+            }
+
+            match primary_client(&registry, &language_id).await {
+                Some(client) => match client.julia_activate_environment(&env_path).await {
+                    Ok(()) => send_event(
+                        &out,
+                        json!({
+                            "type": "juliaEnvironment",
+                            "id": id,
+                            "path": env_path,
+                        }),
+                    ),
+                    Err(err) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": err.to_string()}),
+                    ),
+                },
+                None => send_event(
+                    &out,
+                    json!({
+                        "type": "error",
+                        "id": id,
+                        "message": "Julia language server is not running",
+                    }),
+                ),
+            }
+        }
+
+        Request::ReloadConfiguration { id, config_path } => {
+            let result = {
+                let mut registry = registry.write().await;
+                match registry.as_mut() {
+                    Some(registry) => registry.reload_configuration(config_path.as_deref()).await,
+                    None => Err(anyhow::anyhow!("SimpleCC is not initialized")),
+                }
+            };
+
+            match result {
+                Ok(server_count) => send_event(
+                    &out,
+                    json!({
+                        "type": "configurationReloaded",
+                        "id": id,
+                        "servers": server_count,
+                    }),
+                ),
+                Err(err) => send_event(
+                    &out,
+                    json!({"type": "error", "id": id, "message": err.to_string()}),
+                ),
+            }
         }
 
         Request::DidOpen {
@@ -1475,6 +1561,63 @@ async fn handle_request(
                     "servers": servers,
                 }),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn parses_julia_environment_activation() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "julia/activateEnvironment",
+            "id": 7,
+            "languageId": "julia",
+            "envPath": "/tmp/JuliaProject"
+        }))
+        .unwrap();
+
+        match request {
+            Request::JuliaActivateEnvironment {
+                id,
+                language_id,
+                env_path,
+            } => {
+                assert_eq!(id, 7);
+                assert_eq!(language_id, "julia");
+                assert_eq!(env_path, "/tmp/JuliaProject");
+            }
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
+    fn activation_preserves_document_order() {
+        let request = Request::JuliaActivateEnvironment {
+            id: 1,
+            language_id: "julia".to_string(),
+            env_path: "/tmp/project".to_string(),
+        };
+        assert!(request.preserves_document_order());
+    }
+
+    #[test]
+    fn parses_configuration_reload() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "workspace/reloadConfiguration",
+            "id": 9,
+            "configPath": "/tmp/simplecc.json"
+        }))
+        .unwrap();
+
+        match request {
+            Request::ReloadConfiguration { id, config_path } => {
+                assert_eq!(id, 9);
+                assert_eq!(config_path.as_deref(), Some("/tmp/simplecc.json"));
+            }
+            _ => panic!("unexpected request variant"),
         }
     }
 }

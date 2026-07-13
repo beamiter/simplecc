@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use super::transport::LspTransport;
 use super::types;
@@ -45,6 +45,9 @@ pub struct LspClient {
     /// Methods dynamically registered by the server, such as workspace file
     /// watching requested by LanguageServer.jl.
     registered_methods: Arc<Mutex<HashSet<String>>>,
+    /// Settings served through `workspace/configuration`. Kept mutable so a
+    /// config reload can update a running language server.
+    settings: Arc<RwLock<Value>>,
     /// Recent watched-file notifications, used to collapse the duplicate
     /// event commonly produced by Vim's save hook and the platform watcher.
     watched_file_notifications: Arc<Mutex<HashMap<(String, u32), Instant>>>,
@@ -105,7 +108,7 @@ impl LspClient {
         let pending_clone = pending.clone();
         let transport_clone = transport.clone();
         let event_tx_clone = event_tx.clone();
-        let settings = Arc::new(settings.unwrap_or_else(|| json!({})));
+        let settings = Arc::new(RwLock::new(settings.unwrap_or_else(|| json!({}))));
         let settings_clone = settings.clone();
         let registered_methods = Arc::new(Mutex::new(HashSet::new()));
         let registered_methods_clone = registered_methods.clone();
@@ -151,6 +154,7 @@ impl LspClient {
             semtok_prev_result_id: Arc::new(Mutex::new(HashMap::new())),
             semtok_prev_data: Arc::new(Mutex::new(HashMap::new())),
             registered_methods,
+            settings,
             watched_file_notifications: Arc::new(Mutex::new(HashMap::new())),
             server_name: server_name.to_string(),
         };
@@ -367,6 +371,29 @@ impl LspClient {
     }
 
     // ─── Document Sync ──────────────────────────────────────
+
+    /// Switch LanguageServer.jl to another Julia project environment.
+    /// LanguageServer.jl reloads its project files and symbol store after the
+    /// same custom notification used by the Julia VS Code extension.
+    pub async fn julia_activate_environment(&self, env_path: &str) -> Result<()> {
+        if self.server_name != "julia-lsp" {
+            bail!("server {} is not Julia LanguageServer", self.server_name);
+        }
+        self.notify("julia/activateenvironment", json!({ "envPath": env_path }))
+            .await
+    }
+
+    /// Replace values returned by `workspace/configuration`, then notify the
+    /// server so it can request and apply the new values.
+    pub async fn did_change_configuration(&self, settings: Option<Value>) -> Result<()> {
+        let settings = settings.unwrap_or_else(|| json!({}));
+        *self.settings.write().await = settings.clone();
+        self.notify(
+            "workspace/didChangeConfiguration",
+            json!({ "settings": settings }),
+        )
+        .await
+    }
 
     pub async fn did_open(
         &self,
@@ -1982,7 +2009,7 @@ async fn handle_server_request(
     msg: &Value,
     transport: &Arc<Mutex<LspTransport>>,
     event_tx: &mpsc::Sender<ServerEvent>,
-    settings: &Value,
+    settings: &Arc<RwLock<Value>>,
     registered_methods: &Arc<Mutex<HashSet<String>>>,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -2013,7 +2040,10 @@ async fn handle_server_request(
             let _ = t.send(&resp).await;
         }
         "workspace/configuration" => {
-            let result = configuration_response(msg.get("params"), settings);
+            let result = {
+                let settings = settings.read().await;
+                configuration_response(msg.get("params"), &settings)
+            };
             let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
@@ -2137,6 +2167,18 @@ mod configuration_tests {
                 "workspace/didChangeWatchedFiles".to_string(),
                 "workspace/didChangeConfiguration".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn advertises_dynamic_configuration_updates() {
+        let capabilities = client_capabilities();
+        assert_eq!(
+            capabilities
+                .workspace
+                .and_then(|workspace| workspace.did_change_configuration)
+                .and_then(|configuration| configuration.dynamic_registration),
+            Some(true)
         );
     }
 }
@@ -2392,6 +2434,9 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             workspace_folders: Some(true),
             configuration: Some(true),
+            did_change_configuration: Some(DynamicRegistrationClientCapabilities {
+                dynamic_registration: Some(true),
+            }),
             did_change_watched_files: Some(DidChangeWatchedFilesClientCapabilities {
                 dynamic_registration: Some(true),
                 relative_pattern_support: Some(true),

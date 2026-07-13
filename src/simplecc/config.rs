@@ -122,35 +122,45 @@ impl Config {
         Ok(config)
     }
 
-    /// Search for config: project root first, then ~/.config/simplecc/
-    pub fn find_and_load(project_root: &str) -> Config {
-        // 1. Project root
+    /// Load the currently selected configuration without hiding parse or I/O
+    /// errors. Used by live reload so an invalid edit never silently replaces
+    /// the running settings with defaults.
+    pub fn load_selected(project_root: &str, explicit_path: Option<&str>) -> Result<Self> {
+        if let Some(path) = explicit_path.filter(|path| !path.is_empty()) {
+            return Self::load(Path::new(path));
+        }
+        if let Some(path) = Self::find_path(project_root) {
+            return Self::load(&path);
+        }
+        Ok(Self::default())
+    }
+
+    fn find_path(project_root: &str) -> Option<PathBuf> {
         let project_config = Path::new(project_root).join("simplecc.json");
         if project_config.exists() {
-            if let Ok(c) = Self::load(&project_config) {
-                eprintln!("[simplecc] loaded config from {}", project_config.display());
-                return c;
-            }
+            return Some(project_config);
         }
-        // .simplecc.json
+
         let dot_config = Path::new(project_root).join(".simplecc.json");
         if dot_config.exists() {
-            if let Ok(c) = Self::load(&dot_config) {
-                eprintln!("[simplecc] loaded config from {}", dot_config.display());
-                return c;
+            return Some(dot_config);
+        }
+
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".config/simplecc/simplecc.json"))
+            .filter(|path| path.exists())
+    }
+
+    /// Search for config: project root first, then ~/.config/simplecc/
+    pub fn find_and_load(project_root: &str) -> Config {
+        if let Some(path) = Self::find_path(project_root) {
+            if let Ok(config) = Self::load(&path) {
+                eprintln!("[simplecc] loaded config from {}", path.display());
+                return config;
             }
         }
-        // 2. ~/.config/simplecc/simplecc.json
-        if let Some(home) = std::env::var_os("HOME") {
-            let global = PathBuf::from(home).join(".config/simplecc/simplecc.json");
-            if global.exists() {
-                if let Ok(c) = Self::load(&global) {
-                    eprintln!("[simplecc] loaded config from {}", global.display());
-                    return c;
-                }
-            }
-        }
-        // 3. Default with common servers
+
         eprintln!("[simplecc] no config found, using defaults");
         Config::default()
     }
@@ -308,5 +318,22 @@ mod tests {
         let settings = config.effective_settings("julia-lsp").unwrap();
         assert_eq!(settings["julia"]["lint"]["missingrefs"], json!("symbols"));
         assert_eq!(settings["julia"]["completionmode"], json!("qualify"));
+    }
+
+    #[test]
+    fn live_reload_reports_invalid_json_instead_of_using_defaults() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simplecc-invalid-config-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, "{ invalid json").unwrap();
+
+        let result = Config::load_selected("/tmp", path.to_str());
+        let _ = std::fs::remove_file(path);
+        assert!(result.is_err());
     }
 }

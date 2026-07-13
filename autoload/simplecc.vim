@@ -14,6 +14,7 @@ var s_initialized: bool = false
 var s_next_id: number = 0
 var s_cbs: dict<func> = {}
 var s_root: string = ''
+var s_julia_environment: string = ''
 var s_log: list<string> = []
 # Servers the user declined to install this session (avoids re-prompting)
 var s_declined_installs: dict<bool> = {}
@@ -201,6 +202,24 @@ def SendWithCb(req: dict<any>, Cb: func)
   Send(req)
 enddef
 
+def OnJuliaEnvironmentActivation(ev: dict<any>)
+  if get(ev, 'type', '') !=# 'error'
+    return
+  endif
+  echohl ErrorMsg
+  echom '[SimpleCC] Failed to activate Julia environment: ' .. get(ev, 'message', 'unknown error')
+  echohl None
+enddef
+
+def OnConfigurationReload(ev: dict<any>)
+  if get(ev, 'type', '') !=# 'error'
+    return
+  endif
+  echohl ErrorMsg
+  echom '[SimpleCC] Failed to reload configuration: ' .. get(ev, 'message', 'unknown error')
+  echohl None
+enddef
+
 def OnBackendEvent(line: string)
   if line ==# ''
     return
@@ -337,6 +356,17 @@ def OnBackendEvent(line: string)
     else
       echo '[LSP] ' .. msg
     endif
+
+  elseif ev.type ==# 'juliaEnvironment'
+    s_julia_environment = get(ev, 'path', '')
+    Log('Julia environment activated: ' .. s_julia_environment)
+    echo '[SimpleCC] Julia environment: ' .. s_julia_environment
+
+  elseif ev.type ==# 'configurationReloaded'
+    var count = get(ev, 'servers', 0)
+    Log(printf('configuration reloaded for %d running server(s)', count))
+    echo printf('[SimpleCC] Configuration reloaded (%d running server%s updated)',
+        count, count == 1 ? '' : 's')
 
   elseif ev.type ==# 'log'
     Log('[' .. get(ev, 'server', '') .. '] ' .. get(ev, 'message', ''))
@@ -513,6 +543,16 @@ export def OnBufOpen()
   RequestSemanticTokensDebounced()
 enddef
 
+export def OnBufEnter()
+  if !s_initialized || BufFt() ==# '' || BufUri() ==# 'file://'
+    return
+  endif
+  # Inlay hints are pull-based. Re-requesting on buffer entry also makes live
+  # Julia configuration changes visible after returning from simplecc.json.
+  RequestInlayHintsDebounced()
+  RequestSemanticTokensDebounced()
+enddef
+
 export def OnBufSave()
   if !s_initialized
     return
@@ -523,6 +563,9 @@ export def OnBufSave()
   endif
   var text = join(getline(1, '$'), "\n") .. "\n"
   Send({type: 'textDocument/didSave', id: NextId(), uri: uri, text: text})
+  if IsActiveConfigBuffer()
+    ReloadConfiguration()
+  endif
   RequestInlayHintsDebounced()
   RequestSemanticTokensDebounced()
   # F12: Auto pull diagnostics if enabled
@@ -1776,6 +1819,10 @@ export def Start()
   endif
   # Detect project root
   s_root = FindProjectRoot()
+  s_julia_environment = ''
+  if filereadable(s_root .. '/JuliaProject.toml') || filereadable(s_root .. '/Project.toml')
+    s_julia_environment = s_root
+  endif
   Log('project root: ' .. s_root)
 
   var id = NextId()
@@ -1831,23 +1878,68 @@ export def Status()
     echo '[SimpleCC] starting...'
     return
   endif
-  echo printf('[SimpleCC] running | root: %s | server: %s', s_root, g:simplecc_status)
+  var julia_env = s_julia_environment ==# '' ? '' : ' | Julia env: ' .. s_julia_environment
+  echo printf('[SimpleCC] running | root: %s | server: %s%s',
+      s_root, g:simplecc_status, julia_env)
+enddef
+
+export def JuliaActivateEnvironment(path: string = '')
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  if &filetype !=# 'julia'
+    echohl ErrorMsg
+    echom '[SimpleCC] Julia environment activation requires a Julia buffer'
+    echohl None
+    return
+  endif
+
+  var environment = path ==# '' ? FindNearestJuliaEnvironment() : NormalizeJuliaEnvironment(path)
+  if environment ==# ''
+    var detail = path ==# ''
+        ? 'No Project.toml or JuliaProject.toml found'
+        : 'Not a Julia environment: ' .. path
+    echohl ErrorMsg
+    echom '[SimpleCC] ' .. detail
+    echohl None
+    return
+  endif
+
+  SendWithCb({
+    type: 'julia/activateEnvironment',
+    id: NextId(),
+    languageId: 'julia',
+    envPath: environment,
+  }, OnJuliaEnvironmentActivation)
+  echo '[SimpleCC] Activating Julia environment: ' .. environment
+enddef
+
+export def ReloadConfiguration()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+
+  var configured = get(g:, 'simplecc_config_path', '')
+  var config_path = configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
+  SendWithCb({
+    type: 'workspace/reloadConfiguration',
+    id: NextId(),
+    configPath: config_path,
+  }, OnConfigurationReload)
 enddef
 
 export def OpenConfig()
-  var config_path = get(g:, 'simplecc_config_path', '')
-  if config_path !=# '' && filereadable(config_path)
-    execute 'edit ' .. fnameescape(config_path)
+  var active = ActiveConfigPath()
+  if active !=# ''
+    execute 'edit ' .. fnameescape(active)
     return
   endif
-  # Try project root
+
+  # Create new
   var root = FindProjectRoot()
   var project_config = root .. '/simplecc.json'
-  if filereadable(project_config)
-    execute 'edit ' .. fnameescape(project_config)
-    return
-  endif
-  # Create new
   execute 'edit ' .. fnameescape(project_config)
   if line('$') == 1 && getline(1) ==# ''
     setline(1, [
@@ -3652,4 +3744,71 @@ def FindProjectRoot(): string
   endwhile
 
   return getcwd()
+enddef
+
+def ActiveConfigPath(): string
+  var configured = get(g:, 'simplecc_config_path', '')
+  if configured !=# ''
+    return fnamemodify(expand(configured), ':p')
+  endif
+
+  var root = s_root ==# '' ? FindProjectRoot() : s_root
+  for path in [root .. '/simplecc.json', root .. '/.simplecc.json']
+    if filereadable(path)
+      return fnamemodify(path, ':p')
+    endif
+  endfor
+
+  var global = expand('~/.config/simplecc/simplecc.json')
+  return filereadable(global) ? fnamemodify(global, ':p') : ''
+enddef
+
+def IsActiveConfigBuffer(): bool
+  var current = expand('%:p')
+  var active = ActiveConfigPath()
+  return current !=# '' && active !=# ''
+      && fnamemodify(current, ':p') ==# active
+enddef
+
+def NormalizeJuliaEnvironment(path: string): string
+  if path ==# ''
+    return ''
+  endif
+
+  var candidate = fnamemodify(expand(path), ':p')
+  if filereadable(candidate)
+    var name = fnamemodify(candidate, ':t')
+    if name !=# 'Project.toml' && name !=# 'JuliaProject.toml'
+      return ''
+    endif
+    candidate = fnamemodify(candidate, ':h')
+  endif
+  if !isdirectory(candidate)
+    return ''
+  endif
+  if !filereadable(candidate .. '/Project.toml')
+        && !filereadable(candidate .. '/JuliaProject.toml')
+    return ''
+  endif
+
+  candidate = simplify(candidate)
+  return candidate ==# '/' ? candidate : substitute(candidate, '/$', '', '')
+enddef
+
+def FindNearestJuliaEnvironment(): string
+  var dir = expand('%:p:h')
+  if dir ==# ''
+    dir = getcwd()
+  endif
+
+  var previous = ''
+  while dir !=# previous
+    var environment = NormalizeJuliaEnvironment(dir)
+    if environment !=# ''
+      return environment
+    endif
+    previous = dir
+    dir = fnamemodify(dir, ':h')
+  endwhile
+  return ''
 enddef

@@ -196,6 +196,31 @@ impl Registry {
         self.clients.values().cloned().collect()
     }
 
+    /// Reload configuration and update every running server in place. New
+    /// server instances also use the replacement config through `self.config`.
+    pub async fn reload_configuration(&mut self, config_path: Option<&str>) -> Result<usize> {
+        let config = Config::load_selected(&self.root_dir, config_path)?;
+        let updates: Vec<_> = self
+            .clients
+            .iter()
+            .map(|(name, client)| {
+                (
+                    client.clone(),
+                    config
+                        .language_servers
+                        .get(name)
+                        .and_then(|server| server.effective_settings(name)),
+                )
+            })
+            .collect();
+
+        self.config = config;
+        for (client, settings) in &updates {
+            client.did_change_configuration(settings.clone()).await?;
+        }
+        Ok(updates.len())
+    }
+
     /// Get the client for a server name.
     #[allow(dead_code)]
     pub fn client_by_name(&self, name: &str) -> Option<Arc<LspClient>> {
