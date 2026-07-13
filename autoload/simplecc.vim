@@ -1075,6 +1075,7 @@ export def Definition()
     languageId: BufFt(),
     line: line('.') - 1,
     character: col('.') - 1,
+    symbol: expand('<cword>'),
   })
 enddef
 
@@ -3632,6 +3633,7 @@ enddef
 
 def FindProjectRoot(): string
   var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'pyproject.toml',
+                 'Project.toml', 'JuliaProject.toml',
                  'Makefile', 'CMakeLists.txt', '.hg', '.svn']
   var dir = expand('%:p:h')
   if dir ==# ''

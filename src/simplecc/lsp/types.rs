@@ -476,7 +476,7 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
 }
 
 /// Decode file:// URI to proper path.
-fn decode_uri(uri: &str) -> String {
+pub(crate) fn decode_uri(uri: &str) -> String {
     if let Some(path) = uri.strip_prefix("file://") {
         // Use urlencoding crate if available, otherwise do basic decoding
         match urlencoding::decode(path) {

@@ -92,6 +92,8 @@ enum Request {
         language_id: String,
         line: u32,
         character: u32,
+        #[serde(default)]
+        symbol: String,
     },
     #[serde(rename = "textDocument/references")]
     References {
@@ -675,6 +677,7 @@ async fn handle_request(
             language_id,
             line,
             character,
+            symbol,
         } => {
             eprintln!(
                 "[simplecc] definition request: uri={} lang={} line={} char={}",
@@ -684,7 +687,29 @@ async fn handle_request(
             if let Some(client) = primary_client(&registry, &language_id).await {
                 let c = client;
                 match c.definition(&uri, line, character).await {
-                    Ok(locs) => {
+                    Ok(mut locs) => {
+                        // LanguageServer.jl can fail to connect `using Package: name`
+                        // references in test files to the package's live workspace
+                        // source. Its workspace index still has the exact local
+                        // declaration, so use that only when normal definition and
+                        // document-link navigation both returned nothing.
+                        if locs.is_empty() && !symbol.is_empty() {
+                            match c.workspace_symbol_locations(&symbol).await {
+                                Ok(fallback) => {
+                                    if !fallback.is_empty() {
+                                        eprintln!(
+                                            "[simplecc] definition workspace fallback: symbol={} locations={}",
+                                            symbol,
+                                            fallback.len()
+                                        );
+                                        locs = fallback;
+                                    }
+                                }
+                                Err(err) => eprintln!(
+                                    "[simplecc] definition workspace fallback unavailable: {err}"
+                                ),
+                            }
+                        }
                         eprintln!("[simplecc] definition result: {} locations", locs.len());
                         send_event(
                             &out,

@@ -578,7 +578,52 @@ impl LspClient {
             )
             .await?;
 
-        parse_locations(result)
+        let mut locations = parse_locations(result)?;
+
+        // Some language servers expose navigable file references as document
+        // links instead of definitions. LanguageServer.jl does this for paths
+        // in `include("file.jl")`, so a definition-only client otherwise reports
+        // "No definition found" even though the server knows the target file.
+        // Keep this as a fallback so normal symbol definitions always win.
+        if locations.is_empty() {
+            match self.document_link_at(uri, line, character).await {
+                Ok(Some(location)) => locations.push(location),
+                Ok(None) => {}
+                // Not every server implements document links. An unsupported
+                // fallback must preserve the original empty definition result.
+                Err(err) => {
+                    eprintln!("[simplecc] document-link definition fallback unavailable: {err}")
+                }
+            }
+        }
+
+        Ok(locations)
+    }
+
+    /// Return a file document-link at the cursor, or the nearest one on the
+    /// same line. The same-line fallback lets `gd` work from the `include`
+    /// function name as well as from its quoted path.
+    async fn document_link_at(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<types::Location>> {
+        let result = self
+            .request(
+                "textDocument/documentLink",
+                json!({
+                    "textDocument": { "uri": uri },
+                }),
+            )
+            .await?;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        let links: Vec<DocumentLink> = serde_json::from_value(result)?;
+        Ok(select_document_link(&links, line, character))
     }
 
     pub async fn references(
@@ -929,6 +974,33 @@ impl LspClient {
                 .collect());
         }
         Ok(vec![])
+    }
+
+    /// Find exact-name declarations in the server's workspace index. This is
+    /// used only after a normal definition request fails, notably for Julia
+    /// package symbols imported from tests with `using Package: symbol`.
+    pub async fn workspace_symbol_locations(&self, query: &str) -> Result<Vec<types::Location>> {
+        let result = self
+            .request(
+                "workspace/symbol",
+                json!({
+                    "query": query,
+                }),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(vec![]);
+        }
+
+        let infos: Vec<lsp_types::SymbolInformation> = serde_json::from_value(result)?;
+        let mut locations: Vec<_> = infos
+            .iter()
+            .filter(|info| info.name == query)
+            .map(|info| types::from_lsp_location(&info.location))
+            .collect();
+        locations.sort_by(|a, b| (&a.uri, a.line, a.character).cmp(&(&b.uri, b.line, b.character)));
+        locations.dedup_by(|a, b| a.uri == b.uri && a.line == b.line && a.character == b.character);
+        Ok(locations)
     }
 
     pub async fn document_highlight(
@@ -1689,6 +1761,96 @@ fn parse_locations(result: Value) -> Result<Vec<types::Location>> {
     Ok(vec![])
 }
 
+fn select_document_link(
+    links: &[DocumentLink],
+    line: u32,
+    character: u32,
+) -> Option<types::Location> {
+    links
+        .iter()
+        .filter_map(|link| {
+            let target = link.target.as_ref()?.to_string();
+            // Definition navigation opens an editor buffer; web links and
+            // other URI schemes do not belong in this fallback.
+            if !target.starts_with("file://") {
+                return None;
+            }
+
+            let range = link.range;
+            let contains_cursor = (line > range.start.line
+                || (line == range.start.line && character >= range.start.character))
+                && (line < range.end.line
+                    || (line == range.end.line && character <= range.end.character));
+            let is_on_line = line >= range.start.line && line <= range.end.line;
+            if !is_on_line {
+                return None;
+            }
+
+            let distance = if contains_cursor {
+                0
+            } else if line == range.start.line && character < range.start.character {
+                range.start.character - character
+            } else if line == range.end.line && character > range.end.character {
+                character - range.end.character
+            } else {
+                0
+            };
+
+            Some((
+                !contains_cursor,
+                distance,
+                types::Location {
+                    uri: types::decode_uri(&target),
+                    line: 0,
+                    character: 0,
+                    end_line: None,
+                    end_character: None,
+                },
+            ))
+        })
+        .min_by_key(|(outside, distance, _)| (*outside, *distance))
+        .map(|(_, _, location)| location)
+}
+
+#[cfg(test)]
+mod document_link_tests {
+    use super::*;
+
+    fn link(start: u32, end: u32, target: &str) -> DocumentLink {
+        DocumentLink {
+            range: Range::new(Position::new(4, start), Position::new(4, end)),
+            target: Some(target.parse().unwrap()),
+            tooltip: None,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn selects_link_from_include_function_name_on_same_line() {
+        let links = vec![link(8, 29, "file:///tmp/core/transformer.jl")];
+        let location = select_document_link(&links, 4, 2).unwrap();
+        assert_eq!(location.uri, "/tmp/core/transformer.jl");
+        assert_eq!(location.line, 0);
+    }
+
+    #[test]
+    fn prefers_link_containing_cursor_and_ignores_web_targets() {
+        let links = vec![
+            link(1, 5, "https://example.com"),
+            link(10, 20, "file:///tmp/first.jl"),
+            link(25, 35, "file:///tmp/second.jl"),
+        ];
+        let location = select_document_link(&links, 4, 28).unwrap();
+        assert_eq!(location.uri, "/tmp/second.jl");
+    }
+
+    #[test]
+    fn does_not_select_a_link_from_another_line() {
+        let links = vec![link(8, 29, "file:///tmp/core/transformer.jl")];
+        assert!(select_document_link(&links, 3, 8).is_none());
+    }
+}
+
 fn convert_doc_symbols(syms: &[lsp_types::DocumentSymbol]) -> Vec<types::DocumentSymbolItem> {
     syms.iter()
         .map(|s| types::DocumentSymbolItem {
@@ -1895,6 +2057,10 @@ fn client_capabilities() -> ClientCapabilities {
             definition: Some(GotoCapability {
                 link_support: Some(true),
                 ..Default::default()
+            }),
+            document_link: Some(DocumentLinkClientCapabilities {
+                dynamic_registration: Some(false),
+                tooltip_support: Some(true),
             }),
             references: Some(DynamicRegistrationClientCapabilities {
                 dynamic_registration: Some(false),
