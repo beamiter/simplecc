@@ -4,7 +4,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use super::registry::Registry;
@@ -16,8 +16,10 @@ const DELETED: u32 = 3;
 /// Keeps the platform watcher and its async event-forwarding task alive for
 /// the lifetime of one initialized workspace.
 pub struct WorkspaceWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     task: tokio::task::JoinHandle<()>,
+    root: PathBuf,
+    julia_environment: Option<PathBuf>,
 }
 
 impl WorkspaceWatcher {
@@ -27,11 +29,13 @@ impl WorkspaceWatcher {
             let _ = tx.send(event);
         })
         .context("failed to create platform file watcher")?;
+        let root_path = std::fs::canonicalize(root).unwrap_or_else(|_| PathBuf::from(root));
         watcher
-            .watch(Path::new(root), RecursiveMode::Recursive)
+            .watch(&root_path, RecursiveMode::Recursive)
             .with_context(|| format!("failed to watch workspace {root}"))?;
 
         let task = tokio::spawn(async move {
+            let mut last_julia_refresh: Option<Instant> = None;
             while let Some(result) = rx.recv().await {
                 let mut pending = HashMap::<PathBuf, u32>::new();
                 match result {
@@ -54,6 +58,7 @@ impl WorkspaceWatcher {
                     }
                 }
 
+                let manifest_changed = pending.keys().any(|path| is_julia_manifest(path));
                 let changes: Vec<_> = pending
                     .into_iter()
                     .filter_map(|(path, change_type)| {
@@ -74,18 +79,65 @@ impl WorkspaceWatcher {
                     .as_ref()
                     .map(Registry::active_clients)
                     .unwrap_or_default();
+                let should_refresh_julia = manifest_changed
+                    && last_julia_refresh
+                        .map_or(true, |last| last.elapsed() >= Duration::from_secs(2));
+                let mut refreshed_julia = false;
                 for client in clients {
                     if let Err(err) = client.did_change_watched_files(&changes).await {
                         eprintln!("[simplecc] watched-file notification failed: {err}");
                     }
+                    if should_refresh_julia {
+                        match client.refresh_julia_language_server().await {
+                            Ok(true) => refreshed_julia = true,
+                            Ok(false) => {}
+                            Err(err) => {
+                                eprintln!("[simplecc] Julia symbol-cache refresh failed: {err}")
+                            }
+                        }
+                    }
+                }
+                if refreshed_julia {
+                    last_julia_refresh = Some(Instant::now());
                 }
             }
         });
 
         Ok(Self {
-            _watcher: watcher,
+            watcher,
             task,
+            root: root_path,
+            julia_environment: None,
         })
+    }
+
+    /// Follow the selected Julia environment even when it lives outside the
+    /// workspace (for example ~/.julia/environments/v1.x).
+    pub fn watch_julia_environment(&mut self, environment: &str) -> Result<()> {
+        let environment =
+            std::fs::canonicalize(environment).unwrap_or_else(|_| PathBuf::from(environment));
+        if self.julia_environment.as_ref() == Some(&environment) {
+            return Ok(());
+        }
+
+        if let Some(previous) = self.julia_environment.take() {
+            if !previous.starts_with(&self.root) {
+                let _ = self.watcher.unwatch(&previous);
+            }
+        }
+
+        if !environment.starts_with(&self.root) {
+            self.watcher
+                .watch(&environment, RecursiveMode::NonRecursive)
+                .with_context(|| {
+                    format!(
+                        "failed to watch Julia environment {}",
+                        environment.display()
+                    )
+                })?;
+        }
+        self.julia_environment = Some(environment);
+        Ok(())
     }
 }
 
@@ -154,6 +206,15 @@ fn is_lsp_workspace_file(path: &Path) -> bool {
         && name.ends_with(".toml"))
 }
 
+fn is_julia_manifest(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(name, "Manifest.toml" | "JuliaManifest.toml")
+        || ((name.starts_with("Manifest-v") || name.starts_with("JuliaManifest-v"))
+            && name.ends_with(".toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +258,20 @@ mod tests {
         assert_eq!(pending[Path::new("old.jl")], DELETED);
         assert_eq!(pending[Path::new("temp.jl")], DELETED);
         assert_eq!(pending[Path::new("saved.jl")], CREATED);
+    }
+
+    #[test]
+    fn recognizes_all_supported_julia_manifest_names() {
+        for path in [
+            "Manifest.toml",
+            "JuliaManifest.toml",
+            "Manifest-v1.12.toml",
+            "JuliaManifest-v1.11.toml",
+        ] {
+            assert!(is_julia_manifest(Path::new(path)), "{path}");
+        }
+        for path in ["Project.toml", "Manifest.txt", "src/Manifest.jl"] {
+            assert!(!is_julia_manifest(Path::new(path)), "{path}");
+        }
     }
 }

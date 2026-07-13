@@ -211,6 +211,15 @@ def OnJuliaEnvironmentActivation(ev: dict<any>)
   echohl None
 enddef
 
+def OnJuliaLanguageServerRefresh(ev: dict<any>)
+  if get(ev, 'type', '') !=# 'error'
+    return
+  endif
+  echohl ErrorMsg
+  echom '[SimpleCC] Failed to refresh Julia language server: ' .. get(ev, 'message', 'unknown error')
+  echohl None
+enddef
+
 def OnConfigurationReload(ev: dict<any>)
   if get(ev, 'type', '') !=# 'error'
     return
@@ -361,6 +370,10 @@ def OnBackendEvent(line: string)
     s_julia_environment = get(ev, 'path', '')
     Log('Julia environment activated: ' .. s_julia_environment)
     echo '[SimpleCC] Julia environment: ' .. s_julia_environment
+
+  elseif ev.type ==# 'juliaRefreshed'
+    Log('Julia language server symbol-cache refresh requested')
+    echo '[SimpleCC] Julia language server refresh requested'
 
   elseif ev.type ==# 'configurationReloaded'
     var count = get(ev, 'servers', 0)
@@ -1913,6 +1926,25 @@ export def JuliaActivateEnvironment(path: string = '')
     envPath: environment,
   }, OnJuliaEnvironmentActivation)
   echo '[SimpleCC] Activating Julia environment: ' .. environment
+enddef
+
+export def JuliaRefreshLanguageServer()
+  if !s_initialized
+    echom '[SimpleCC] not initialized'
+    return
+  endif
+  if &filetype !=# 'julia'
+    echohl ErrorMsg
+    echom '[SimpleCC] Julia language server refresh requires a Julia buffer'
+    echohl None
+    return
+  endif
+
+  SendWithCb({
+    type: 'julia/refreshLanguageServer',
+    id: NextId(),
+    languageId: 'julia',
+  }, OnJuliaLanguageServerRefresh)
 enddef
 
 export def ReloadConfiguration()

@@ -40,6 +40,12 @@ enum Request {
         #[serde(rename = "envPath")]
         env_path: String,
     },
+    #[serde(rename = "julia/refreshLanguageServer")]
+    JuliaRefreshLanguageServer {
+        id: u64,
+        #[serde(rename = "languageId")]
+        language_id: String,
+    },
     #[serde(rename = "workspace/reloadConfiguration")]
     ReloadConfiguration {
         id: u64,
@@ -381,6 +387,7 @@ impl Request {
                 | Self::DidSave { .. }
                 | Self::DidClose { .. }
                 | Self::JuliaActivateEnvironment { .. }
+                | Self::JuliaRefreshLanguageServer { .. }
                 | Self::ReloadConfiguration { .. }
         )
     }
@@ -565,12 +572,59 @@ async fn handle_request(
 
             match primary_client(&registry, &language_id).await {
                 Some(client) => match client.julia_activate_environment(&env_path).await {
-                    Ok(()) => send_event(
+                    Ok(()) => {
+                        if let Some(watcher) = workspace_watcher.lock().await.as_mut() {
+                            if let Err(err) = watcher.watch_julia_environment(&env_path) {
+                                eprintln!("[simplecc] {err}");
+                            }
+                        }
+                        send_event(
+                            &out,
+                            json!({
+                                "type": "juliaEnvironment",
+                                "id": id,
+                                "path": env_path,
+                            }),
+                        );
+                    }
+                    Err(err) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": err.to_string()}),
+                    ),
+                },
+                None => send_event(
+                    &out,
+                    json!({
+                        "type": "error",
+                        "id": id,
+                        "message": "Julia language server is not running",
+                    }),
+                ),
+            }
+        }
+
+        Request::JuliaRefreshLanguageServer { id, language_id } => {
+            if language_id != "julia" {
+                send_event(
+                    &out,
+                    json!({
+                        "type": "error",
+                        "id": id,
+                        "message": "Julia language server refresh requires a Julia buffer",
+                    }),
+                );
+                return;
+            }
+
+            match primary_client(&registry, &language_id).await {
+                Some(client) => match client.refresh_julia_language_server().await {
+                    Ok(true) => send_event(&out, json!({"type": "juliaRefreshed", "id": id})),
+                    Ok(false) => send_event(
                         &out,
                         json!({
-                            "type": "juliaEnvironment",
+                            "type": "error",
                             "id": id,
-                            "path": env_path,
+                            "message": "Active server is not Julia LanguageServer",
                         }),
                     ),
                     Err(err) => send_event(
@@ -1616,6 +1670,24 @@ mod request_tests {
             Request::ReloadConfiguration { id, config_path } => {
                 assert_eq!(id, 9);
                 assert_eq!(config_path.as_deref(), Some("/tmp/simplecc.json"));
+            }
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
+    fn parses_julia_language_server_refresh() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "julia/refreshLanguageServer",
+            "id": 11,
+            "languageId": "julia"
+        }))
+        .unwrap();
+
+        match request {
+            Request::JuliaRefreshLanguageServer { id, language_id } => {
+                assert_eq!(id, 11);
+                assert_eq!(language_id, "julia");
             }
             _ => panic!("unexpected request variant"),
         }

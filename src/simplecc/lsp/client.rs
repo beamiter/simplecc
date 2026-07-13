@@ -383,6 +383,17 @@ impl LspClient {
             .await
     }
 
+    /// Ask LanguageServer.jl to rebuild its dependency symbol cache. Returns
+    /// false for non-Julia clients so workspace watchers can broadcast safely.
+    pub async fn refresh_julia_language_server(&self) -> Result<bool> {
+        if self.server_name != "julia-lsp" {
+            return Ok(false);
+        }
+        self.notify("julia/refreshLanguageServer", Value::Null)
+            .await?;
+        Ok(true)
+    }
+
     /// Replace values returned by `workspace/configuration`, then notify the
     /// server so it can request and apply the new values.
     pub async fn did_change_configuration(&self, settings: Option<Value>) -> Result<()> {
