@@ -5,6 +5,7 @@
       "args": [],
       "filetypes": ["rust"],
       "rootPatterns": ["Cargo.toml"],
+      "priority": 100,
       "initializationOptions": {}
     },
     "typescript-language-server": {

@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use lsp_types::*;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -14,6 +14,12 @@ use super::types;
 struct CompletionCache {
     generation: u64,
     items: Vec<lsp_types::CompletionItem>,
+}
+
+#[derive(Clone, Default)]
+struct SemanticTokenCache {
+    result_id: Option<String>,
+    data: Vec<lsp_types::SemanticToken>,
 }
 
 /// A single LSP server client.
@@ -32,16 +38,17 @@ pub struct LspClient {
     /// Server capabilities after initialize
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
-    pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeAction>>>,
+    pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeActionOrCommand>>>,
     /// Latest completion generation and its raw items for resolve.
     cached_completions: Arc<Mutex<CompletionCache>>,
     completion_generation: Arc<AtomicU64>,
     /// Cached code lenses for execute
     pub cached_code_lenses: Arc<Mutex<Vec<lsp_types::CodeLens>>>,
-    /// Previous semantic token result_id per URI (for delta requests)
-    semtok_prev_result_id: Arc<Mutex<HashMap<String, String>>>,
-    /// Previous raw semantic token data per URI (for applying delta edits)
-    semtok_prev_data: Arc<Mutex<HashMap<String, Vec<lsp_types::SemanticToken>>>>,
+    /// Previous semantic-token result and raw data, updated atomically per URI.
+    semtok_cache: Arc<Mutex<HashMap<String, SemanticTokenCache>>>,
+    /// Full and delta requests for one URI must never mutate the cache out of
+    /// order. Different documents can still be processed concurrently.
+    semtok_uri_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// Methods dynamically registered by the server, such as workspace file
     /// watching requested by LanguageServer.jl.
     registered_methods: Arc<Mutex<HashSet<String>>>,
@@ -51,6 +58,7 @@ pub struct LspClient {
     /// Recent watched-file notifications, used to collapse the duplicate
     /// event commonly produced by Vim's save hook and the platform watcher.
     watched_file_notifications: Arc<Mutex<HashMap<(String, u32), Instant>>>,
+    alive: Arc<AtomicBool>,
     server_name: String,
 }
 
@@ -79,6 +87,9 @@ pub enum ServerEvent {
         title: String,
         message: String,
         percentage: Option<u64>,
+    },
+    Stopped {
+        message: String,
     },
 }
 
@@ -112,6 +123,8 @@ impl LspClient {
         let settings_clone = settings.clone();
         let registered_methods = Arc::new(Mutex::new(HashSet::new()));
         let registered_methods_clone = registered_methods.clone();
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_clone = alive.clone();
         tokio::spawn(async move {
             while let Some(msg) = incoming.recv().await {
                 // Is it a response?
@@ -139,6 +152,22 @@ impl LspClient {
                     handle_server_notification(method, &msg, &event_tx_clone).await;
                 }
             }
+
+            alive_clone.store(false, Ordering::Release);
+            // Dropping every sender wakes all pending requests immediately with
+            // a disconnect error instead of making them wait for their timeout.
+            pending_clone.lock().await.clear();
+            {
+                let mut transport = transport_clone.lock().await;
+                if let Err(error) = transport.terminate().await {
+                    eprintln!("[simplecc] failed to reap disconnected language server: {error}");
+                }
+            }
+            let _ = event_tx_clone
+                .send(ServerEvent::Stopped {
+                    message: "language server connection closed".to_string(),
+                })
+                .await;
         });
 
         let mut client = Self {
@@ -151,22 +180,44 @@ impl LspClient {
             cached_completions: Arc::new(Mutex::new(CompletionCache::default())),
             completion_generation: Arc::new(AtomicU64::new(0)),
             cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
-            semtok_prev_result_id: Arc::new(Mutex::new(HashMap::new())),
-            semtok_prev_data: Arc::new(Mutex::new(HashMap::new())),
+            semtok_cache: Arc::new(Mutex::new(HashMap::new())),
+            semtok_uri_locks: Arc::new(Mutex::new(HashMap::new())),
             registered_methods,
             settings,
             watched_file_notifications: Arc::new(Mutex::new(HashMap::new())),
+            alive,
             server_name: server_name.to_string(),
         };
 
         // Initialize
-        client.initialize(root_uri, root_path, init_options).await?;
+        if let Err(error) = client.initialize(root_uri, root_path, init_options).await {
+            client.mark_dead().await;
+            if let Err(terminate_error) = client.terminate_transport().await {
+                eprintln!(
+                    "[simplecc] failed to clean up {server_name} after initialization error: {terminate_error}"
+                );
+            }
+            return Err(error);
+        }
 
         Ok((client, event_rx))
     }
 
     fn next_request_id(&self) -> i64 {
         self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    async fn mark_dead(&self) {
+        self.alive.store(false, Ordering::Release);
+        self.pending.lock().await.clear();
+    }
+
+    async fn terminate_transport(&self) -> Result<()> {
+        self.transport.lock().await.terminate().await
     }
 
     /// Send a JSON-RPC request and wait for response.
@@ -209,8 +260,18 @@ impl LspClient {
     }
 
     async fn send_message(&self, msg: &Value) -> Result<()> {
-        let mut transport = self.transport.lock().await;
-        transport.send(msg).await
+        if !self.is_alive() {
+            bail!("language server {} is not running", self.server_name);
+        }
+        let result = {
+            let mut transport = self.transport.lock().await;
+            transport.send(msg).await
+        };
+        if result.is_err() {
+            self.mark_dead().await;
+            let _ = self.terminate_transport().await;
+        }
+        result
     }
 
     async fn cancel_pending_request(&self, id: i64) {
@@ -245,6 +306,9 @@ impl LspClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>> {
+        if !self.is_alive() {
+            bail!("language server {} is not running", self.server_name);
+        }
         let id = self.next_request_id();
         let msg = json!({
             "jsonrpc": "2.0",
@@ -286,6 +350,12 @@ impl LspClient {
                     if !self.clear_latest_request(key, id).await {
                         return Ok(None);
                     }
+                }
+                if !self.is_alive() {
+                    bail!(
+                        "language server {} disconnected while waiting for {method}",
+                        self.server_name
+                    );
                 }
                 return Err(err.into());
             }
@@ -354,9 +424,8 @@ impl LspClient {
 
         let result = self.request("initialize", params).await?;
 
-        if let Ok(init_result) = serde_json::from_value::<InitializeResult>(result) {
-            *self.capabilities.lock().await = Some(init_result.capabilities);
-        }
+        let init_result = serde_json::from_value::<InitializeResult>(result)?;
+        *self.capabilities.lock().await = Some(init_result.capabilities);
 
         self.notify("initialized", json!({})).await?;
 
@@ -365,9 +434,19 @@ impl LspClient {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.request("shutdown", Value::Null).await;
-        self.notify("exit", Value::Null).await?;
-        Ok(())
+        let protocol_result = if self.is_alive() {
+            let shutdown_result = self
+                .request_with_timeout("shutdown", Value::Null, Duration::from_secs(5))
+                .await;
+            let exit_result = self.notify("exit", Value::Null).await;
+            shutdown_result.and(exit_result)
+        } else {
+            Ok(())
+        };
+
+        self.mark_dead().await;
+        let terminate_result = self.terminate_transport().await;
+        protocol_result.and(terminate_result)
     }
 
     // ─── Document Sync ──────────────────────────────────────
@@ -525,6 +604,10 @@ impl LspClient {
     }
 
     pub async fn did_close(&self, uri: &str) -> Result<()> {
+        let uri_lock = self.semantic_token_uri_lock(uri).await;
+        let _guard = uri_lock.lock().await;
+        self.semtok_cache.lock().await.remove(uri);
+        self.semtok_uri_locks.lock().await.remove(uri);
         self.notify(
             "textDocument/didClose",
             json!({
@@ -610,7 +693,7 @@ impl LspClient {
         } else {
             vec![]
         };
-        items.truncate(max_items.max(1).min(500));
+        items.truncate(max_items.clamp(1, 500));
 
         {
             let mut cache = self.cached_completions.lock().await;
@@ -784,78 +867,65 @@ impl LspClient {
             return Ok(vec![]);
         }
 
-        let raw: Vec<Value> = serde_json::from_value(result)?;
-        let mut actions = Vec::new();
-        let mut cached = Vec::new();
-
-        for (i, item) in raw.into_iter().enumerate() {
-            // Could be Command or CodeAction
-            if item.get("edit").is_some() || item.get("command").is_some() {
-                let title = item
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let kind = item.get("kind").and_then(|k| k.as_str()).map(String::from);
-                actions.push(types::CodeAction {
-                    title,
-                    kind,
-                    index: i,
-                });
-                if let Ok(ca) = serde_json::from_value::<lsp_types::CodeAction>(item) {
-                    cached.push(ca);
-                } else {
-                    cached.push(lsp_types::CodeAction {
-                        title: actions.last().unwrap().title.clone(),
-                        ..Default::default()
-                    });
-                }
-            } else {
-                // It's a Command
-                let title = item
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                actions.push(types::CodeAction {
-                    title,
+        let cached: Vec<lsp_types::CodeActionOrCommand> = serde_json::from_value(result)?;
+        let actions = cached
+            .iter()
+            .enumerate()
+            .map(|(index, action)| match action {
+                lsp_types::CodeActionOrCommand::Command(command) => types::CodeAction {
+                    title: command.title.clone(),
                     kind: None,
-                    index: i,
-                });
-                cached.push(lsp_types::CodeAction {
-                    title: actions.last().unwrap().title.clone(),
-                    ..Default::default()
-                });
-            }
-        }
+                    index,
+                },
+                lsp_types::CodeActionOrCommand::CodeAction(action) => types::CodeAction {
+                    title: action.title.clone(),
+                    kind: action.kind.as_ref().map(|kind| kind.as_str().to_string()),
+                    index,
+                },
+            })
+            .collect();
 
         *self.cached_actions.lock().await = cached;
         Ok(actions)
     }
 
     pub async fn execute_code_action(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
-        let cached = self.cached_actions.lock().await;
-        let action = cached
+        // Clone before awaiting so a slow command never holds the cache mutex
+        // or blocks a newer code-action response.
+        let action = self
+            .cached_actions
+            .lock()
+            .await
             .get(index)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid action index"))?;
 
-        // Apply workspace edit if present
-        let ws_edit = action.edit.as_ref().map(types::from_lsp_workspace_edit);
+        let (workspace_edit, command) = match action {
+            lsp_types::CodeActionOrCommand::Command(command) => (None, Some(command)),
+            lsp_types::CodeActionOrCommand::CodeAction(action) => (
+                action.edit.as_ref().map(types::from_lsp_workspace_edit),
+                action.command,
+            ),
+        };
 
-        // Execute command if present
-        if let Some(ref cmd) = action.command {
-            let _ = self
+        if let Some(command) = command {
+            let result = self
                 .request(
                     "workspace/executeCommand",
                     json!({
-                        "command": cmd.command,
-                        "arguments": cmd.arguments,
+                        "command": command.command,
+                        "arguments": command.arguments,
                     }),
                 )
-                .await;
+                .await?;
+            if workspace_edit.is_none() {
+                if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result) {
+                    return Ok(Some(types::from_lsp_workspace_edit(&edit)));
+                }
+            }
         }
 
-        Ok(ws_edit)
+        Ok(workspace_edit)
     }
 
     pub async fn formatting(
@@ -948,8 +1018,7 @@ impl LspClient {
         let sigs: Vec<types::SignatureInfo> = sh
             .signatures
             .into_iter()
-            .enumerate()
-            .map(|(_i, sig)| {
+            .map(|sig| {
                 let params: Vec<types::ParameterInfo> = sig
                     .parameters
                     .unwrap_or_default()
@@ -1300,7 +1369,7 @@ impl LspClient {
             return Ok(vec![]);
         }
         let ranges: Vec<lsp_types::SelectionRange> = serde_json::from_value(result)?;
-        Ok(ranges.iter().map(|r| convert_selection_range(r)).collect())
+        Ok(ranges.iter().map(convert_selection_range).collect())
     }
 
     async fn get_semtok_legend(&self) -> (Vec<String>, Vec<String>) {
@@ -1308,13 +1377,11 @@ impl LspClient {
         let legend = caps
             .as_ref()
             .and_then(|c| c.semantic_tokens_provider.as_ref())
-            .and_then(|p| match p {
-                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(o) => {
-                    Some(&o.legend)
-                }
+            .map(|p| match p {
+                lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(o) => &o.legend,
                 lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
                     o,
-                ) => Some(&o.semantic_tokens_options.legend),
+                ) => &o.semantic_tokens_options.legend,
             });
         let type_names: Vec<String> = legend
             .map(|l| {
@@ -1372,6 +1439,20 @@ impl LspClient {
     }
 
     pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
+        let uri_lock = self.semantic_token_uri_lock(uri).await;
+        let _guard = uri_lock.lock().await;
+        self.semantic_tokens_full_inner(uri).await
+    }
+
+    async fn semantic_token_uri_lock(&self, uri: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.semtok_uri_locks.lock().await;
+        locks
+            .entry(uri.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn semantic_tokens_full_inner(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
         let result = self
             .request(
                 "textDocument/semanticTokens/full",
@@ -1381,22 +1462,19 @@ impl LspClient {
             )
             .await?;
         if result.is_null() {
+            self.semtok_cache.lock().await.remove(uri);
             return Ok(vec![]);
         }
         let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
         let (type_names, mod_names) = self.get_semtok_legend().await;
 
-        // Cache result_id and raw data for delta requests
-        if let Some(ref id) = tokens.result_id {
-            self.semtok_prev_result_id
-                .lock()
-                .await
-                .insert(uri.to_string(), id.clone());
-        }
-        self.semtok_prev_data
-            .lock()
-            .await
-            .insert(uri.to_string(), tokens.data.clone());
+        self.semtok_cache.lock().await.insert(
+            uri.to_string(),
+            SemanticTokenCache {
+                result_id: tokens.result_id.clone(),
+                data: tokens.data.clone(),
+            },
+        );
 
         Ok(Self::decode_raw_tokens(
             &tokens.data,
@@ -1409,11 +1487,16 @@ impl LspClient {
         &self,
         uri: &str,
     ) -> Result<Vec<types::SemanticTokenItem>> {
-        // Check if we have a previous result_id for this URI
-        let prev_id = self.semtok_prev_result_id.lock().await.get(uri).cloned();
-        let prev_id = match prev_id {
-            Some(id) => id,
-            None => return self.semantic_tokens_full(uri).await,
+        let uri_lock = self.semantic_token_uri_lock(uri).await;
+        let _guard = uri_lock.lock().await;
+
+        let previous = self.semtok_cache.lock().await.get(uri).cloned();
+        let (prev_id, previous_data) = match previous {
+            Some(SemanticTokenCache {
+                result_id: Some(result_id),
+                data,
+            }) => (result_id, data),
+            _ => return self.semantic_tokens_full_inner(uri).await,
         };
 
         let result = self
@@ -1429,13 +1512,14 @@ impl LspClient {
         // On error, clear cache and fall back to full
         let result = match result {
             Ok(r) => r,
-            Err(_) => {
-                self.semtok_prev_result_id.lock().await.remove(uri);
-                self.semtok_prev_data.lock().await.remove(uri);
-                return self.semantic_tokens_full(uri).await;
+            Err(error) => {
+                eprintln!("[simplecc] semantic-token delta request failed, retrying full: {error}");
+                self.semtok_cache.lock().await.remove(uri);
+                return self.semantic_tokens_full_inner(uri).await;
             }
         };
         if result.is_null() {
+            self.semtok_cache.lock().await.remove(uri);
             return Ok(vec![]);
         }
 
@@ -1444,55 +1528,38 @@ impl LspClient {
         // Try to parse as full response first, then as delta
         if let Ok(full) = serde_json::from_value::<lsp_types::SemanticTokens>(result.clone()) {
             // Server returned full tokens
-            if let Some(ref id) = full.result_id {
-                self.semtok_prev_result_id
-                    .lock()
-                    .await
-                    .insert(uri.to_string(), id.clone());
-            }
-            self.semtok_prev_data
-                .lock()
-                .await
-                .insert(uri.to_string(), full.data.clone());
+            self.semtok_cache.lock().await.insert(
+                uri.to_string(),
+                SemanticTokenCache {
+                    result_id: full.result_id.clone(),
+                    data: full.data.clone(),
+                },
+            );
             Ok(Self::decode_raw_tokens(&full.data, &type_names, &mod_names))
         } else if let Ok(delta) = serde_json::from_value::<lsp_types::SemanticTokensDelta>(result) {
-            // Server returned delta edits
-            if let Some(ref id) = delta.result_id {
-                self.semtok_prev_result_id
-                    .lock()
-                    .await
-                    .insert(uri.to_string(), id.clone());
-            }
-
-            // Apply edits to cached data
-            let mut data_map = self.semtok_prev_data.lock().await;
-            let data = data_map.entry(uri.to_string()).or_insert_with(Vec::new);
-
-            // Sort edits by start in reverse order to avoid index shifting
-            let mut edits = delta.edits;
-            edits.sort_by(|a, b| b.start.cmp(&a.start));
-
-            for edit in &edits {
-                let start = edit.start as usize;
-                let delete_count = edit.delete_count as usize;
-                // Remove old tokens
-                let end = (start + delete_count).min(data.len());
-                data.drain(start..end);
-                // Insert new tokens
-                if let Some(ref new_tokens) = edit.data {
-                    for (i, token) in new_tokens.iter().enumerate() {
-                        data.insert(start + i, token.clone());
-                    }
+            match apply_semantic_token_edits(&previous_data, &delta.edits) {
+                Ok(data) => {
+                    self.semtok_cache.lock().await.insert(
+                        uri.to_string(),
+                        SemanticTokenCache {
+                            result_id: delta.result_id,
+                            data: data.clone(),
+                        },
+                    );
+                    Ok(Self::decode_raw_tokens(&data, &type_names, &mod_names))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[simplecc] invalid semantic-token delta, retrying full response: {error}"
+                    );
+                    self.semtok_cache.lock().await.remove(uri);
+                    self.semantic_tokens_full_inner(uri).await
                 }
             }
-
-            let decoded = Self::decode_raw_tokens(data, &type_names, &mod_names);
-            Ok(decoded)
         } else {
             // Cannot parse response, fall back to full
-            self.semtok_prev_result_id.lock().await.remove(uri);
-            self.semtok_prev_data.lock().await.remove(uri);
-            self.semantic_tokens_full(uri).await
+            self.semtok_cache.lock().await.remove(uri);
+            self.semantic_tokens_full_inner(uri).await
         }
     }
 
@@ -1615,20 +1682,24 @@ impl LspClient {
     }
 
     pub async fn execute_code_lens(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
-        let cached = self.cached_code_lenses.lock().await;
-        let lens = cached
+        // Clone before resolving so a server round trip never holds the cache
+        // lock and blocks a newer code-lens response.
+        let lens = self
+            .cached_code_lenses
+            .lock()
+            .await
             .get(index)
+            .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid code lens index"))?;
         // Resolve if no command yet
         let lens = if lens.command.is_none() {
             let resolved = self
-                .request("codeLens/resolve", serde_json::to_value(lens)?)
+                .request("codeLens/resolve", serde_json::to_value(&lens)?)
                 .await?;
             serde_json::from_value::<lsp_types::CodeLens>(resolved)?
         } else {
-            lens.clone()
+            lens
         };
-        drop(cached);
         if let Some(ref cmd) = lens.command {
             let result = self
                 .request(
@@ -1638,12 +1709,10 @@ impl LspClient {
                         "arguments": cmd.arguments,
                     }),
                 )
-                .await;
+                .await?;
             // Command may return a workspace edit
-            if let Ok(val) = result {
-                if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(val) {
-                    return Ok(Some(types::from_lsp_workspace_edit(&edit)));
-                }
+            if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result) {
+                return Ok(Some(types::from_lsp_workspace_edit(&edit)));
             }
         }
         Ok(None)
@@ -1833,6 +1902,148 @@ impl LspClient {
                 .collect(),
             word_pattern: ler.word_pattern,
         }))
+    }
+}
+
+/// Apply LSP semantic-token delta edits to the grouped representation used by
+/// `lsp-types`. `start` and `deleteCount` are offsets into the wire-level flat
+/// u32 array, where every semantic token occupies exactly five integers.
+fn apply_semantic_token_edits(
+    previous: &[lsp_types::SemanticToken],
+    edits: &[lsp_types::SemanticTokensEdit],
+) -> Result<Vec<lsp_types::SemanticToken>> {
+    let mut edits = edits.to_vec();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
+
+    let mut upper_bound = previous.len();
+    let mut normalized = Vec::with_capacity(edits.len());
+    for edit in edits {
+        if edit.start % 5 != 0 {
+            bail!(
+                "semantic-token edit start {} is not divisible by 5",
+                edit.start
+            );
+        }
+        if edit.delete_count % 5 != 0 {
+            bail!(
+                "semantic-token edit deleteCount {} is not divisible by 5",
+                edit.delete_count
+            );
+        }
+
+        let start = (edit.start / 5) as usize;
+        let delete_count = (edit.delete_count / 5) as usize;
+        let end = start
+            .checked_add(delete_count)
+            .ok_or_else(|| anyhow::anyhow!("semantic-token edit range overflow"))?;
+        if start > previous.len() || end > previous.len() {
+            bail!(
+                "semantic-token edit range {start}..{end} exceeds {} cached tokens",
+                previous.len()
+            );
+        }
+        if end > upper_bound {
+            bail!("semantic-token delta contains overlapping edits");
+        }
+        upper_bound = start;
+        normalized.push((start, end, edit.data.unwrap_or_default()));
+    }
+
+    let mut data = previous.to_vec();
+    for (start, end, replacement) in normalized {
+        data.splice(start..end, replacement);
+    }
+    Ok(data)
+}
+
+#[cfg(test)]
+mod semantic_token_delta_tests {
+    use super::*;
+
+    fn token(value: u32) -> lsp_types::SemanticToken {
+        lsp_types::SemanticToken {
+            delta_line: value,
+            delta_start: value,
+            length: 1,
+            token_type: value,
+            token_modifiers_bitset: 0,
+        }
+    }
+
+    fn edit(
+        start: u32,
+        delete_count: u32,
+        data: Option<Vec<lsp_types::SemanticToken>>,
+    ) -> lsp_types::SemanticTokensEdit {
+        lsp_types::SemanticTokensEdit {
+            start,
+            delete_count,
+            data,
+        }
+    }
+
+    #[test]
+    fn applies_flat_wire_offsets_in_five_integer_token_units() {
+        let previous = vec![token(1), token(2), token(3)];
+        let edits = vec![edit(5, 5, Some(vec![token(9)]))];
+
+        let updated = apply_semantic_token_edits(&previous, &edits).unwrap();
+
+        assert_eq!(updated, vec![token(1), token(9), token(3)]);
+    }
+
+    #[test]
+    fn supports_insertion_at_the_flat_array_end() {
+        let previous = vec![token(1), token(2)];
+        let edits = vec![edit(10, 0, Some(vec![token(3)]))];
+
+        let updated = apply_semantic_token_edits(&previous, &edits).unwrap();
+
+        assert_eq!(updated, vec![token(1), token(2), token(3)]);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_edits_without_mutating_the_cache() {
+        let previous = vec![token(1), token(2)];
+
+        assert!(apply_semantic_token_edits(&previous, &[edit(15, 0, None)]).is_err());
+        assert!(apply_semantic_token_edits(&previous, &[edit(5, 10, None)]).is_err());
+        assert_eq!(previous, vec![token(1), token(2)]);
+    }
+
+    #[test]
+    fn rejects_non_token_aligned_start_and_delete_count() {
+        let previous = vec![token(1), token(2)];
+
+        assert!(apply_semantic_token_edits(&previous, &[edit(1, 5, None)]).is_err());
+        assert!(apply_semantic_token_edits(&previous, &[edit(5, 1, None)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn eof_during_initialize_fails_without_waiting_for_request_timeout() {
+        let args = vec!["-c".to_string(), "exit 0".to_string()];
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            LspClient::start(
+                "test-server",
+                "sh",
+                &args,
+                "file:///tmp/",
+                "/tmp",
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("disconnect should wake initialize immediately");
+
+        assert!(result.is_err());
     }
 }
 
@@ -2028,24 +2239,39 @@ async fn handle_server_request(
 
     match method {
         "workspace/applyEdit" => {
-            if let Some(params) = msg.get("params") {
-                if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(
-                    params.get("edit").cloned().unwrap_or(Value::Null),
-                ) {
+            let apply_result = match msg
+                .get("params")
+                .and_then(|params| params.get("edit"))
+                .cloned()
+                .ok_or_else(|| "workspace/applyEdit is missing params.edit".to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<lsp_types::WorkspaceEdit>(value)
+                        .map_err(|error| format!("invalid workspace edit: {error}"))
+                }) {
+                Ok(edit) if workspace_edit_has_resource_operations(&edit) => {
+                    Err("resource create/rename/delete operations are not supported".to_string())
+                }
+                Ok(edit) => {
                     let ws_edit = types::from_lsp_workspace_edit(&edit);
-                    let _ = event_tx
+                    event_tx
                         .send(ServerEvent::ApplyEdit {
                             id: id.clone(),
                             edit: ws_edit,
                         })
-                        .await;
+                        .await
+                        .map_err(|_| "editor apply-edit channel is closed".to_string())
                 }
-            }
-            // Respond with applied=true
+                Err(error) => Err(error),
+            };
+
+            let result = match apply_result {
+                Ok(()) => json!({ "applied": true }),
+                Err(reason) => json!({ "applied": false, "failureReason": reason }),
+            };
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "applied": true },
+                "result": result,
             });
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
@@ -2082,6 +2308,54 @@ async fn handle_server_request(
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
         }
+    }
+}
+
+fn workspace_edit_has_resource_operations(edit: &lsp_types::WorkspaceEdit) -> bool {
+    matches!(
+        edit.document_changes,
+        Some(lsp_types::DocumentChanges::Operations(ref operations))
+            if operations.iter().any(|operation| !matches!(
+                operation,
+                lsp_types::DocumentChangeOperation::Edit(_)
+            ))
+    )
+}
+
+#[cfg(test)]
+mod workspace_edit_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_resource_operations_that_the_editor_cannot_apply() {
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [{
+                "kind": "create",
+                "uri": "file:///tmp/new.rs"
+            }]
+        }))
+        .unwrap();
+
+        assert!(workspace_edit_has_resource_operations(&edit));
+    }
+
+    #[test]
+    fn accepts_text_document_edits() {
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [{
+                "textDocument": {"uri": "file:///tmp/main.rs", "version": 1},
+                "edits": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 0}
+                    },
+                    "newText": "fn main() {}"
+                }]
+            }]
+        }))
+        .unwrap();
+
+        assert!(!workspace_edit_has_resource_operations(&edit));
     }
 }
 
@@ -2383,7 +2657,6 @@ fn client_capabilities() -> ClientCapabilities {
                 requests: SemanticTokensClientCapabilitiesRequests {
                     full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                     range: Some(true),
-                    ..Default::default()
                 },
                 token_types: vec![
                     SemanticTokenType::NAMESPACE,

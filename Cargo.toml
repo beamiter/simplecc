@@ -2,6 +2,9 @@
 name = "simplecc"
 version = "0.1.0"
 edition = "2021"
+description = "A Rust-powered Language Server Protocol client for Vim 9"
+repository = "https://github.com/beamiter/simplecc"
+readme = "README.md"
 
 [[bin]]
 name = "simplecc-daemon"
@@ -20,7 +23,6 @@ tar = "0.4"
 zip = "2"
 futures-util = "0.3"
 dirs = "5"
-urlencoding = "2"
 url = "2"
 notify = "8.2"
 

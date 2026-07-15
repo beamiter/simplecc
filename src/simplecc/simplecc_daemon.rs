@@ -382,7 +382,9 @@ impl Request {
     fn preserves_document_order(&self) -> bool {
         matches!(
             self,
-            Self::DidOpen { .. }
+            Self::Initialize { .. }
+                | Self::Shutdown { .. }
+                | Self::DidOpen { .. }
                 | Self::DidChange { .. }
                 | Self::DidSave { .. }
                 | Self::DidClose { .. }
@@ -390,6 +392,10 @@ impl Request {
                 | Self::JuliaRefreshLanguageServer { .. }
                 | Self::ReloadConfiguration { .. }
         )
+    }
+
+    fn is_lifecycle_barrier(&self) -> bool {
+        matches!(self, Self::Initialize { .. } | Self::Shutdown { .. })
     }
 }
 
@@ -423,7 +429,23 @@ async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
 
 fn send_event(tx: &EventTx, event: Value) {
     let s = serde_json::to_string(&event).unwrap();
-    let _ = tx.try_send(s);
+    match tx.try_send(s) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(line)) => {
+            // Preserve request/reply delivery under temporary stdout
+            // backpressure. The cloned sender also keeps the writer alive while
+            // main drains it during shutdown.
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if tx.send(line).await.is_err() {
+                    eprintln!("[simplecc] stdout channel closed before a reply was written");
+                }
+            });
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            eprintln!("[simplecc] stdout channel is closed; reply could not be written");
+        }
+    }
 }
 
 async fn primary_client(
@@ -432,6 +454,32 @@ async fn primary_client(
 ) -> Option<Arc<LspClient>> {
     let registry = registry.read().await;
     registry.as_ref()?.client_for_filetype(language_id)
+}
+
+/// Resolve the active server for a request and always finish the daemon-side
+/// request when none exists. A silent `None` leaves Vim waiting forever for an
+/// id that can never receive a reply (uninitialized registry, unknown
+/// filetype, or a server that has just stopped).
+async fn primary_client_or_error(
+    registry: &Arc<RwLock<Option<Registry>>>,
+    out: &EventTx,
+    id: u64,
+    language_id: &str,
+) -> Option<Arc<LspClient>> {
+    let client = primary_client(registry, language_id).await;
+    if client.is_none() {
+        send_event(
+            out,
+            json!({
+                "type": "error",
+                "id": id,
+                "message": format!(
+                    "no active language server for filetype: {language_id}"
+                ),
+            }),
+        );
+    }
+    client
 }
 
 async fn filetype_clients(
@@ -455,13 +503,14 @@ async fn main() -> Result<()> {
     eprintln!("[simplecc] daemon started");
 
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    tokio::spawn(stdout_writer(out_rx));
+    let mut stdout_task = tokio::spawn(stdout_writer(out_rx));
 
     let registry: Arc<RwLock<Option<Registry>>> = Arc::new(RwLock::new(None));
     let workspace_watcher: Arc<Mutex<Option<WorkspaceWatcher>>> = Arc::new(Mutex::new(None));
     // Track which filetype a URI belongs to
     let uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let mut request_tasks = tokio::task::JoinSet::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.is_empty() {
@@ -480,23 +529,53 @@ async fn main() -> Result<()> {
         let uft = uri_ft.clone();
         let watcher = workspace_watcher.clone();
 
+        // Reap completed feature tasks so a long-running daemon does not retain
+        // their task records until shutdown.
+        while let Some(result) = request_tasks.try_join_next() {
+            if let Err(error) = result {
+                eprintln!("[simplecc] request task failed: {error}");
+            }
+        }
+
         // Document notifications must reach the LSP in input order. Spawning
         // didChange and completion independently lets completion win the race
         // and query stale text.
-        if req.preserves_document_order() {
+        if req.is_lifecycle_barrier() {
+            // Reinitialization and shutdown invalidate every cloned client held
+            // by an in-flight feature request. Cancel those tasks before taking
+            // down the registry so they cannot write after the lifecycle edge.
+            request_tasks.abort_all();
+            while request_tasks.join_next().await.is_some() {}
+            handle_request(req, reg, out, uft, watcher).await;
+        } else if req.preserves_document_order() {
             handle_request(req, reg, out, uft, watcher).await;
         } else {
-            tokio::spawn(async move {
+            request_tasks.spawn(async move {
                 handle_request(req, reg, out, uft, watcher).await;
             });
         }
     }
 
     // Shutdown
+    request_tasks.abort_all();
+    while request_tasks.join_next().await.is_some() {}
     workspace_watcher.lock().await.take();
     let mut registry_to_shutdown = registry.write().await.take();
     if let Some(ref mut reg) = registry_to_shutdown {
         reg.shutdown_all().await;
+    }
+    drop(registry_to_shutdown);
+
+    // The stdout writer owns the actual pipe. Let it drain every queued reply
+    // (especially the shutdown acknowledgement) before the Tokio runtime tears
+    // down spawned tasks at process exit.
+    drop(out_tx);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut stdout_task)
+        .await
+        .is_err()
+    {
+        stdout_task.abort();
+        let _ = stdout_task.await;
     }
 
     eprintln!("[simplecc] daemon exiting");
@@ -516,17 +595,29 @@ async fn handle_request(
             root,
             config_path,
         } => {
-            let cfg = if let Some(ref p) = config_path {
-                let path = std::path::Path::new(p);
-                if path.exists() {
-                    config::Config::load(path)
-                        .unwrap_or_else(|_| config::Config::find_and_load(&root))
-                } else {
-                    config::Config::find_and_load(&root)
+            let cfg = match config::Config::load_selected(&root, config_path.as_deref()) {
+                Ok(config) => config,
+                Err(error) => {
+                    send_event(
+                        &out,
+                        json!({
+                            "type": "error",
+                            "id": id,
+                            "message": format!("failed to load SimpleCC configuration: {error}"),
+                        }),
+                    );
+                    return;
                 }
-            } else {
-                config::Config::find_and_load(&root)
             };
+
+            // A successful reinitialization replaces one complete workspace;
+            // stop its watcher and servers before publishing the new registry.
+            workspace_watcher.lock().await.take();
+            let mut registry_to_shutdown = registry.write().await.take();
+            if let Some(ref mut registry) = registry_to_shutdown {
+                registry.shutdown_all().await;
+            }
+            uri_ft.lock().await.clear();
 
             let reg = Registry::new(cfg, root.clone(), out.clone());
             *registry.write().await = Some(reg);
@@ -550,6 +641,7 @@ async fn handle_request(
             if let Some(ref mut reg) = registry_to_shutdown {
                 reg.shutdown_all().await;
             }
+            uri_ft.lock().await.clear();
             send_event(&out, json!({"type": "shutdown", "id": id}));
         }
 
@@ -681,7 +773,7 @@ async fn handle_request(
             let clients = {
                 let mut registry = registry.write().await;
                 if let Some(ref mut registry) = *registry {
-                    if let Ok(Some(_name)) = registry.ensure_server(&language_id).await {
+                    if let Ok(Some(_name)) = registry.ensure_server(&language_id, &uri).await {
                         registry.clients_for_filetype(&language_id)
                     } else {
                         Vec::new()
@@ -815,7 +907,7 @@ async fn handle_request(
                 uri, language_id, line, character
             );
 
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.hover(&uri, line, character).await {
                     Ok(Some(contents)) => {
@@ -855,7 +947,7 @@ async fn handle_request(
                 uri, language_id, line, character
             );
 
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.definition(&uri, line, character).await {
                     Ok(mut locs) => {
@@ -907,7 +999,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.references(&uri, line, character).await {
                     Ok(locs) => send_event(
@@ -935,7 +1027,7 @@ async fn handle_request(
             let el = end_line.unwrap_or(line);
             let ec = end_character.unwrap_or(character);
 
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c
                     .code_action(&uri, line, character, el, ec, diagnostics)
@@ -958,7 +1050,7 @@ async fn handle_request(
             language_id,
             index,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.execute_code_action(index).await {
                     Ok(Some(edit)) => {
@@ -980,7 +1072,7 @@ async fn handle_request(
             tab_size,
             insert_spaces,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.formatting(&uri, tab_size, insert_spaces).await {
                     Ok(edits) => send_event(
@@ -1003,7 +1095,7 @@ async fn handle_request(
             character,
             new_name,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.rename(&uri, line, character, &new_name).await {
                     Ok(Some(edit)) => {
@@ -1025,7 +1117,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.signature_help(&uri, line, character).await {
                     Ok(Some(sigs)) => send_event(
@@ -1051,7 +1143,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.implementation(&uri, line, character).await {
                     Ok(locs) => send_event(
@@ -1073,7 +1165,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.type_definition(&uri, line, character).await {
                     Ok(locs) => send_event(
@@ -1093,7 +1185,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.document_symbol(&uri).await {
                     Ok(symbols) => send_event(
@@ -1113,7 +1205,7 @@ async fn handle_request(
             language_id,
             query,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.workspace_symbol(&query).await {
                     Ok(symbols) => send_event(
@@ -1135,7 +1227,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.document_highlight(&uri, line, character).await {
                     Ok(highlights) => send_event(
@@ -1157,7 +1249,7 @@ async fn handle_request(
             start_line,
             end_line,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.inlay_hints(&uri, start_line, end_line).await {
                     Ok(hints) => {
@@ -1178,7 +1270,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.call_hierarchy_prepare(&uri, line, character).await {
                     Ok(items) => {
@@ -1214,19 +1306,27 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                if let Ok(lsp_item) = serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
-                    match c.call_hierarchy_incoming(&lsp_item).await {
-                        Ok(calls) => send_event(
+                let lsp_item = match serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        send_event(
                             &out,
-                            json!({"type": "incomingCalls", "id": id, "calls": calls}),
-                        ),
-                        Err(e) => send_event(
-                            &out,
-                            json!({"type": "error", "id": id, "message": e.to_string()}),
-                        ),
+                            json!({"type": "error", "id": id, "message": format!("invalid call hierarchy item: {error}")}),
+                        );
+                        return;
                     }
+                };
+                match c.call_hierarchy_incoming(&lsp_item).await {
+                    Ok(calls) => send_event(
+                        &out,
+                        json!({"type": "incomingCalls", "id": id, "calls": calls}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -1236,19 +1336,27 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                if let Ok(lsp_item) = serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
-                    match c.call_hierarchy_outgoing(&lsp_item).await {
-                        Ok(calls) => send_event(
+                let lsp_item = match serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        send_event(
                             &out,
-                            json!({"type": "outgoingCalls", "id": id, "calls": calls}),
-                        ),
-                        Err(e) => send_event(
-                            &out,
-                            json!({"type": "error", "id": id, "message": e.to_string()}),
-                        ),
+                            json!({"type": "error", "id": id, "message": format!("invalid call hierarchy item: {error}")}),
+                        );
+                        return;
                     }
+                };
+                match c.call_hierarchy_outgoing(&lsp_item).await {
+                    Ok(calls) => send_event(
+                        &out,
+                        json!({"type": "outgoingCalls", "id": id, "calls": calls}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -1259,7 +1367,7 @@ async fn handle_request(
             language_id,
             positions,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 let pos: Vec<(u32, u32)> = positions
                     .iter()
@@ -1288,7 +1396,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.semantic_tokens_full(&uri).await {
                     Ok(tokens) => send_event(
@@ -1308,7 +1416,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.semantic_tokens_full_delta(&uri).await {
                     Ok(tokens) => send_event(
@@ -1332,7 +1440,7 @@ async fn handle_request(
             end_line,
             end_character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c
                     .semantic_tokens_range(
@@ -1361,7 +1469,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.code_lens(&uri).await {
                     Ok(lenses) => send_event(
@@ -1381,7 +1489,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.folding_range(&uri).await {
                     Ok(ranges) => send_event(
@@ -1403,7 +1511,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.linked_editing_range(&uri, line, character).await {
                     Ok(Some(ranges)) => send_event(
@@ -1428,7 +1536,7 @@ async fn handle_request(
             generation,
             index,
         } => {
-            let client = primary_client(&registry, &language_id).await;
+            let client = primary_client_or_error(&registry, &out, id, &language_id).await;
             if let Some(client) = client {
                 let c = client;
                 match c.completion_resolve(generation, index).await {
@@ -1449,7 +1557,7 @@ async fn handle_request(
             language_id,
             index,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.execute_code_lens(index).await {
                     Ok(Some(edit)) => {
@@ -1471,7 +1579,7 @@ async fn handle_request(
             line,
             character,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.type_hierarchy_prepare(&uri, line, character).await {
                     Ok(items) => {
@@ -1507,19 +1615,27 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                if let Ok(lsp_item) = serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
-                    match c.type_hierarchy_supertypes(&lsp_item).await {
-                        Ok(items) => send_event(
+                let lsp_item = match serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        send_event(
                             &out,
-                            json!({"type": "supertypes", "id": id, "items": items}),
-                        ),
-                        Err(e) => send_event(
-                            &out,
-                            json!({"type": "error", "id": id, "message": e.to_string()}),
-                        ),
+                            json!({"type": "error", "id": id, "message": format!("invalid type hierarchy item: {error}")}),
+                        );
+                        return;
                     }
+                };
+                match c.type_hierarchy_supertypes(&lsp_item).await {
+                    Ok(items) => send_event(
+                        &out,
+                        json!({"type": "supertypes", "id": id, "items": items}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -1529,18 +1645,26 @@ async fn handle_request(
             language_id,
             item,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                if let Ok(lsp_item) = serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
-                    match c.type_hierarchy_subtypes(&lsp_item).await {
-                        Ok(items) => {
-                            send_event(&out, json!({"type": "subtypes", "id": id, "items": items}))
-                        }
-                        Err(e) => send_event(
+                let lsp_item = match serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        send_event(
                             &out,
-                            json!({"type": "error", "id": id, "message": e.to_string()}),
-                        ),
+                            json!({"type": "error", "id": id, "message": format!("invalid type hierarchy item: {error}")}),
+                        );
+                        return;
                     }
+                };
+                match c.type_hierarchy_subtypes(&lsp_item).await {
+                    Ok(items) => {
+                        send_event(&out, json!({"type": "subtypes", "id": id, "items": items}))
+                    }
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
                 }
             }
         }
@@ -1550,7 +1674,7 @@ async fn handle_request(
             uri,
             language_id,
         } => {
-            if let Some(client) = primary_client(&registry, &language_id).await {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.pull_diagnostics(&uri).await {
                     Ok(items) => send_event(
@@ -1655,6 +1779,50 @@ mod request_tests {
             env_path: "/tmp/project".to_string(),
         };
         assert!(request.preserves_document_order());
+    }
+
+    #[test]
+    fn initialize_and_shutdown_are_ordered_lifecycle_barriers() {
+        let initialize = Request::Initialize {
+            id: 1,
+            root: "/tmp/project".to_string(),
+            config_path: None,
+        };
+        let shutdown = Request::Shutdown { id: 2 };
+
+        assert!(initialize.preserves_document_order());
+        assert!(initialize.is_lifecycle_barrier());
+        assert!(shutdown.preserves_document_order());
+        assert!(shutdown.is_lifecycle_barrier());
+    }
+
+    #[tokio::test]
+    async fn replies_wait_for_capacity_instead_of_being_dropped() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send("already queued".to_string()).await.unwrap();
+
+        send_event(&tx, json!({"type": "reply", "id": 42}));
+
+        assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
+        let reply = rx.recv().await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], 42);
+    }
+
+    #[tokio::test]
+    async fn missing_primary_client_returns_error_with_request_id() {
+        let registry = Arc::new(RwLock::new(None));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let client = primary_client_or_error(&registry, &tx, 73, "rust").await;
+
+        assert!(client.is_none());
+        let reply: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(reply["type"], "error");
+        assert_eq!(reply["id"], 73);
+        assert!(reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("no active language server"));
     }
 
     #[test]

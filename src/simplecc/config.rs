@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -25,6 +25,10 @@ pub struct ServerConfig {
     /// requests. Nested objects and exact dotted keys are both supported.
     #[serde(default)]
     pub settings: Option<serde_json::Value>,
+    /// Higher values win when more than one server handles the same filetype.
+    /// The server name is used as a stable tie breaker.
+    #[serde(default)]
+    pub priority: i32,
 }
 
 impl ServerConfig {
@@ -117,9 +121,31 @@ const JULIA_LSP_SCRIPT: &str = concat!(
 impl Config {
     /// Load config from a path.
     pub fn load(path: &Path) -> Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read configuration {}", path.display()))?;
+        let config: Config = serde_json::from_str(&content)
+            .with_context(|| format!("invalid JSON in configuration {}", path.display()))?;
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, server) in &self.language_servers {
+            if name.trim().is_empty() {
+                bail!("language server names must not be empty");
+            }
+            if server.command.trim().is_empty() {
+                bail!("language server '{name}' has an empty command");
+            }
+            if server
+                .filetypes
+                .iter()
+                .any(|filetype| filetype.trim().is_empty())
+            {
+                bail!("language server '{name}' contains an empty filetype");
+            }
+        }
+        Ok(())
     }
 
     /// Load the currently selected configuration without hiding parse or I/O
@@ -152,37 +178,27 @@ impl Config {
             .filter(|path| path.exists())
     }
 
-    /// Search for config: project root first, then ~/.config/simplecc/
-    pub fn find_and_load(project_root: &str) -> Config {
-        if let Some(path) = Self::find_path(project_root) {
-            if let Ok(config) = Self::load(&path) {
-                eprintln!("[simplecc] loaded config from {}", path.display());
-                return config;
-            }
-        }
-
-        eprintln!("[simplecc] no config found, using defaults");
-        Config::default()
-    }
-
-    /// Find which server handles a given filetype (returns first match).
+    /// Find the deterministic primary server for a filetype. Higher explicit
+    /// priority wins; names provide a stable tie breaker for legacy configs.
     pub fn server_for_filetype(&self, filetype: &str) -> Option<(&str, &ServerConfig)> {
-        for (name, cfg) in &self.language_servers {
-            if cfg.filetypes.iter().any(|ft| ft == filetype) {
-                return Some((name, cfg));
-            }
-        }
-        None
+        self.servers_for_filetype(filetype).into_iter().next()
     }
 
     /// Find all servers that handle a given filetype.
-    #[allow(dead_code)]
     pub fn servers_for_filetype(&self, filetype: &str) -> Vec<(&str, &ServerConfig)> {
-        self.language_servers
+        let mut servers: Vec<_> = self
+            .language_servers
             .iter()
             .filter(|(_, cfg)| cfg.filetypes.iter().any(|ft| ft == filetype))
             .map(|(name, cfg)| (name.as_str(), cfg))
-            .collect()
+            .collect();
+        servers.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        servers
     }
 }
 
@@ -199,6 +215,7 @@ impl Default for Config {
                 root_patterns: vec!["Cargo.toml".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -211,6 +228,7 @@ impl Default for Config {
                 root_patterns: vec!["compile_commands.json".to_string(), ".clangd".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -223,6 +241,7 @@ impl Default for Config {
                 root_patterns: vec!["pyproject.toml".to_string(), "setup.py".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -240,6 +259,7 @@ impl Default for Config {
                 root_patterns: vec!["package.json".to_string(), "tsconfig.json".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -252,6 +272,7 @@ impl Default for Config {
                 root_patterns: vec![".luarc.json".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -264,6 +285,7 @@ impl Default for Config {
                 root_patterns: vec!["go.mod".to_string()],
                 initialization_options: None,
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -283,6 +305,7 @@ impl Default for Config {
                 root_patterns: vec!["Project.toml".to_string(), "JuliaProject.toml".to_string()],
                 initialization_options: Some(json!({ "useFormatterConfigDefaults": true })),
                 settings: None,
+                priority: 0,
             },
         );
 
@@ -307,6 +330,7 @@ mod tests {
             settings: Some(json!({
                 "julia": { "lint": { "missingrefs": "symbols" } }
             })),
+            priority: 0,
         };
 
         let init = config
@@ -335,5 +359,54 @@ mod tests {
         let result = Config::load_selected("/tmp", path.to_str());
         let _ = std::fs::remove_file(path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_selection_is_stable_and_respects_priority() {
+        let server = |priority| ServerConfig {
+            command: "server".to_string(),
+            args: vec![],
+            filetypes: vec!["rust".to_string()],
+            root_patterns: vec![],
+            initialization_options: None,
+            settings: None,
+            priority,
+        };
+        let config = Config {
+            language_servers: HashMap::from([
+                ("zeta".to_string(), server(0)),
+                ("alpha".to_string(), server(0)),
+                ("preferred".to_string(), server(10)),
+            ]),
+        };
+
+        let ordered: Vec<_> = config
+            .servers_for_filetype("rust")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(ordered, ["preferred", "alpha", "zeta"]);
+        assert_eq!(config.server_for_filetype("rust").unwrap().0, "preferred");
+    }
+
+    #[test]
+    fn configuration_validation_rejects_empty_commands() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simplecc-empty-command-{}-{unique}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"languageServers":{"broken":{"command":" ","filetypes":["rust"]}}}"#,
+        )
+        .unwrap();
+
+        let result = Config::load(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(result.unwrap_err().to_string().contains("empty command"));
     }
 }

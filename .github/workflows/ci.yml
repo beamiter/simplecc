@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --locked --all-targets
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release daemon
+        run: cargo build --release --locked
+
+      - name: Verify installer
+        run: |
+          ./install.sh
+          test -s lib/simplecc-daemon
+          test -x lib/simplecc-daemon
+          cmp -s target/release/simplecc-daemon lib/simplecc-daemon
+
+  vim:
+    name: Vim9
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim-nox
+          vim --version
+
+      - name: Compile Vim9 scripts and help
+        run: |
+          vim -Nu NONE -n -i NONE -es \
+            -c 'let g:simplecc_auto_start=0' \
+            -c "set rtp^=$GITHUB_WORKSPACE" \
+            -c 'runtime plugin/simplecc.vim' \
+            -c 'source autoload/simplecc.vim' \
+            -c 'defcompile' \
+            -c 'helptags doc' \
+            -c 'qa!'
+
+      - name: Run Vim9 smoke tests
+        run: >-
+          vim -Nu NONE -n -i NONE -es
+          -V1/tmp/simplecc-vim-test.log
+          -S test/vim9_smoke.vim

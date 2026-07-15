@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use urlencoding;
 
 /// Simplified completion item sent to Vim.
 #[derive(Debug, Clone, Serialize)]
@@ -417,21 +416,21 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
                     let file_edits: Vec<TextEdit> = edit
                         .edits
                         .iter()
-                        .filter_map(|e| match e {
-                            lsp_types::OneOf::Left(te) => Some(TextEdit {
+                        .map(|e| match e {
+                            lsp_types::OneOf::Left(te) => TextEdit {
                                 line: te.range.start.line,
                                 character: te.range.start.character,
                                 end_line: te.range.end.line,
                                 end_character: te.range.end.character,
                                 new_text: te.new_text.clone(),
-                            }),
-                            lsp_types::OneOf::Right(ate) => Some(TextEdit {
+                            },
+                            lsp_types::OneOf::Right(ate) => TextEdit {
                                 line: ate.text_edit.range.start.line,
                                 character: ate.text_edit.range.start.character,
                                 end_line: ate.text_edit.range.end.line,
                                 end_character: ate.text_edit.range.end.character,
                                 new_text: ate.text_edit.new_text.clone(),
-                            }),
+                            },
                         })
                         .collect();
                     changes.push(FileEdit {
@@ -446,21 +445,21 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
                         let file_edits: Vec<TextEdit> = edit
                             .edits
                             .iter()
-                            .filter_map(|e| match e {
-                                lsp_types::OneOf::Left(te) => Some(TextEdit {
+                            .map(|e| match e {
+                                lsp_types::OneOf::Left(te) => TextEdit {
                                     line: te.range.start.line,
                                     character: te.range.start.character,
                                     end_line: te.range.end.line,
                                     end_character: te.range.end.character,
                                     new_text: te.new_text.clone(),
-                                }),
-                                lsp_types::OneOf::Right(ate) => Some(TextEdit {
+                                },
+                                lsp_types::OneOf::Right(ate) => TextEdit {
                                     line: ate.text_edit.range.start.line,
                                     character: ate.text_edit.range.start.character,
                                     end_line: ate.text_edit.range.end.line,
                                     end_character: ate.text_edit.range.end.character,
                                     new_text: ate.text_edit.new_text.clone(),
-                                }),
+                                },
                             })
                             .collect();
                         changes.push(FileEdit {
@@ -477,13 +476,27 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
 
 /// Decode file:// URI to proper path.
 pub(crate) fn decode_uri(uri: &str) -> String {
-    if let Some(path) = uri.strip_prefix("file://") {
-        // Use urlencoding crate if available, otherwise do basic decoding
-        match urlencoding::decode(path) {
-            Ok(decoded) => decoded.to_string(),
-            Err(_) => path.to_string(),
-        }
-    } else {
-        uri.to_string()
+    url::Url::parse(uri)
+        .ok()
+        .filter(|url| url.scheme() == "file")
+        .and_then(|url| url.to_file_path().ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| uri.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_uri;
+
+    #[test]
+    fn decodes_file_uris_without_losing_unicode_or_reserved_characters() {
+        assert_eq!(
+            decode_uri("file:///tmp/My%20Project/%E4%B8%AD%23%25.rs"),
+            "/tmp/My Project/中#%.rs"
+        );
+        assert_eq!(
+            decode_uri("https://example.com/a%20b"),
+            "https://example.com/a%20b"
+        );
     }
 }

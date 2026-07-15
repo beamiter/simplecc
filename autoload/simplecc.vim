@@ -11,6 +11,11 @@ vim9script
 var s_job: job = null_job
 var s_running: bool = false
 var s_initialized: bool = false
+var s_initializing: bool = false
+var s_stopping: bool = false
+var s_restart_pending: bool = false
+var s_job_generation: number = 0
+var s_initialize_id: number = 0
 var s_next_id: number = 0
 var s_cbs: dict<func> = {}
 var s_root: string = ''
@@ -126,6 +131,33 @@ def IsRunning(): bool
   return s_running && s_job != null_job && job_status(s_job) ==# 'run'
 enddef
 
+def OnBackendExit(generation: number, code: number)
+  # A stopped daemon may exit after a replacement has already started.  Never
+  # let that stale callback reset the replacement job's state.
+  if generation != s_job_generation
+    Log(printf('stale daemon generation %d exited with code %d', generation, code))
+    return
+  endif
+  var restart = s_restart_pending
+  s_restart_pending = false
+  s_running = false
+  s_initialized = false
+  s_initializing = false
+  s_stopping = false
+  s_initialize_id = 0
+  s_job = null_job
+  s_cbs = {}
+  if s_kill_timer > 0
+    timer_stop(s_kill_timer)
+    s_kill_timer = 0
+  endif
+  Log('daemon exited with code ' .. string(code))
+  g:simplecc_status = ''
+  if restart
+    timer_start(0, (_) => Start())
+  endif
+enddef
+
 def EnsureBackend(): bool
   if IsRunning()
     return true
@@ -138,28 +170,25 @@ def EnsureBackend(): bool
     return false
   endif
 
+  s_job_generation += 1
+  var generation = s_job_generation
   try
     s_job = job_start([exe], {
       in_io: 'pipe',
       out_mode: 'nl',
       out_cb: (ch, line) => {
-        OnBackendEvent(line)
+        if generation == s_job_generation
+          OnBackendEvent(line)
+        endif
       },
       err_mode: 'nl',
       err_cb: (ch, line) => {
-        Log('stderr: ' .. line)
+        if generation == s_job_generation
+          Log('stderr: ' .. line)
+        endif
       },
       exit_cb: (ch, code) => {
-        s_running = false
-        s_initialized = false
-        s_job = null_job
-        s_cbs = {}
-        if s_kill_timer > 0
-          timer_stop(s_kill_timer)
-          s_kill_timer = 0
-        endif
-        Log('daemon exited with code ' .. string(code))
-        g:simplecc_status = ''
+        OnBackendExit(generation, code)
       },
       stoponexit: 'term'
     })
@@ -178,6 +207,7 @@ def EnsureBackend(): bool
   endif
 
   s_running = true
+  s_stopping = false
   Log('daemon started')
   return true
 enddef
@@ -249,6 +279,8 @@ def OnBackendEvent(line: string)
 
   if ev.type ==# 'initialized'
     s_initialized = true
+    s_initializing = false
+    s_initialize_id = 0
     g:simplecc_status = 'ready'
     Log('initialized')
     # Open all current buffers
@@ -385,6 +417,16 @@ def OnBackendEvent(line: string)
     Log('[' .. get(ev, 'server', '') .. '] ' .. get(ev, 'message', ''))
 
   elseif ev.type ==# 'error'
+    if id > 0 && id == s_initialize_id
+      s_initializing = false
+      s_initialize_id = 0
+      echohl ErrorMsg
+      echom '[SimpleCC] initialization failed: ' .. get(ev, 'message', 'unknown error')
+      echohl None
+    endif
+    if id > 0 && id == s_comp_id
+      s_comp_requesting = false
+    endif
     if id == s_comp_resolve_id
       if s_comp_resolve_request_key !=# ''
             && has_key(s_comp_resolve_requested, s_comp_resolve_request_key)
@@ -413,10 +455,235 @@ enddef
 # Document sync
 # ═════════════════════════════════════════════════════════
 
-def BufUri(bufnr: number = 0): string
-  var nr = bufnr == 0 ? bufnr('%') : bufnr
-  var name = fnamemodify(bufname(nr), ':p')
-  return 'file://' .. name
+export def ByteOffsetToUtf16(text: string, byte_offset: number): number
+  var target = max([0, min([byte_offset, strlen(text)])])
+  var byte_index = 0
+  var char_index = 0
+  var utf16_offset = 0
+  var char_count = strchars(text)
+  while char_index < char_count
+    var char = strcharpart(text, char_index, 1)
+    var char_bytes = strlen(char)
+    if byte_index + char_bytes > target
+      break
+    endif
+    utf16_offset += char2nr(char) >= 0x10000 ? 2 : 1
+    byte_index += char_bytes
+    char_index += 1
+  endwhile
+  return utf16_offset
+enddef
+
+export def Utf16ToByteOffset(text: string, utf16_offset: number): number
+  var target = max([0, utf16_offset])
+  var byte_offset = 0
+  var utf16_index = 0
+  var char_index = 0
+  var char_count = strchars(text)
+  while char_index < char_count
+    var char = strcharpart(text, char_index, 1)
+    var char_units = char2nr(char) >= 0x10000 ? 2 : 1
+    # A position in the middle of a surrogate pair is invalid LSP input. Clamp
+    # it to the beginning of that codepoint instead of splitting UTF-8 bytes.
+    if utf16_index + char_units > target
+      break
+    endif
+    utf16_index += char_units
+    byte_offset += strlen(char)
+    char_index += 1
+  endwhile
+  return byte_offset
+enddef
+
+def PercentEncodePath(path: string): string
+  var encoded = ''
+  var i = 0
+  # str2list() returns Unicode codepoints under UTF-8, while URI escaping is
+  # defined over the encoded bytes.  Read one byte at a time with strpart().
+  while i < strlen(path)
+    var byte = char2nr(strpart(path, i, 1))
+    if (byte >= char2nr('A') && byte <= char2nr('Z'))
+          || (byte >= char2nr('a') && byte <= char2nr('z'))
+          || (byte >= char2nr('0') && byte <= char2nr('9'))
+          || byte == char2nr('-') || byte == char2nr('.')
+          || byte == char2nr('_') || byte == char2nr('~')
+          || byte == char2nr('/') || byte == char2nr(':')
+      encoded ..= nr2char(byte)
+    else
+      encoded ..= printf('%%%02X', byte)
+    endif
+    i += 1
+  endwhile
+  return encoded
+enddef
+
+def HexNibble(byte: number): number
+  if byte >= char2nr('0') && byte <= char2nr('9')
+    return byte - char2nr('0')
+  endif
+  if byte >= char2nr('A') && byte <= char2nr('F')
+    return byte - char2nr('A') + 10
+  endif
+  if byte >= char2nr('a') && byte <= char2nr('f')
+    return byte - char2nr('a') + 10
+  endif
+  return -1
+enddef
+
+def DecodeUtf8Bytes(bytes: list<number>): string
+  var decoded = ''
+  var i = 0
+  while i < len(bytes)
+    var first = bytes[i]
+    if first < 0x80
+      decoded ..= nr2char(first)
+      i += 1
+      continue
+    endif
+
+    var width = 0
+    var codepoint = 0
+    var minimum = 0
+    if first >= 0xC2 && first <= 0xDF
+      width = 2
+      codepoint = and(first, 0x1F)
+      minimum = 0x80
+    elseif first >= 0xE0 && first <= 0xEF
+      width = 3
+      codepoint = and(first, 0x0F)
+      minimum = 0x800
+    elseif first >= 0xF0 && first <= 0xF4
+      width = 4
+      codepoint = and(first, 0x07)
+      minimum = 0x10000
+    else
+      decoded ..= nr2char(0xFFFD)
+      i += 1
+      continue
+    endif
+
+    if i + width > len(bytes)
+      decoded ..= nr2char(0xFFFD)
+      i += 1
+      continue
+    endif
+    var valid = true
+    for offset in range(1, width - 1)
+      var continuation = bytes[i + offset]
+      if continuation < 0x80 || continuation > 0xBF
+        valid = false
+        break
+      endif
+      codepoint = codepoint * 64 + and(continuation, 0x3F)
+    endfor
+    if !valid || codepoint < minimum || codepoint > 0x10FFFF
+          || (codepoint >= 0xD800 && codepoint <= 0xDFFF)
+      decoded ..= nr2char(0xFFFD)
+      i += 1
+      continue
+    endif
+    decoded ..= nr2char(codepoint)
+    i += width
+  endwhile
+  return decoded
+enddef
+
+def PercentDecodePath(encoded: string): string
+  var bytes: list<number> = []
+  var i = 0
+  while i < strlen(encoded)
+    var byte = char2nr(strpart(encoded, i, 1))
+    if byte == char2nr('%') && i + 2 < strlen(encoded)
+      var high = HexNibble(char2nr(strpart(encoded, i + 1, 1)))
+      var low = HexNibble(char2nr(strpart(encoded, i + 2, 1)))
+      if high >= 0 && low >= 0
+        add(bytes, high * 16 + low)
+        i += 3
+        continue
+      endif
+    endif
+    add(bytes, byte)
+    i += 1
+  endwhile
+  return DecodeUtf8Bytes(bytes)
+enddef
+
+export def PathToUri(path: string): string
+  if path ==# ''
+    return 'file://'
+  endif
+  var absolute = fnamemodify(path, ':p')
+  if has('win32') || has('win64')
+    absolute = substitute(absolute, '\\', '/', 'g')
+    if absolute =~# '^\a:/'
+      absolute = '/' .. absolute
+    endif
+  endif
+  if absolute =~# '^//[^/]'
+    return 'file://' .. PercentEncodePath(strpart(absolute, 2))
+  endif
+  return 'file://' .. PercentEncodePath(absolute)
+enddef
+
+export def UriToPath(uri: string): string
+  # Some daemon events intentionally carry an already-decoded filesystem path.
+  if uri !~? '^file://'
+    return uri
+  endif
+  var encoded = strpart(uri, strlen('file://'))
+  if encoded =~? '^localhost/'
+    encoded = strpart(encoded, strlen('localhost'))
+  elseif encoded !=# '' && strpart(encoded, 0, 1) !=# '/'
+    # Preserve a non-local URI authority as a UNC-style path.
+    encoded = '//' .. encoded
+  endif
+  var path = PercentDecodePath(encoded)
+  if (has('win32') || has('win64')) && path =~# '^/\a:/'
+    path = strpart(path, 1)
+  endif
+  return path
+enddef
+
+def BufUri(buffer: number = 0): string
+  var nr = buffer == 0 ? bufnr('%') : buffer
+  return PathToUri(bufname(nr))
+enddef
+
+def CursorUtf16(): number
+  return ByteOffsetToUtf16(getline('.'), col('.') - 1)
+enddef
+
+def Utf16LineColumn(line_text: string, utf16_offset: number): number
+  return Utf16ToByteOffset(line_text, utf16_offset) + 1
+enddef
+
+def Utf16EndCursorColumn(line_text: string, utf16_offset: number): number
+  var end_byte = Utf16ToByteOffset(line_text, utf16_offset)
+  if end_byte <= 0
+    return 1
+  endif
+  var prefix = strpart(line_text, 0, end_byte)
+  var last_char = strcharpart(prefix, strchars(prefix) - 1, 1)
+  return end_byte - strlen(last_char) + 1
+enddef
+
+def PathLine(path: string, lnum: number): string
+  if path ==# '' || lnum <= 0
+    return ''
+  endif
+  var bnr = bufnr(path)
+  if bnr >= 0 && bufloaded(bnr)
+    return get(getbufline(bnr, lnum), 0, '')
+  endif
+  if filereadable(path)
+    return get(readfile(path, '', lnum), lnum - 1, '')
+  endif
+  return ''
+enddef
+
+def UriUtf16Column(uri: string, lnum: number, utf16_offset: number): number
+  var path = UriToPath(uri)
+  return Utf16LineColumn(PathLine(path, lnum), utf16_offset)
 enddef
 
 def BufFt(bufnr: number = 0): string
@@ -587,17 +854,16 @@ export def OnBufSave()
   endif
 enddef
 
-export def OnBufClose()
-  if !s_initialized
-    return
-  endif
-  var bnr = bufnr('%')
+export def OnBufClose(buffer: number = 0)
+  var bnr = buffer > 0 ? buffer : bufnr('%')
   var uri = BufUri(bnr)
+  UnregisterListener(bnr)
   if uri ==# 'file://'
     return
   endif
-  UnregisterListener(bnr)
-  Send({type: 'textDocument/didClose', id: NextId(), uri: uri})
+  if s_initialized && has_key(s_doc_versions, uri)
+    Send({type: 'textDocument/didClose', id: NextId(), uri: uri})
+  endif
   if has_key(s_doc_versions, uri)
     remove(s_doc_versions, uri)
   endif
@@ -838,11 +1104,16 @@ export def SelectTabKey(): string
   if pumvisible()
     # Menu is open, navigate/select in menu
     return "\<C-n>"
-  else
-    # Menu is closed, trigger completion
-    TriggerCompletionManual()
-    return ""
   endif
+  var byte_col = col('.') - 1
+  var before = strpart(getline('.'), 0, byte_col)
+  if !s_initialized || BufFt() ==# '' || byte_col <= 0
+        || before ==# '' || before =~# '\s$'
+    return "\<Tab>"
+  endif
+  # Menu is closed and the cursor is in a completion context.
+  TriggerCompletionManual()
+  return ''
 enddef
 
 export def SelectShiftTabKey(): string
@@ -850,7 +1121,7 @@ export def SelectShiftTabKey(): string
     # Menu is open, move to previous item
     return "\<C-p>"
   else
-    return ""
+    return "\<S-Tab>"
   endif
 enddef
 
@@ -937,7 +1208,7 @@ def RequestCompletion(manual: bool = false)
 
   var uri = BufUri()
   var lnum = line('.') - 1
-  var cchar = ccol - 1
+  var cchar = ByteOffsetToUtf16(line_text, ccol - 1)
 
   var id = NextId()
   s_comp_id = id
@@ -1081,7 +1352,7 @@ export def Hover()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -1130,7 +1401,7 @@ export def Definition()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
     symbol: expand('<cword>'),
   })
 enddef
@@ -1166,7 +1437,7 @@ export def References()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -1192,7 +1463,7 @@ export def CodeAction()
 
   var id = NextId()
   var lnum = line('.') - 1
-  var cchar = col('.') - 1
+  var cchar = CursorUtf16()
   Send({
     type: 'textDocument/codeAction',
     id: id,
@@ -1323,7 +1594,7 @@ export def Rename()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
     newName: new_name,
   })
 enddef
@@ -1344,7 +1615,7 @@ export def SignatureHelp()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -1410,7 +1681,7 @@ enddef
 
 def DisplayDiagnostics(uri: string)
   # Find buffer
-  var fpath = substitute(uri, '^file://', '', '')
+  var fpath = UriToPath(uri)
   var bufnr = bufnr(fpath)
   if bufnr < 0
     return
@@ -1480,9 +1751,11 @@ def UpdateDiagHighlights(bufnr: number, items: list<dict<any>>)
     endif
 
     var sl = get(item, 'line', 0) + 1
-    var sc = get(item, 'character', 0) + 1
     var el = get(item, 'end_line', get(item, 'line', 0)) + 1
-    var ec = get(item, 'end_character', 0) + 1
+    var start_line = get(getbufline(bufnr, sl), 0, '')
+    var end_line = get(getbufline(bufnr, el), 0, '')
+    var sc = Utf16LineColumn(start_line, get(item, 'character', 0))
+    var ec = Utf16LineColumn(end_line, get(item, 'end_character', 0))
     if sl > 0 && sc > 0 && el > 0 && ec > 0
       try
         if sl == el
@@ -1505,7 +1778,7 @@ export def DiagList()
   endif
 
   var qf_items: list<dict<any>> = []
-  var fpath = substitute(uri, '^file://', '', '')
+  var fpath = UriToPath(uri)
   for item in items
     var sev_text = 'I'
     var sev = get(item, 'severity', 3)
@@ -1519,7 +1792,8 @@ export def DiagList()
     add(qf_items, {
       filename: fpath,
       lnum: get(item, 'line', 0) + 1,
-      col: get(item, 'character', 0) + 1,
+      col: Utf16LineColumn(
+          getline(get(item, 'line', 0) + 1), get(item, 'character', 0)),
       text: get(item, 'message', ''),
       type: sev_text,
     })
@@ -1540,14 +1814,16 @@ export def DiagNext()
   var cur_line = line('.') - 1
   for item in sort(copy(items), (a, b) => a.line - b.line)
     if item.line > cur_line
-      cursor(item.line + 1, item.character + 1)
+      cursor(item.line + 1,
+          Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
       echo DiagMessage(item)
       return
     endif
   endfor
   # Wrap around
   var first = items[0]
-  cursor(first.line + 1, first.character + 1)
+  cursor(first.line + 1,
+      Utf16LineColumn(getline(first.line + 1), get(first, 'character', 0)))
   echo DiagMessage(first)
 enddef
 
@@ -1563,14 +1839,16 @@ export def DiagPrev()
   var sorted = sort(copy(items), (a, b) => b.line - a.line)
   for item in sorted
     if item.line < cur_line
-      cursor(item.line + 1, item.character + 1)
+      cursor(item.line + 1,
+          Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
       echo DiagMessage(item)
       return
     endif
   endfor
   # Wrap around
   var last = sorted[0]
-  cursor(last.line + 1, last.character + 1)
+  cursor(last.line + 1,
+      Utf16LineColumn(getline(last.line + 1), get(last, 'character', 0)))
   echo DiagMessage(last)
 enddef
 
@@ -1641,7 +1919,7 @@ def OnApplyEdit(ev: dict<any>)
   for file_edit in changes
     var uri = get(file_edit, 'uri', '')
     var edits = get(file_edit, 'edits', [])
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     var bnr = bufnr(fpath)
 
     if bnr < 0
@@ -1659,37 +1937,7 @@ def OnApplyEdit(ev: dict<any>)
   echo printf('Applied %d edits across %d files', total_edits, len(changes))
 enddef
 
-def Utf16ToCharOffset(line: string, utf16_offset: number): number
-  # Convert UTF-16 code unit offset to character offset
-  if utf16_offset <= 0
-    return 0
-  endif
-
-  var utf16_count = 0
-  var char_count = 0
-
-  for char_idx in range(strchars(line))
-    if utf16_count >= utf16_offset
-      break
-    endif
-
-    var char = strcharpart(line, char_idx, 1)
-    var codepoint = char2nr(char)
-
-    # Codepoints >= U+10000 require 2 UTF-16 code units (surrogate pair)
-    if codepoint >= 0x10000
-      utf16_count += 2
-    else
-      utf16_count += 1
-    endif
-
-    char_count = char_idx + 1
-  endfor
-
-  return char_count
-enddef
-
-def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
+export def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
   # Sort edits in reverse order to avoid offset issues
   var sorted = sort(copy(edits), (a, b) => {
     if a.line != b.line
@@ -1714,29 +1962,28 @@ def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
       continue
     endif
 
-    # Convert UTF-16 offsets to character offsets (for Vim string slicing)
+    # LSP columns are UTF-16 code units; Vim buffer APIs and strpart() use bytes.
     var start_offset = get(edit, 'character', 0)
     var end_offset = get(edit, 'end_character', 0)
 
-    var sc = Utf16ToCharOffset(lines[0], start_offset)
-    var ec = Utf16ToCharOffset(lines[-1], end_offset)
+    var sc = Utf16ToByteOffset(lines[0], start_offset)
+    var ec = Utf16ToByteOffset(lines[-1], end_offset)
 
     # Build the replacement
-    # sc and ec are now 0-based character offsets
-    var prefix = sc > 0 ? lines[0][: sc - 1] : ''
-    var suffix = ec > 0 && ec < strchars(lines[-1]) ? lines[-1][ec :] : (ec == 0 ? lines[-1] : '')
+    var prefix = strpart(lines[0], 0, sc)
+    var suffix = strpart(lines[-1], ec)
 
     new_lines[0] = prefix .. new_lines[0]
     new_lines[-1] = new_lines[-1] .. suffix
 
-    # Replace lines in buffer
-    if el >= sl
-      deletebufline(bufnr, sl, el)
+    # Keep one line in place so an empty replacement does not accidentally
+    # delete the entire logical line.
+    setbufline(bufnr, sl, new_lines[0])
+    if el > sl
+      deletebufline(bufnr, sl + 1, el)
     endif
-    if empty(new_lines) || (len(new_lines) == 1 && new_lines[0] ==# '')
-      # Delete only
-    else
-      appendbufline(bufnr, sl - 1, new_lines)
+    if len(new_lines) > 1
+      appendbufline(bufnr, sl, new_lines[1 :])
     endif
   endfor
 enddef
@@ -1748,8 +1995,7 @@ enddef
 def JumpToLocation(loc: dict<any>)
   var uri = get(loc, 'uri', '')
   var lnum = get(loc, 'line', 0) + 1
-  var cchar = get(loc, 'character', 0) + 1
-  var fpath = substitute(uri, '^file://', '', '')
+  var fpath = UriToPath(uri)
 
   # Push to tagstack
   var cur_item = {'bufnr': bufnr('%'), 'from': getpos('.'), 'tagname': expand('<cword>')}
@@ -1761,7 +2007,7 @@ def JumpToLocation(loc: dict<any>)
   if fpath !=# expand('%:p')
     execute 'edit ' .. fnameescape(fpath)
   endif
-  cursor(lnum, cchar)
+  cursor(lnum, Utf16LineColumn(getline(lnum), get(loc, 'character', 0)))
   normal! zz
 enddef
 
@@ -1769,11 +2015,12 @@ def LocationsToQuickfix(locs: list<dict<any>>, title: string)
   var qf_items: list<dict<any>> = []
   for loc in locs
     var uri = get(loc, 'uri', '')
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     add(qf_items, {
       filename: fpath,
       lnum: get(loc, 'line', 0) + 1,
-      col: get(loc, 'character', 0) + 1,
+      col: UriUtf16Column(uri, get(loc, 'line', 0) + 1,
+          get(loc, 'character', 0)),
       text: title,
     })
   endfor
@@ -1827,6 +2074,14 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 export def Start()
+  if s_initialized || s_initializing
+    Log('Start: already initialized or initializing')
+    return
+  endif
+  if s_stopping
+    Log('Start: daemon is stopping')
+    return
+  endif
   if !EnsureBackend()
     return
   endif
@@ -1839,7 +2094,10 @@ export def Start()
   Log('project root: ' .. s_root)
 
   var id = NextId()
-  var config_path = get(g:, 'simplecc_config_path', '')
+  s_initialize_id = id
+  s_initializing = true
+  var configured = get(g:, 'simplecc_config_path', '')
+  var config_path = configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
   Send({
     type: 'initialize',
     id: id,
@@ -1848,35 +2106,47 @@ export def Start()
   })
 enddef
 
-export def Stop()
-  if !IsRunning()
+export def Stop(restarting: bool = false)
+  # A manual stop cancels a queued restart; Restart() keeps the intent until
+  # the exact daemon generation has really exited.
+  s_restart_pending = restarting
+  if !IsRunning() || s_stopping
     return
   endif
+  s_stopping = true
+  s_initialized = false
+  s_initializing = false
+  s_initialize_id = 0
+  g:simplecc_status = 'stopping'
+  var generation = s_job_generation
+  var job_to_stop = s_job
   Send({type: 'shutdown', id: NextId()})
   timer_start(500, (_) => {
-    if s_job != null_job
-      job_stop(s_job)
+    if generation != s_job_generation
+      return
+    endif
+    if job_to_stop != null_job && job_status(job_to_stop) ==# 'run'
+      job_stop(job_to_stop)
       # Force kill if still running after 3 seconds
-      s_kill_timer = timer_start(3000, (_) => {
-        s_kill_timer = 0
-        if s_job != null_job && job_status(s_job) ==# 'run'
-          job_stop(s_job, 'kill')
+      s_kill_timer = timer_start(3000, (timer) => {
+        if s_kill_timer == timer
+          s_kill_timer = 0
+        endif
+        if generation != s_job_generation
+          return
+        endif
+        if job_to_stop != null_job && job_status(job_to_stop) ==# 'run'
+          job_stop(job_to_stop, 'kill')
           Log('daemon force-killed')
         endif
       })
     endif
-    s_running = false
-    s_initialized = false
-    g:simplecc_status = ''
   })
 enddef
 
 export def Restart()
-  if IsRunning()
-    Stop()
-    timer_start(1000, (_) => {
-      Start()
-    })
+  if IsRunning() || s_stopping
+    Stop(true)
   else
     Start()
   endif
@@ -2006,7 +2276,7 @@ export def Implementation()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -2039,7 +2309,7 @@ export def TypeDefinition()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -2093,7 +2363,8 @@ def FlattenSymbols(symbols: list<any>, items: list<dict<any>>, depth: number)
     add(items, {
       filename: expand('%:p'),
       lnum: get(s, 'line', 0) + 1,
-      col: get(s, 'character', 0) + 1,
+      col: Utf16LineColumn(getline(get(s, 'line', 0) + 1),
+          get(s, 'character', 0)),
       text: printf('%s[%s] %s', indent, kind, name),
     })
     var children = get(s, 'children', [])
@@ -2142,11 +2413,12 @@ def OnWorkspaceSymbol(ev: dict<any>)
   var qf_items: list<dict<any>> = []
   for s in symbols
     var uri = get(s, 'detail', '')
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     add(qf_items, {
       filename: fpath,
       lnum: get(s, 'line', 0) + 1,
-      col: get(s, 'character', 0) + 1,
+      col: UriUtf16Column(uri, get(s, 'line', 0) + 1,
+          get(s, 'character', 0)),
       text: printf('[%s] %s', get(s, 'kind', ''), get(s, 'name', '')),
     })
   endfor
@@ -2170,7 +2442,7 @@ export def DocumentHighlight()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
 enddef
 
@@ -2199,9 +2471,9 @@ def OnDocumentHighlightResult(ev: dict<any>)
       hl_group = 'SimpleCCDocHighlightWrite'
     endif
     var sl = get(h, 'line', 0) + 1
-    var sc = get(h, 'character', 0) + 1
     var el = get(h, 'end_line', 0) + 1
-    var ec = get(h, 'end_character', 0) + 1
+    var sc = Utf16LineColumn(getline(sl), get(h, 'character', 0))
+    var ec = Utf16LineColumn(getline(el), get(h, 'end_character', 0))
     try
       var mid = matchadd(hl_group, '\%' .. sl .. 'l\%' .. sc .. 'c\_.*\%' .. el .. 'l\%' .. ec .. 'c')
       add(s_dochighlight_ids, mid)
@@ -2288,14 +2560,17 @@ def ApplyInlayHints(hints: list<any>, bnr: number)
     prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
   endtry
+  var info = getbufinfo(bnr)
+  var line_count = empty(info) ? 0 : info[0].linecount
   for h in hints
     var lnum = get(h, 'line', 0) + 1
-    var col = get(h, 'character', 0) + 1
+    var line_text = get(getbufline(bnr, lnum), 0, '')
+    var col = Utf16LineColumn(line_text, get(h, 'character', 0))
     var label = get(h, 'label', '')
     var pad_l = get(h, 'padding_left', false)
     var pad_r = get(h, 'padding_right', false)
     var text = (pad_l ? ' ' : '') .. label .. (pad_r ? ' ' : '')
-    if lnum > 0 && lnum <= line('$')
+    if lnum > 0 && lnum <= line_count
       try
         prop_add(lnum, col, {type: 'SimpleCCInlay', text: text, bufnr: bnr})
       catch
@@ -2344,7 +2619,7 @@ export def IncomingCalls()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
   # Store direction for when prepare result arrives
   b:simplecc_call_direction = 'incoming'
@@ -2362,7 +2637,7 @@ export def OutgoingCalls()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
   b:simplecc_call_direction = 'outgoing'
 enddef
@@ -2396,11 +2671,12 @@ def OnIncomingCallsResult(ev: dict<any>)
   for c in calls
     var item = get(c, 'item', {})
     var uri = get(item, 'uri', '')
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     add(qf_items, {
       filename: fpath,
       lnum: get(item, 'line', 0) + 1,
-      col: get(item, 'character', 0) + 1,
+      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
+          get(item, 'character', 0)),
       text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
     })
   endfor
@@ -2418,11 +2694,12 @@ def OnOutgoingCallsResult(ev: dict<any>)
   for c in calls
     var item = get(c, 'item', {})
     var uri = get(item, 'uri', '')
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     add(qf_items, {
       filename: fpath,
       lnum: get(item, 'line', 0) + 1,
-      col: get(item, 'character', 0) + 1,
+      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
+          get(item, 'character', 0)),
       text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
     })
   endfor
@@ -2447,7 +2724,7 @@ export def SelectionExpand()
       id: NextId(),
       uri: BufUri(),
       languageId: BufFt(),
-      positions: [{line: line('.') - 1, character: col('.') - 1}],
+      positions: [{line: line('.') - 1, character: CursorUtf16()}],
     })
     return
   endif
@@ -2492,9 +2769,16 @@ def ApplySelectionRange()
   endif
   var r = s_selection_ranges[s_selection_idx]
   var sl = get(r, 'line', 0) + 1
-  var sc = get(r, 'character', 0) + 1
+  var sc = Utf16LineColumn(getline(sl), get(r, 'character', 0))
   var el = get(r, 'end_line', 0) + 1
-  var ec = get(r, 'end_character', 0)
+  var end_utf16 = get(r, 'end_character', 0)
+  var ends_at_next_line_start = el > sl && end_utf16 == 0
+  if ends_at_next_line_start
+    el -= 1
+  endif
+  var effective_end = ends_at_next_line_start
+      ? ByteOffsetToUtf16(getline(el), strlen(getline(el))) : end_utf16
+  var ec = Utf16EndCursorColumn(getline(el), effective_end)
   normal! v
   cursor(sl, sc)
   normal! o
@@ -2662,8 +2946,13 @@ def OnSemanticTokens(ev: dict<any>)
 
   for t in tokens
     var lnum = get(t, 'line', 0) + 1
-    var col = get(t, 'start', 0) + 1
-    var length = get(t, 'length', 0)
+    var line_text = getline(lnum)
+    var start_utf16 = get(t, 'start', 0)
+    var end_utf16 = start_utf16 + get(t, 'length', 0)
+    var start_byte = Utf16ToByteOffset(line_text, start_utf16)
+    var end_byte = Utf16ToByteOffset(line_text, end_utf16)
+    var col = start_byte + 1
+    var length = max([0, end_byte - start_byte])
     var ttype = get(t, 'token_type', '')
     var mods: list<any> = get(t, 'modifiers', [])
     var resolved = ResolveSemanticHighlight(ttype, mods)
@@ -2862,17 +3151,24 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
-  if !g:simplecc_virtual_diag
+  var prop_types = [
+    ['SimpleCCVirtualDiagErrorProp', 'SimpleCCVirtualDiagError'],
+    ['SimpleCCVirtualDiagWarnProp', 'SimpleCCVirtualDiagWarn'],
+  ]
+  for [ptype, highlight] in prop_types
+    try
+      prop_type_add(ptype, {bufnr: bufnr, highlight: highlight})
+    catch
+    endtry
+    try
+      prop_remove({type: ptype, bufnr: bufnr, all: true})
+    catch
+    endtry
+  endfor
+  var max_per_line = max([0, get(g:, 'simplecc_diag_max_per_line', 3)])
+  if !g:simplecc_virtual_diag || max_per_line == 0
     return
   endif
-  try
-    prop_type_add('SimpleCCVirtualDiag', {bufnr: bufnr, highlight: 'SimpleCCVirtualDiagError'})
-  catch
-  endtry
-  try
-    prop_remove({type: 'SimpleCCVirtualDiag', bufnr: bufnr, all: true})
-  catch
-  endtry
   # Group diagnostics by line, sorted by severity
   var line_diags: dict<list<dict<any>>> = {}
   for item in items
@@ -2883,7 +3179,8 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     endif
     add(line_diags[key], item)
   endfor
-  var max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
+  var info = getbufinfo(bufnr)
+  var line_count = empty(info) ? 0 : info[0].linecount
   for [key, diags] in items(line_diags)
     var lnum = str2nr(key)
     # Sort by severity (error first)
@@ -2892,8 +3189,8 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     var msgs: list<string> = []
     for d in shown
       var msg = substitute(get(d, 'message', ''), "\n", ' ', 'g')
-      if len(msg) > 60
-        msg = msg[: 57] .. '...'
+      if strchars(msg) > 60
+        msg = strcharpart(msg, 0, 57) .. '...'
       endif
       add(msgs, msg)
     endfor
@@ -2901,14 +3198,12 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
       add(msgs, printf('+%d more', len(diags) - max_per_line))
     endif
     var best_sev = get(shown[0], 'severity', 3)
-    var hl = best_sev <= 1 ? 'SimpleCCVirtualDiagError' : 'SimpleCCVirtualDiagWarn'
-    try
-      prop_type_add('SimpleCCVirtualDiag', {bufnr: bufnr, highlight: hl})
-    catch
-    endtry
-    if lnum > 0 && lnum <= getbufinfo(bufnr)[0].linecount
+    var ptype = best_sev <= 1
+        ? 'SimpleCCVirtualDiagErrorProp' : 'SimpleCCVirtualDiagWarnProp'
+    if lnum > 0 && lnum <= line_count
       try
-        prop_add(lnum, 0, {type: 'SimpleCCVirtualDiag', text: '  ' .. join(msgs, ' | '), text_align: 'after', bufnr: bufnr})
+        prop_add(lnum, 0, {type: ptype, text: '  ' .. join(msgs, ' | '),
+            text_align: 'after', bufnr: bufnr})
       catch
       endtry
     endif
@@ -2976,7 +3271,8 @@ export def InstallServer(name: string = '')
 
   var server = name
   if server ==# ''
-    var servers = ['rust-analyzer', 'clangd', 'pyright', 'lua-language-server', 'gopls', 'julia-lsp']
+    var servers = ['rust-analyzer', 'clangd', 'pyright', 'typescript-language-server',
+        'lua-language-server', 'gopls', 'julia-lsp']
     popup_menu(servers, {
       title: ' Install Language Server ',
       border: [1, 1, 1, 1],
@@ -3169,7 +3465,7 @@ export def Supertypes()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
   b:simplecc_type_direction = 'supertypes'
 enddef
@@ -3186,7 +3482,7 @@ export def Subtypes()
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
-    character: col('.') - 1,
+    character: CursorUtf16(),
   })
   b:simplecc_type_direction = 'subtypes'
 enddef
@@ -3232,11 +3528,12 @@ def TypeHierarchyToQuickfix(items: list<any>, title: string)
   var qf_items: list<dict<any>> = []
   for item in items
     var uri = get(item, 'uri', '')
-    var fpath = substitute(uri, '^file://', '', '')
+    var fpath = UriToPath(uri)
     add(qf_items, {
       filename: fpath,
       lnum: get(item, 'line', 0) + 1,
-      col: get(item, 'character', 0) + 1,
+      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
+          get(item, 'character', 0)),
       text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
     })
   endfor
@@ -3291,10 +3588,11 @@ def WsSymbolFilter(id: number, key: string): bool
         popup_close(id, sel)
         var item = s_ws_results[sel]
         var uri = get(item, 'detail', get(item, 'uri', ''))
-        var fpath = substitute(uri, '^file://', '', '')
+        var fpath = UriToPath(uri)
         if fpath !=# '' && filereadable(fpath)
-          execute 'edit ' .. fpath
-          cursor(get(item, 'line', 0) + 1, get(item, 'character', 0) + 1)
+          execute 'edit ' .. fnameescape(fpath)
+          var lnum = get(item, 'line', 0) + 1
+          cursor(lnum, Utf16LineColumn(getline(lnum), get(item, 'character', 0)))
           normal! zz
         endif
       endif
@@ -3338,7 +3636,7 @@ def UpdateWsResults()
     var kind = get(item, 'kind', '')
     var name = get(item, 'name', '')
     var detail = get(item, 'detail', '')
-    var fpath = substitute(detail, '^file://', '', '')
+    var fpath = UriToPath(detail)
     var short = fnamemodify(fpath, ':t')
     add(lines, printf('  [%s] %s  %s', kind, name, short))
   endfor
@@ -3404,8 +3702,8 @@ def ApplyCompletionTextEdit(edit: dict<any>): bool
   endif
 
   var start_offset = get(edit, 'character', 0)
-  var start_chars = Utf16ToCharOffset(s_comp_original_line, start_offset)
-  var prefix = strcharpart(s_comp_original_line, 0, start_chars)
+  var start_byte = Utf16ToByteOffset(s_comp_original_line, start_offset)
+  var prefix = strpart(s_comp_original_line, 0, start_byte)
   var new_text = get(edit, 'new_text', '')
   var new_lines = split(new_text, "\n", true)
   if empty(new_lines)

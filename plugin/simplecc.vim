@@ -85,41 +85,63 @@ command! -nargs=? -complete=custom,SimpleCCInstallComplete SimpleCCInstall simpl
 command! -nargs=0 SimpleCCServers       simplecc#ListServers()
 
 def SimpleCCInstallComplete(arglead: string, cmdline: string, cursorpos: number): string
-  return "rust-analyzer\nclangd\npyright\nlua-language-server\ngopls\njulia-lsp"
+  return "rust-analyzer\nclangd\npyright\ntypescript-language-server\nlua-language-server\ngopls\njulia-lsp"
 enddef
 
 # ─── Keymaps ──────────────────────────────────────────────
+# Stable <Plug> targets let users opt into individual actions without coupling
+# their configuration to command names.
+nnoremap <silent> <Plug>(simplecc-definition) <Cmd>SimpleCCDefinition<CR>
+nnoremap <silent> <Plug>(simplecc-references) <Cmd>SimpleCCReferences<CR>
+nnoremap <silent> <Plug>(simplecc-hover) <Cmd>SimpleCCHover<CR>
+nnoremap <silent> <Plug>(simplecc-rename) <Cmd>SimpleCCRename<CR>
+nnoremap <silent> <Plug>(simplecc-code-action) <Cmd>SimpleCCAction<CR>
+nnoremap <silent> <Plug>(simplecc-format) <Cmd>SimpleCCFormat<CR>
+nnoremap <silent> <Plug>(simplecc-prev-diagnostic) <Cmd>SimpleCCPrevDiag<CR>
+nnoremap <silent> <Plug>(simplecc-next-diagnostic) <Cmd>SimpleCCNextDiag<CR>
+nnoremap <silent> <Plug>(simplecc-implementation) <Cmd>SimpleCCImplementation<CR>
+nnoremap <silent> <Plug>(simplecc-type-definition) <Cmd>SimpleCCTypeDef<CR>
+nnoremap <silent> <Plug>(simplecc-outline) <Cmd>SimpleCCOutline<CR>
+nnoremap <silent> <Plug>(simplecc-inlay-hints) <Cmd>SimpleCCInlayHints<CR>
+inoremap <silent> <expr> <Plug>(simplecc-select-tab) simplecc#SelectTabKey()
+inoremap <silent> <expr> <Plug>(simplecc-select-shift-tab) simplecc#SelectShiftTabKey()
+inoremap <silent> <expr> <Plug>(simplecc-select-down) simplecc#SelectDownKey()
+inoremap <silent> <expr> <Plug>(simplecc-select-up) simplecc#SelectUpKey()
+inoremap <silent> <expr> <Plug>(simplecc-select-enter) simplecc#SelectEnterKey()
+
 if !g:simplecc_no_default_maps
-  nnoremap <silent> gd         :SimpleCCDefinition<CR>
-  nnoremap <silent> gr         :SimpleCCReferences<CR>
-  nnoremap <silent> K          :SimpleCCHover<CR>
-  nnoremap <silent> <leader>rn :SimpleCCRename<CR>
-  nnoremap <silent> <leader>ca :SimpleCCAction<CR>
-  nnoremap <silent> <leader>f  :SimpleCCFormat<CR>
-  nnoremap <silent> [d         :SimpleCCPrevDiag<CR>
-  nnoremap <silent> ]d         :SimpleCCNextDiag<CR>
-  nnoremap <silent> gi         :SimpleCCImplementation<CR>
-  nnoremap <silent> gy         :SimpleCCTypeDef<CR>
-  nnoremap <silent> <leader>o  :SimpleCCOutline<CR>
-  nnoremap <silent> <leader>ih :SimpleCCInlayHints<CR>
-  # Insert mode: Tab to enter menu or move down
-  inoremap <silent> <expr> <Tab> simplecc#SelectTabKey()
-  inoremap <silent> <expr> <S-Tab> simplecc#SelectShiftTabKey()
-  inoremap <silent> <expr> <Down> simplecc#SelectDownKey()
-  inoremap <silent> <expr> <Up> simplecc#SelectUpKey()
-  inoremap <silent> <expr> <CR> simplecc#SelectEnterKey()
+  if maparg('gd', 'n') ==# '' | nmap <silent> gd <Plug>(simplecc-definition) | endif
+  if maparg('gr', 'n') ==# '' | nmap <silent> gr <Plug>(simplecc-references) | endif
+  if maparg('K', 'n') ==# '' | nmap <silent> K <Plug>(simplecc-hover) | endif
+  if maparg('<leader>rn', 'n') ==# '' | nmap <silent> <leader>rn <Plug>(simplecc-rename) | endif
+  if maparg('<leader>ca', 'n') ==# '' | nmap <silent> <leader>ca <Plug>(simplecc-code-action) | endif
+  if maparg('<leader>f', 'n') ==# '' | nmap <silent> <leader>f <Plug>(simplecc-format) | endif
+  if maparg('[d', 'n') ==# '' | nmap <silent> [d <Plug>(simplecc-prev-diagnostic) | endif
+  if maparg(']d', 'n') ==# '' | nmap <silent> ]d <Plug>(simplecc-next-diagnostic) | endif
+  if maparg('gi', 'n') ==# '' | nmap <silent> gi <Plug>(simplecc-implementation) | endif
+  if maparg('gy', 'n') ==# '' | nmap <silent> gy <Plug>(simplecc-type-definition) | endif
+  if maparg('<leader>o', 'n') ==# '' | nmap <silent> <leader>o <Plug>(simplecc-outline) | endif
+  if maparg('<leader>ih', 'n') ==# '' | nmap <silent> <leader>ih <Plug>(simplecc-inlay-hints) | endif
+  if maparg('<Tab>', 'i') ==# '' | imap <silent> <Tab> <Plug>(simplecc-select-tab) | endif
+  if maparg('<S-Tab>', 'i') ==# '' | imap <silent> <S-Tab> <Plug>(simplecc-select-shift-tab) | endif
+  if maparg('<Down>', 'i') ==# '' | imap <silent> <Down> <Plug>(simplecc-select-down) | endif
+  if maparg('<Up>', 'i') ==# '' | imap <silent> <Up> <Plug>(simplecc-select-up) | endif
+  if maparg('<CR>', 'i') ==# '' | imap <silent> <CR> <Plug>(simplecc-select-enter) | endif
 endif
 
 # ─── Signs ────────────────────────────────────────────────
-sign define SimpleCCError text=E> texthl=ErrorMsg linehl= numhl=
-sign define SimpleCCWarn  text=W> texthl=WarningMsg linehl= numhl=
-sign define SimpleCCInfo  text=I> texthl=Normal linehl= numhl=
-sign define SimpleCCHint  text=H> texthl=Comment linehl= numhl=
+def DefineSimpleCCSign(name: string, text: string, texthl: string, fallback: string)
+  try
+    sign_define(name, {text: text, texthl: texthl})
+  catch
+    sign_define(name, {text: fallback, texthl: texthl})
+  endtry
+enddef
 
-execute 'sign define SimpleCCError text=' .. g:simplecc_sign_error .. ' texthl=ErrorMsg'
-execute 'sign define SimpleCCWarn  text=' .. g:simplecc_sign_warn  .. ' texthl=WarningMsg'
-execute 'sign define SimpleCCInfo  text=' .. g:simplecc_sign_info  .. ' texthl=Normal'
-execute 'sign define SimpleCCHint  text=' .. g:simplecc_sign_hint  .. ' texthl=Comment'
+DefineSimpleCCSign('SimpleCCError', g:simplecc_sign_error, 'ErrorMsg', 'E>')
+DefineSimpleCCSign('SimpleCCWarn', g:simplecc_sign_warn, 'WarningMsg', 'W>')
+DefineSimpleCCSign('SimpleCCInfo', g:simplecc_sign_info, 'Normal', 'I>')
+DefineSimpleCCSign('SimpleCCHint', g:simplecc_sign_hint, 'Comment', 'H>')
 
 # ─── Highlights ───────────────────────────────────────────
 highlight default link SimpleCCErrorHL   SpellBad
@@ -171,7 +193,7 @@ augroup simplecc
   autocmd FileType * simplecc#OnBufOpen()
   autocmd BufEnter * simplecc#OnBufEnter()
   autocmd BufWritePost * simplecc#OnBufSave()
-  autocmd BufUnload * simplecc#OnBufClose()
+  autocmd BufUnload * simplecc#OnBufClose(str2nr(expand('<abuf>')))
   autocmd TextChanged,TextChangedI * simplecc#OnTextChanged()
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
   autocmd InsertLeave * simplecc#OnInsertLeave()

@@ -81,7 +81,7 @@ impl WorkspaceWatcher {
                     .unwrap_or_default();
                 let should_refresh_julia = manifest_changed
                     && last_julia_refresh
-                        .map_or(true, |last| last.elapsed() >= Duration::from_secs(2));
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
                 let mut refreshed_julia = false;
                 for client in clients {
                     if let Err(err) = client.did_change_watched_files(&changes).await {

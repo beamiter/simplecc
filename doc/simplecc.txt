@@ -1,0 +1,371 @@
+*simplecc.txt*                 SimpleCC LSP client                 July 2026
+
+==============================================================================
+CONTENTS                                                     *simplecc-contents*
+
+1. Introduction.................................|simplecc|
+2. Installation.................................|simplecc-installation|
+3. Quick start..................................|simplecc-quick-start|
+4. Configuration................................|simplecc-configuration|
+5. Commands.....................................|simplecc-commands|
+6. Mappings.....................................|simplecc-mappings|
+7. Options......................................|simplecc-options|
+8. Languages....................................|simplecc-languages|
+9. Troubleshooting..............................|simplecc-troubleshooting|
+
+==============================================================================
+INTRODUCTION                                                     *simplecc*
+
+SimpleCC is a Vim 9 Language Server Protocol client.  A Rust daemon manages
+language-server processes and JSON-RPC traffic while Vim9 script provides the
+editor UI.
+
+Features include completion, hover, diagnostics, navigation, rename,
+formatting, code actions, symbols, hierarchy views, inlay hints, semantic
+tokens, code lenses, snippets, and Julia environment support.
+
+Requirements:
+
+- Vim 9.0 or newer with +vim9script, +job, +channel, +popupwin, +timers, and
+  +textprop.
+- A daemon built by install.sh or selected with |g:simplecc_daemon_path|.
+- A configured language server on PATH or installed with |:SimpleCCInstall|.
+
+==============================================================================
+INSTALLATION                                         *simplecc-installation*
+
+vim-plug example: >
+
+  Plug 'beamiter/simplecc', { 'do': './install.sh' }
+<
+Manual build from the plugin root: >
+
+  ./install.sh
+<
+The installer runs a locked release build and atomically installs the verified
+daemon as lib/simplecc-daemon.  The plugin directory must be on 'runtimepath'.
+
+To use another daemon executable: >
+
+  let g:simplecc_daemon_path = '/absolute/path/to/simplecc-daemon'
+<
+Generate help tags manually if your plugin manager does not do so: >
+
+  :helptags /path/to/simplecc/doc
+<
+==============================================================================
+QUICK START                                             *simplecc-quick-start*
+
+1. Install the plugin and daemon.
+2. Install a language server, for example: >
+
+     :SimpleCCInstall rust-analyzer
+<
+3. Open a supported file.  SimpleCC starts automatically by default.
+4. Check status with |:SimpleCC|.
+5. Use 'gd' for definition, 'K' for hover, and '<Leader>rn' for rename.
+
+SimpleCC first looks for a managed server and then searches PATH.  A
+system-installed language server needs no additional setup.
+
+==============================================================================
+CONFIGURATION                                         *simplecc-configuration*
+
+Set an explicit JSON configuration before SimpleCC is loaded: >
+
+  let g:simplecc_config_path = expand('~/.config/simplecc/simplecc.json')
+<
+Without this option, configuration is selected in order:
+
+1. simplecc.json in the detected project root
+2. .simplecc.json in the detected project root
+3. ~/.config/simplecc/simplecc.json
+4. built-in defaults
+
+Example: >
+
+  {
+    "languageServers": {
+      "rust-analyzer": {
+        "command": "rust-analyzer",
+        "args": [],
+        "filetypes": ["rust"],
+        "rootPatterns": ["Cargo.toml"],
+        "priority": 100,
+        "initializationOptions": {},
+        "settings": {}
+      }
+    }
+  }
+<
+Entry fields:
+
+command                 Executable name or absolute path.
+args                    Command-line arguments.
+filetypes               Vim filetypes handled by the server.
+rootPatterns            Project marker filenames.
+priority                Optional integer server priority.  Higher values win;
+                        ties are ordered by server name.
+initializationOptions   Value sent during LSP initialization.
+settings                workspace/configuration values and live settings.
+
+Use |:SimpleCCConfig| to open or create a project configuration and
+|:SimpleCCReloadConfig| to validate it and hot-push settings to running
+servers.  Changes to command, args, filetypes, rootPatterns, priority, or
+initializationOptions require |:SimpleCCRestart|.  Invalid JSON is reported
+without replacing the running configuration.
+
+See simplecc.json.example in the repository for complete examples.
+
+==============================================================================
+COMMANDS                                                   *simplecc-commands*
+
+Lifecycle and configuration ~
+
+*:SimpleCC*
+        Show daemon, project, and active-server status.
+
+*:SimpleCCStart*
+        Start and initialize the daemon.
+
+*:SimpleCCStop*
+        Shut down the daemon and language servers.
+
+*:SimpleCCRestart*
+        Restart SimpleCC.
+
+*:SimpleCCConfig*
+        Open or create the active project configuration.
+
+*:SimpleCCReloadConfig*
+        Validate configuration and hot-reload settings on running servers.
+
+*:SimpleCCLog*
+        Open the in-memory SimpleCC log.
+
+*:SimpleCCInstall* [server]
+        Install a managed language server.  With no argument, show a menu.
+
+*:SimpleCCServers*
+        List managed language servers and their installation state.
+
+Navigation ~
+
+*:SimpleCCHover*                 Show hover documentation.
+*:SimpleCCDefinition*            Go to definition.
+*:SimpleCCReferences*            List references.
+*:SimpleCCImplementation*        Go to implementation.
+*:SimpleCCTypeDef*               Go to type definition.
+*:SimpleCCOutline*               Show document symbols.
+*:SimpleCCWorkspaceSymbol* [q]   Search workspace symbols.
+*:SimpleCCWorkspaceSymbolLive*   Open live workspace-symbol search.
+*:SimpleCCHighlight*             Highlight symbol references.
+*:SimpleCCHighlightClear*        Clear document highlights.
+*:SimpleCCIncomingCalls*         Show incoming calls.
+*:SimpleCCOutgoingCalls*         Show outgoing calls.
+*:SimpleCCSupertypes*            Show supertypes.
+*:SimpleCCSubtypes*              Show subtypes.
+
+Editing and language features ~
+
+*:SimpleCCRename*                Rename the symbol under the cursor.
+*:SimpleCCFormat*                Format the current buffer.
+*:SimpleCCAction*                Select and execute a code action.
+*:SimpleCCSignatureHelp*         Show signature help.
+*:SimpleCCInlayHints*            Toggle inlay hints.
+*:SimpleCCSelExpand*             Expand selection using selection ranges.
+*:SimpleCCSelShrink*             Shrink the current selection.
+*:SimpleCCSemanticTokens*        Refresh semantic tokens.
+*:SimpleCCCodeLens*              Display code lenses.
+*:SimpleCCCodeLensRun*           Execute a code lens.
+*:SimpleCCFold*                  Apply server-provided folding ranges.
+
+Diagnostics and Julia ~
+
+*:SimpleCCDiagnostics*           Put diagnostics in the quickfix list.
+*:SimpleCCNextDiag*              Jump to the next diagnostic.
+*:SimpleCCPrevDiag*              Jump to the previous diagnostic.
+*:SimpleCCPullDiag*              Request pull diagnostics.
+*:SimpleCCJuliaActivate* [dir]   Activate a Julia environment.
+*:SimpleCCJuliaRefresh*          Refresh LanguageServer.jl caches.
+
+==============================================================================
+MAPPINGS                                                   *simplecc-mappings*
+
+Default Normal-mode mappings:
+
+gd              Definition
+gr              References
+K               Hover
+gi              Implementation
+gy              Type definition
+<Leader>rn      Rename
+<Leader>ca      Code action
+<Leader>f       Format
+<Leader>o       Document outline
+<Leader>ih      Toggle inlay hints
+[d / ]d        Previous / next diagnostic
+
+Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
+
+Disable all defaults before loading the plugin: >
+
+  let g:simplecc_no_default_maps = 1
+<
+==============================================================================
+OPTIONS                                                     *simplecc-options*
+
+All options must be set before plugin/simplecc.vim is loaded.
+
+                                                *g:simplecc_auto_start*
+g:simplecc_auto_start            number  default: 1
+        Start SimpleCC on VimEnter.
+
+                                        *g:simplecc_no_default_maps*
+g:simplecc_no_default_maps       number  default: 0
+        Disable all default mappings.
+
+                                               *g:simplecc_config_path*
+g:simplecc_config_path           string  default: ''
+        Explicit simplecc.json path.
+
+                                               *g:simplecc_daemon_path*
+g:simplecc_daemon_path           string  default: ''
+        Explicit daemon executable.
+
+                                             *g:simplecc_auto_complete*
+g:simplecc_auto_complete         number  default: 1
+        Enable automatic completion.
+
+                                              *g:simplecc_change_delay*
+g:simplecc_change_delay          number  default: 120
+        Document-change debounce in milliseconds.
+
+                                            *g:simplecc_complete_delay*
+g:simplecc_complete_delay        number  default: 80
+        Completion debounce in milliseconds.
+
+                                  *g:simplecc_complete_min_chars*
+g:simplecc_complete_min_chars    number  default: 1
+        Minimum typed characters before automatic completion.
+
+                                  *g:simplecc_complete_max_items*
+g:simplecc_complete_max_items    number  default: 100
+        Maximum completion items.
+
+                              *g:simplecc_complete_resolve_delay*
+g:simplecc_complete_resolve_delay number default: 120
+        Completion-item resolve debounce in milliseconds.
+
+                                                *g:simplecc_sign_error*
+g:simplecc_sign_error            string  default: 'E>'
+                                                *g:simplecc_sign_warn*
+g:simplecc_sign_warn             string  default: 'W>'
+                                                *g:simplecc_sign_info*
+g:simplecc_sign_info             string  default: 'I>'
+                                                *g:simplecc_sign_hint*
+g:simplecc_sign_hint             string  default: 'H>'
+        Diagnostic sign text for each severity.
+
+                                              *g:simplecc_auto_install*
+g:simplecc_auto_install          number  default: 0
+        Install missing managed servers without prompting.
+
+                                               *g:simplecc_inlay_hints*
+g:simplecc_inlay_hints           number  default: 1
+        Enable inlay hints.
+
+                                               *g:simplecc_virtual_diag*
+g:simplecc_virtual_diag          number  default: 1
+        Show virtual diagnostic text.
+
+                                      *g:simplecc_diag_max_per_line*
+g:simplecc_diag_max_per_line     number  default: 3
+        Maximum virtual diagnostics displayed per line.
+
+                                                 *g:simplecc_diag_float*
+g:simplecc_diag_float            number  default: 0
+        Show diagnostics near the cursor.
+
+                                          *g:simplecc_diag_min_severity*
+g:simplecc_diag_min_severity     number  default: 4
+        Include severities through this value: 1 error, 2 warning,
+        3 information, 4 hint.
+
+                                          *g:simplecc_semantic_tokens*
+g:simplecc_semantic_tokens       number  default: 0
+        Enable automatic semantic tokens.
+
+                                          *g:simplecc_semtok_priority*
+g:simplecc_semtok_priority       number  default: 100
+        Semantic-token text-property priority.
+
+                                   *g:simplecc_semtok_range_threshold*
+g:simplecc_semtok_range_threshold number default: 5000
+        Use range token requests above this buffer line count.
+
+                                         *g:simplecc_pull_diagnostics*
+g:simplecc_pull_diagnostics      number  default: 0
+        Enable pull diagnostics.
+
+                                                    *g:simplecc_status*
+g:simplecc_status                string  default: ''
+        Current statusline-friendly SimpleCC state.
+
+==============================================================================
+LANGUAGES                                                 *simplecc-languages*
+
+Built-in defaults:
+
+Language                Server                       Managed install
+Rust                    rust-analyzer                yes
+C / C++                 clangd                       yes
+Python                  pyright-langserver           yes (requires npm)
+Go                      gopls                        yes (requires Go)
+Lua                     lua-language-server          yes
+Julia                   LanguageServer.jl            yes (requires Julia)
+TypeScript / JavaScript typescript-language-server   yes (requires npm)
+
+Install TypeScript support through SimpleCC: >
+
+  :SimpleCCInstall typescript-language-server
+<
+Managed installations may contact GitHub, npm, the Go module proxy, or Julia
+package registries.
+
+==============================================================================
+TROUBLESHOOTING                                     *simplecc-troubleshooting*
+
+Daemon not found ~
+
+Run install.sh and verify lib/simplecc-daemon is executable, or set
+|g:simplecc_daemon_path| to an absolute path.
+
+Server not found ~
+
+Run the server with --version, use |:SimpleCCInstall| where supported, then
+run |:SimpleCCRestart|.  Inspect |:SimpleCCLog| for startup errors.
+
+Configuration does not apply ~
+
+Use |:SimpleCCReloadConfig| for settings-only changes.  Use
+|:SimpleCCRestart| after changing commands, arguments, initialization,
+routing, root patterns, or priorities.  An explicit
+|g:simplecc_config_path| takes precedence over discovered files.
+
+No completion or navigation result ~
+
+Check |:SimpleCC|, confirm the current 'filetype' is configured, and inspect
+|:SimpleCCLog| for language-server errors.
+
+Julia server does not start ~
+
+Ensure Julia is on PATH, run ':SimpleCCInstall julia-lsp', open a Julia
+buffer, and use |:SimpleCCJuliaActivate| in the intended environment.
+
+==============================================================================
+
+Full documentation and development commands:
+https://github.com/beamiter/simplecc
+
+vim:tw=78:ts=8:noet:ft=help:norl:
