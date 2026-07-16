@@ -115,7 +115,7 @@ if !g:simplecc_no_default_maps
   if maparg('K', 'n') ==# '' | nmap <silent> K <Plug>(simplecc-hover) | endif
   if maparg('<leader>rn', 'n') ==# '' | nmap <silent> <leader>rn <Plug>(simplecc-rename) | endif
   if maparg('<leader>ca', 'n') ==# '' | nmap <silent> <leader>ca <Plug>(simplecc-code-action) | endif
-  if maparg('<leader>fm', 'n') ==# '' | nmap <silent> <leader>f <Plug>(simplecc-format) | endif
+  if maparg('<leader>fm', 'n') ==# '' | nmap <silent> <leader>fm <Plug>(simplecc-format) | endif
   if maparg('[d', 'n') ==# '' | nmap <silent> [d <Plug>(simplecc-prev-diagnostic) | endif
   if maparg(']d', 'n') ==# '' | nmap <silent> ]d <Plug>(simplecc-next-diagnostic) | endif
   if maparg('gi', 'n') ==# '' | nmap <silent> gi <Plug>(simplecc-implementation) | endif
