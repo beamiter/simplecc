@@ -110,16 +110,16 @@ inoremap <silent> <expr> <Plug>(simplecc-select-up) simplecc#SelectUpKey()
 inoremap <silent> <expr> <Plug>(simplecc-select-enter) simplecc#SelectEnterKey()
 
 if !g:simplecc_no_default_maps
-  if maparg('gd', 'n') ==# '' | nmap <silent> gd <Plug>(simplecc-definition) | endif
-  if maparg('gr', 'n') ==# '' | nmap <silent> gr <Plug>(simplecc-references) | endif
-  if maparg('K', 'n') ==# '' | nmap <silent> K <Plug>(simplecc-hover) | endif
-  if maparg('<leader>rn', 'n') ==# '' | nmap <silent> <leader>rn <Plug>(simplecc-rename) | endif
-  if maparg('<leader>ca', 'n') ==# '' | nmap <silent> <leader>ca <Plug>(simplecc-code-action) | endif
-  if maparg('<leader>fm', 'n') ==# '' | nmap <silent> <leader>fm <Plug>(simplecc-format) | endif
-  if maparg('[d', 'n') ==# '' | nmap <silent> [d <Plug>(simplecc-prev-diagnostic) | endif
-  if maparg(']d', 'n') ==# '' | nmap <silent> ]d <Plug>(simplecc-next-diagnostic) | endif
-  if maparg('gi', 'n') ==# '' | nmap <silent> gi <Plug>(simplecc-implementation) | endif
-  if maparg('gy', 'n') ==# '' | nmap <silent> gy <Plug>(simplecc-type-definition) | endif
+  if maparg('gd', 'n') ==# '' | nmap <silent> gd <Plug>(simplecc-definition)| endif
+  if maparg('gr', 'n') ==# '' | nmap <silent> gr <Plug>(simplecc-references)| endif
+  if maparg('K', 'n') ==# '' | nmap <silent> K <Plug>(simplecc-hover)| endif
+  if maparg('<leader>rn', 'n') ==# '' | nmap <silent> <leader>rn <Plug>(simplecc-rename)| endif
+  if maparg('<leader>ca', 'n') ==# '' | nmap <silent> <leader>ca <Plug>(simplecc-code-action)| endif
+  if maparg('<leader>fm', 'n') ==# '' | nmap <silent> <leader>fm <Plug>(simplecc-format)| endif
+  if maparg('[d', 'n') ==# '' | nmap <silent> [d <Plug>(simplecc-prev-diagnostic)| endif
+  if maparg(']d', 'n') ==# '' | nmap <silent> ]d <Plug>(simplecc-next-diagnostic)| endif
+  if maparg('gi', 'n') ==# '' | nmap <silent> gi <Plug>(simplecc-implementation)| endif
+  if maparg('gy', 'n') ==# '' | nmap <silent> gy <Plug>(simplecc-type-definition)| endif
   if maparg('<leader>o', 'n') ==# '' | nmap <silent> <leader>o <Plug>(simplecc-outline) | endif
   if maparg('<leader>ih', 'n') ==# '' | nmap <silent> <leader>ih <Plug>(simplecc-inlay-hints) | endif
   if maparg('<Tab>', 'i') ==# '' | imap <silent> <Tab> <Plug>(simplecc-select-tab) | endif
