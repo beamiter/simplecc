@@ -75,6 +75,50 @@ let g:simplecc_daemon_path = s:fake_daemon
 call simplecc#Start()
 sleep 300m
 call assert_equal('ready', g:simplecc_status)
+
+" Definition replies must stay attached to the split that issued the request.
+" Selecting a result must replace that source split and create one precise
+" jumplist entry for Ctrl-O, even for a same-buffer target.
+let s:source_file = tempname() .. '.rs'
+let s:other_file = tempname() .. '.rs'
+call writefile(['alpha', 'beta symbol', 'gamma target', 'delta target'],
+      \ s:source_file)
+call writefile(['unrelated window'], s:other_file)
+execute 'edit! ' .. fnameescape(s:source_file)
+call cursor(2, 6)
+let s:source_winid = win_getid()
+execute 'vsplit ' .. fnameescape(s:other_file)
+let s:other_winid = win_getid()
+call win_gotoid(s:source_winid)
+call simplecc#Definition()
+call win_gotoid(s:other_winid)
+sleep 250m
+
+let s:list_winid = win_getid()
+call assert_equal(1, get(getwininfo(s:list_winid), 0, {})->get('loclist', 0))
+call assert_equal(win_screenpos(s:source_winid)[1], win_screenpos(s:list_winid)[1])
+call assert_notequal(win_screenpos(s:other_winid)[1], win_screenpos(s:list_winid)[1])
+call assert_equal(s:other_file, fnamemodify(bufname(winbufnr(s:other_winid)), ':p'))
+
+call simplecc#QfEnter()
+call assert_equal(s:source_winid, win_getid())
+call assert_equal(s:source_file, expand('%:p'))
+call assert_equal([3, 2], [line('.'), col('.')])
+execute "normal! \<C-o>"
+call assert_equal(s:source_file, expand('%:p'))
+call assert_equal([2, 6], [line('.'), col('.')])
+
+" A single-location reply uses the same originating window and jumplist path.
+call cursor(1, 3)
+call simplecc#Definition()
+call win_gotoid(s:other_winid)
+sleep 250m
+call assert_equal(s:source_winid, win_getid())
+call assert_equal(s:source_file, expand('%:p'))
+call assert_equal([3, 2], [line('.'), col('.')])
+execute "normal! \<C-o>"
+call assert_equal([1, 3], [line('.'), col('.')])
+
 call simplecc#Restart()
 sleep 700m
 call assert_equal('ready', g:simplecc_status)
@@ -82,6 +126,8 @@ call simplecc#Stop()
 sleep 300m
 call assert_equal('', g:simplecc_status)
 call delete(s:fake_daemon)
+call delete(s:source_file)
+call delete(s:other_file)
 
 if !empty(v:errors)
   call writefile(v:errors, '/dev/stderr')

@@ -87,6 +87,10 @@ var s_pending_changes: dict<list<dict<any>>> = {}
 var s_listener_ids: dict<number> = {}
 # Inlay hints version tracking
 var s_inlay_request_version: dict<number> = {}
+# Window/buffer context for asynchronous location requests.  LSP replies can
+# arrive after the user has moved to another split, so navigation must not use
+# whichever window happens to be current when the reply is handled.
+var s_navigation_contexts: dict<dict<any>> = {}
 # Completion preview state - for real-time preview of selected completion
 var s_comp_preview_start_line: number = 0
 var s_comp_preview_start_col: number = 0
@@ -147,6 +151,7 @@ def OnBackendExit(generation: number, code: number)
   s_initialize_id = 0
   s_job = null_job
   s_cbs = {}
+  s_navigation_contexts = {}
   if s_kill_timer > 0
     timer_stop(s_kill_timer)
     s_kill_timer = 0
@@ -434,6 +439,9 @@ def OnBackendEvent(line: string)
       endif
       s_comp_resolve_id = 0
       s_comp_resolve_request_key = ''
+    endif
+    if id > 0 && has_key(s_navigation_contexts, string(id))
+      remove(s_navigation_contexts, string(id))
     endif
     Log('error(id=' .. string(id) .. '): ' .. get(ev, 'message', ''))
 
@@ -1388,6 +1396,40 @@ enddef
 # Go to Definition
 # ═════════════════════════════════════════════════════════
 
+def RememberNavigationContext(id: number)
+  s_navigation_contexts[string(id)] = {
+    winid: win_getid(),
+    bufnr: bufnr('%'),
+  }
+enddef
+
+def TakeNavigationContext(ev: dict<any>): dict<any>
+  var key = string(get(ev, 'id', 0))
+  if has_key(s_navigation_contexts, key)
+    return remove(s_navigation_contexts, key)
+  endif
+  return {winid: win_getid(), bufnr: bufnr('%')}
+enddef
+
+def GoToNavigationWindow(context: dict<any>): bool
+  var winid = get(context, 'winid', 0)
+  if winid > 0 && win_gotoid(winid)
+    return true
+  endif
+
+  # If the original split was closed while the request was pending, prefer
+  # another window showing the request buffer before falling back to the
+  # user's current window.
+  var bufnr = get(context, 'bufnr', 0)
+  if bufnr > 0
+    var wins = win_findbuf(bufnr)
+    if !empty(wins) && win_gotoid(wins[0])
+      return true
+    endif
+  endif
+  return &buftype !=# 'quickfix'
+enddef
+
 export def Definition()
   if !s_initialized
     echom '[SimpleCC] not initialized'
@@ -1395,6 +1437,7 @@ export def Definition()
   endif
 
   var id = NextId()
+  RememberNavigationContext(id)
   Send({
     type: 'textDocument/definition',
     id: id,
@@ -1407,6 +1450,7 @@ export def Definition()
 enddef
 
 def OnDefinition(ev: dict<any>)
+  var context = TakeNavigationContext(ev)
   var locs = get(ev, 'locations', [])
   if empty(locs)
     echo 'No definition found'
@@ -1414,9 +1458,9 @@ def OnDefinition(ev: dict<any>)
   endif
 
   if len(locs) == 1
-    JumpToLocation(locs[0])
+    JumpToLocation(locs[0], context)
   else
-    LocationsToQuickfix(locs, 'Definition')
+    LocationsToQuickfix(locs, 'Definition', context)
   endif
 enddef
 
@@ -1431,6 +1475,7 @@ export def References()
   endif
 
   var id = NextId()
+  RememberNavigationContext(id)
   Send({
     type: 'textDocument/references',
     id: id,
@@ -1442,13 +1487,14 @@ export def References()
 enddef
 
 def OnReferences(ev: dict<any>)
+  var context = TakeNavigationContext(ev)
   var locs = get(ev, 'locations', [])
   if empty(locs)
     echo 'No references found'
     return
   endif
 
-  LocationsToQuickfix(locs, 'References')
+  LocationsToQuickfix(locs, 'References', context)
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -1992,18 +2038,43 @@ enddef
 # Location helpers
 # ═════════════════════════════════════════════════════════
 
-def JumpToLocation(loc: dict<any>)
+def PushNavigationOrigin()
+  # m' updates both the previous-context mark and this window's jumplist.
+  # cursor() and same-buffer LSP jumps do not do that by themselves.
+  normal! m'
+
+  var cur_item = {
+    bufnr: bufnr('%'),
+    from: getpos('.'),
+    tagname: expand('<cword>'),
+  }
+  try
+    settagstack(winnr(), {items: [cur_item]}, 'a')
+  catch
+  endtry
+enddef
+
+def JumpToFilePosition(fpath: string, lnum: number, col: number)
+  PushNavigationOrigin()
+  if fpath !=# expand('%:p')
+    execute 'edit ' .. fnameescape(fpath)
+  endif
+  cursor(lnum, col > 0 ? col : 1)
+  normal! zz
+enddef
+
+def JumpToLocation(loc: dict<any>, context: dict<any> = {})
+  if !empty(context) && !GoToNavigationWindow(context)
+    echohl ErrorMsg
+    echom '[SimpleCC] originating window is no longer available'
+    echohl None
+    return
+  endif
+
   var uri = get(loc, 'uri', '')
   var lnum = get(loc, 'line', 0) + 1
   var fpath = UriToPath(uri)
-
-  # Push to tagstack
-  var cur_item = {'bufnr': bufnr('%'), 'from': getpos('.'), 'tagname': expand('<cword>')}
-  try
-    settagstack(winnr(), {'items': [cur_item]}, 'a')
-  catch
-  endtry
-
+  PushNavigationOrigin()
   if fpath !=# expand('%:p')
     execute 'edit ' .. fnameescape(fpath)
   endif
@@ -2011,7 +2082,8 @@ def JumpToLocation(loc: dict<any>)
   normal! zz
 enddef
 
-def LocationsToQuickfix(locs: list<dict<any>>, title: string)
+def LocationsToQuickfix(locs: list<dict<any>>, title: string,
+    context: dict<any> = {})
   var qf_items: list<dict<any>> = []
   for loc in locs
     var uri = get(loc, 'uri', '')
@@ -2024,8 +2096,21 @@ def LocationsToQuickfix(locs: list<dict<any>>, title: string)
       text: title,
     })
   endfor
-  setqflist(qf_items)
-  copen
+
+  if !empty(context) && !GoToNavigationWindow(context)
+    echohl ErrorMsg
+    echom '[SimpleCC] originating window is no longer available'
+    echohl None
+    return
+  endif
+
+  # LSP result lists belong to the split that issued the request.  A location
+  # list gives each source split its own list and, unlike :copen, can be placed
+  # directly below that split in a multi-window layout.
+  var source_winid = win_getid()
+  setloclist(0, qf_items, 'r')
+  belowright lopen
+  w:simplecc_source_winid = source_winid
   SetupQfMappings()
 enddef
 
@@ -2039,15 +2124,53 @@ enddef
 
 export def QfEnter()
   var lnum = line('.')
-  execute 'cc ' .. lnum
-  cclose
+  var info = get(getwininfo(win_getid()), 0, {})
+  var is_loclist = get(info, 'loclist', 0) == 1
+  var items = is_loclist ? getloclist(0) : getqflist()
+  var source_winid = get(w:, 'simplecc_source_winid', 0)
+  if lnum < 1 || lnum > len(items)
+    return
+  endif
+  var item = items[lnum - 1]
+
+  if is_loclist
+    lclose
+  else
+    cclose
+  endif
+  if source_winid > 0 && !win_gotoid(source_winid)
+    echohl ErrorMsg
+    echom '[SimpleCC] originating window is no longer available'
+    echohl None
+    return
+  endif
+
+  var fname = bufname(get(item, 'bufnr', 0))
+  if fname ==# ''
+    return
+  endif
+  JumpToFilePosition(fnamemodify(fname, ':p'), get(item, 'lnum', 1),
+      get(item, 'col', 1))
 enddef
 
 export def QfEnterMulti()
   var lstart = line("'<")
   var lend = line("'>")
-  var items = getqflist()
-  cclose
+  var info = get(getwininfo(win_getid()), 0, {})
+  var is_loclist = get(info, 'loclist', 0) == 1
+  var items = is_loclist ? getloclist(0) : getqflist()
+  var source_winid = get(w:, 'simplecc_source_winid', 0)
+  if is_loclist
+    lclose
+  else
+    cclose
+  endif
+  if source_winid > 0 && !win_gotoid(source_winid)
+    echohl ErrorMsg
+    echom '[SimpleCC] originating window is no longer available'
+    echohl None
+    return
+  endif
   var first = true
   for i in range(lstart - 1, lend - 1)
     if i < 0 || i >= len(items)
@@ -2059,13 +2182,14 @@ export def QfEnterMulti()
     endif
     var fname = bufname(it.bufnr)
     if first
-      execute 'edit ' .. fnameescape(fname)
+      JumpToFilePosition(fnamemodify(fname, ':p'), it.lnum,
+          it.col > 0 ? it.col : 1)
       first = false
     else
       execute 'split ' .. fnameescape(fname)
+      cursor(it.lnum, it.col > 0 ? it.col : 1)
+      normal! zz
     endif
-    cursor(it.lnum, it.col > 0 ? it.col : 1)
-    normal! zz
   endfor
 enddef
 
@@ -2270,6 +2394,7 @@ export def Implementation()
     return
   endif
   var id = NextId()
+  RememberNavigationContext(id)
   Send({
     type: 'textDocument/implementation',
     id: id,
@@ -2281,15 +2406,16 @@ export def Implementation()
 enddef
 
 def OnImplementation(ev: dict<any>)
+  var context = TakeNavigationContext(ev)
   var locs = get(ev, 'locations', [])
   if empty(locs)
     echo 'No implementation found'
     return
   endif
   if len(locs) == 1
-    JumpToLocation(locs[0])
+    JumpToLocation(locs[0], context)
   else
-    LocationsToQuickfix(locs, 'Implementation')
+    LocationsToQuickfix(locs, 'Implementation', context)
   endif
 enddef
 
@@ -2303,6 +2429,7 @@ export def TypeDefinition()
     return
   endif
   var id = NextId()
+  RememberNavigationContext(id)
   Send({
     type: 'textDocument/typeDefinition',
     id: id,
@@ -2314,15 +2441,16 @@ export def TypeDefinition()
 enddef
 
 def OnTypeDefinition(ev: dict<any>)
+  var context = TakeNavigationContext(ev)
   var locs = get(ev, 'locations', [])
   if empty(locs)
     echo 'No type definition found'
     return
   endif
   if len(locs) == 1
-    JumpToLocation(locs[0])
+    JumpToLocation(locs[0], context)
   else
-    LocationsToQuickfix(locs, 'TypeDefinition')
+    LocationsToQuickfix(locs, 'TypeDefinition', context)
   endif
 enddef
 
