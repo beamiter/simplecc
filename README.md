@@ -246,6 +246,8 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_complete_min_chars</code> | 1 | Minimum typed characters |
 | <code>g:simplecc_complete_max_items</code> | 100 | Maximum completion items |
 | <code>g:simplecc_complete_resolve_delay</code> | 120 | Resolve debounce in ms |
+| <code>g:simplecc_complete_buffer_words</code> | 1 | Supplement LSP with keyword matches from open buffers |
+| <code>g:simplecc_complete_buffer_max_items</code> | 20 | Max buffer-word candidates per menu |
 | <code>g:simplecc_sign_error</code> | E&gt; | Error sign text |
 | <code>g:simplecc_sign_warn</code> | W&gt; | Warning sign text |
 | <code>g:simplecc_sign_info</code> | I&gt; | Information sign text |

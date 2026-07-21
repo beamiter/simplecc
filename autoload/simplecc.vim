@@ -1247,6 +1247,88 @@ def RequestCompletion(manual: bool = false)
   })
 enddef
 
+# Collect keyword tokens from open buffers that start with `prefix`, skipping
+# anything already offered by the language server (`existing`). Lines are visited
+# outward from the cursor so nearby, more relevant identifiers surface first and
+# the scan stops as soon as `limit` candidates are found. Other loaded buffers of
+# the same filetype are scanned after the current one for cross-file matches.
+def CollectBufferWords(prefix: string, existing: dict<bool>, limit: number): list<dict<any>>
+  var out: list<dict<any>> = []
+  if limit <= 0 || prefix ==# ''
+    return out
+  endif
+  var ic = &ignorecase
+  var lower_prefix = tolower(prefix)
+  var plen = strlen(prefix)
+  var seen: dict<bool> = {}
+  var cur = line('.')
+
+  # Build the list of (bufnr, lnum) to visit. Current buffer first, ordered by
+  # distance from the cursor; then other loaded same-filetype buffers top-down.
+  var cur_buf = bufnr('%')
+  var cur_ft = &filetype
+  var total = line('$')
+  var sources: list<list<number>> = [[cur_buf, cur]]
+  var d = 1
+  while cur - d >= 1 || cur + d <= total
+    if cur - d >= 1
+      add(sources, [cur_buf, cur - d])
+    endif
+    if cur + d <= total
+      add(sources, [cur_buf, cur + d])
+    endif
+    d += 1
+  endwhile
+  for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
+    if b.bufnr == cur_buf || getbufvar(b.bufnr, '&filetype', '') !=# cur_ft
+      continue
+    endif
+    for lnum in range(1, b.linecount)
+      add(sources, [b.bufnr, lnum])
+    endfor
+  endfor
+
+  var last_buf = -1
+  var buf_lines: list<string> = []
+  for src in sources
+    if len(out) >= limit
+      break
+    endif
+    if src[0] != last_buf
+      buf_lines = getbufline(src[0], 1, '$')
+      last_buf = src[0]
+    endif
+    var text = get(buf_lines, src[1] - 1, '')
+    for w in split(text, '\%(\k\)\@!.')
+      if len(out) >= limit
+        break
+      endif
+      # Skip words no longer than the prefix (this also drops the word the user
+      # is currently typing).
+      if strlen(w) <= plen
+        continue
+      endif
+      if ic ? stridx(tolower(w), lower_prefix) != 0 : stridx(w, prefix) != 0
+        continue
+      endif
+      var lw = ic ? tolower(w) : w
+      if has_key(seen, lw) || has_key(existing, lw)
+        continue
+      endif
+      seen[lw] = true
+      add(out, {
+        word: w,
+        abbr: w,
+        menu: 'buf',
+        dup: 1,
+        icase: ic ? 1 : 0,
+        user_data: {source: 'buffer'},
+      })
+    endfor
+  endfor
+  return out
+enddef
+
 def OnCompletion(ev: dict<any>)
   if !s_comp_requesting
     return
@@ -1257,10 +1339,9 @@ def OnCompletion(ev: dict<any>)
   endif
   s_comp_requesting = false
 
+  # generation <= 0 means the server offered no completion (no capability or no
+  # server for this filetype). Buffer-word completion can still fire below.
   var generation = get(ev, 'generation', 0)
-  if generation <= 0
-    return
-  endif
   s_comp_generation = generation
 
   # A response is only valid for the exact editor snapshot that requested it.
@@ -1270,16 +1351,17 @@ def OnCompletion(ev: dict<any>)
     return
   endif
 
-  var items = get(ev, 'items', [])
-  if empty(items)
-    return
-  endif
+  var items = generation > 0 ? get(ev, 'items', []) : []
 
   var line_text = getline('.')
   var start = s_comp_start_col
 
   # Build Vim complete items
   var complete_items: list<dict<any>> = []
+  # Words already offered by the server, so buffer completion never duplicates
+  # them. Keyed with the same case-folding used when matching buffer words.
+  var ic = &ignorecase
+  var existing: dict<bool> = {}
   var idx = 0
   var max_items = max([1, g:simplecc_complete_max_items])
   for item in items
@@ -1319,8 +1401,19 @@ def OnCompletion(ev: dict<any>)
       ci.info = get(ci, 'info', '') !=# '' ? ci.info .. "\n\n" .. doc : doc
     endif
     add(complete_items, ci)
+    if word !=# ''
+      existing[ic ? tolower(word) : word] = true
+    endif
     idx += 1
   endfor
+
+  # Supplement server results with keyword matches from open buffers. This also
+  # provides completion before the server is ready or in files with no server.
+  if g:simplecc_complete_buffer_words
+    var prefix = start < s_comp_col - 1 ? line_text[start : s_comp_col - 2] : ''
+    var buf_limit = max([0, g:simplecc_complete_buffer_max_items])
+    extend(complete_items, CollectBufferWords(prefix, existing, buf_limit))
+  endif
 
   if empty(complete_items)
     return

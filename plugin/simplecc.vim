@@ -26,6 +26,11 @@ g:simplecc_complete_delay  = get(g:, 'simplecc_complete_delay', 80)
 g:simplecc_complete_min_chars = get(g:, 'simplecc_complete_min_chars', 1)
 g:simplecc_complete_max_items = get(g:, 'simplecc_complete_max_items', 100)
 g:simplecc_complete_resolve_delay = get(g:, 'simplecc_complete_resolve_delay', 120)
+# Supplement LSP results with keyword matches from open buffers. Useful before a
+# server is ready, in files with no server, or for local identifiers the server
+# does not know about yet.
+g:simplecc_complete_buffer_words = get(g:, 'simplecc_complete_buffer_words', 1)
+g:simplecc_complete_buffer_max_items = get(g:, 'simplecc_complete_buffer_max_items', 20)
 g:simplecc_sign_error      = get(g:, 'simplecc_sign_error', 'E>')
 g:simplecc_sign_warn       = get(g:, 'simplecc_sign_warn', 'W>')
 g:simplecc_sign_info       = get(g:, 'simplecc_sign_info', 'I>')

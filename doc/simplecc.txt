@@ -257,6 +257,20 @@ g:simplecc_complete_max_items    number  default: 100
 g:simplecc_complete_resolve_delay number default: 120
         Completion-item resolve debounce in milliseconds.
 
+                              *g:simplecc_complete_buffer_words*
+g:simplecc_complete_buffer_words number default: 1
+        Supplement language-server completion with keyword matches drawn
+        from open buffers. Nearby identifiers in the current file are
+        offered first, followed by other loaded buffers of the same
+        filetype. Words the server already offers are never duplicated.
+        These candidates are tagged "buf" in the completion menu and also
+        appear before a server is ready or in files with no server. Set to
+        0 to rely on the language server alone.
+
+                              *g:simplecc_complete_buffer_max_items*
+g:simplecc_complete_buffer_max_items number default: 20
+        Maximum number of buffer-word candidates to add to each menu.
+
                                                 *g:simplecc_sign_error*
 g:simplecc_sign_error            string  default: 'E>'
                                                 *g:simplecc_sign_warn*
