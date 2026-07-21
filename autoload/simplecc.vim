@@ -1108,10 +1108,20 @@ export def TriggerCompletionManual()
   RequestCompletion(true)
 enddef
 
+# Smart <Tab>. Priority order, most specific first:
+#   1. Completion menu open  -> advance/select the next candidate.
+#   2. Active snippet         -> jump to the next placeholder.
+#   3. Completion context     -> request completion.
+#   4. Otherwise              -> insert a literal <Tab> (indentation).
+# Keeping the menu ahead of snippets means a popup that appears while editing a
+# placeholder is still selectable with <Tab>.
 export def SelectTabKey(): string
   if pumvisible()
-    # Menu is open, navigate/select in menu
     return "\<C-n>"
+  endif
+  if s_snippet_active
+    SnippetNext()
+    return ''
   endif
   var byte_col = col('.') - 1
   var before = strpart(getline('.'), 0, byte_col)
@@ -1124,13 +1134,16 @@ export def SelectTabKey(): string
   return ''
 enddef
 
+# Smart <S-Tab>: mirror of SelectTabKey for backward movement.
 export def SelectShiftTabKey(): string
   if pumvisible()
-    # Menu is open, move to previous item
     return "\<C-p>"
-  else
-    return "\<S-Tab>"
   endif
+  if s_snippet_active
+    SnippetPrev()
+    return ''
+  endif
+  return "\<S-Tab>"
 enddef
 
 export def SelectDownKey(): string
@@ -4138,9 +4151,12 @@ def ExpandSnippet(ci: dict<any>, snippet: string)
   endfor
   s_snippet_idx = 0
 
-  # Set buffer-local mappings for tab navigation
-  inoremap <buffer> <Tab> <Cmd>call simplecc#SnippetNext()<CR>
-  inoremap <buffer> <S-Tab> <Cmd>call simplecc#SnippetPrev()<CR>
+  # Buffer-local tab navigation while the snippet is active. Insert-mode <Tab>
+  # goes through the smart handler so an open completion menu still wins; the
+  # expr maps also restore snippet <Tab> for users who set no_default_maps.
+  # Select mode (an active placeholder) never has a popup, so it jumps directly.
+  inoremap <buffer> <expr> <Tab> simplecc#SelectTabKey()
+  inoremap <buffer> <expr> <S-Tab> simplecc#SelectShiftTabKey()
   snoremap <buffer> <Tab> <Cmd>call simplecc#SnippetNext()<CR>
   snoremap <buffer> <S-Tab> <Cmd>call simplecc#SnippetPrev()<CR>
 

@@ -207,6 +207,11 @@ gy              Type definition
 [d / ]d        Previous / next diagnostic
 
 Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
+Tab is context-aware and acts on the first of these that applies: advance the
+completion menu, jump to the next snippet placeholder, request completion when
+the cursor follows a word, or insert a literal tab. Shift-Tab moves backward the
+same way. Because the menu takes priority, a popup that appears while editing a
+snippet placeholder is still selectable with Tab.
 
 Disable all defaults before loading the plugin: >
 
