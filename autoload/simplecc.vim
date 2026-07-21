@@ -82,6 +82,10 @@ var s_code_lens_cache: list<dict<any>> = []
 var s_snippet_active: bool = false
 var s_snippet_tabstops: list<dict<any>> = []
 var s_snippet_idx: number = -1
+# Line and starting column of the active (single-line) snippet, used to detect
+# when the cursor has wandered out of the snippet so it can be auto-finished.
+var s_snippet_lnum: number = 0
+var s_snippet_start_col: number = 0
 # Incremental sync state
 var s_pending_changes: dict<list<dict<any>>> = {}
 var s_listener_ids: dict<number> = {}
@@ -919,6 +923,7 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 export def OnCursorMovedI()
+  SnippetCheckRange()
   if !s_initialized || !g:simplecc_auto_complete
     return
   endif
@@ -927,6 +932,12 @@ export def OnCursorMovedI()
     return
   endif
   TriggerCompletion()
+enddef
+
+# Normal-mode cursor movement: only used to auto-finish a snippet when the user
+# leaves insert mode and navigates away from it. Cheap no-op otherwise.
+export def OnCursorMoved()
+  SnippetCheckRange()
 enddef
 
 export def OnInsertLeave()
@@ -1120,8 +1131,9 @@ export def SelectTabKey(): string
     return "\<C-n>"
   endif
   if s_snippet_active
-    SnippetNext()
-    return ''
+    # Defer via <Cmd>: SnippetJump selects the placeholder with :normal, which
+    # is forbidden under the textlock active while an <expr> mapping evaluates.
+    return "\<Cmd>call simplecc#SnippetNext()\<CR>"
   endif
   var byte_col = col('.') - 1
   var before = strpart(getline('.'), 0, byte_col)
@@ -1140,8 +1152,7 @@ export def SelectShiftTabKey(): string
     return "\<C-p>"
   endif
   if s_snippet_active
-    SnippetPrev()
-    return ''
+    return "\<Cmd>call simplecc#SnippetPrev()\<CR>"
   endif
   return "\<S-Tab>"
 enddef
@@ -4011,6 +4022,9 @@ def ApplyCompletionAdditionalEdits(edits: list<dict<any>>)
         s_snippet_tabstops[i].lnum += line_delta
       endfor
     endif
+    if s_snippet_active
+      s_snippet_lnum = max([1, s_snippet_lnum + line_delta])
+    endif
   endif
 enddef
 
@@ -4140,6 +4154,8 @@ def ExpandSnippet(ci: dict<any>, snippet: string)
 
   # Setup tabstop navigation
   s_snippet_active = true
+  s_snippet_lnum = lnum
+  s_snippet_start_col = word_start + 1
   s_snippet_tabstops = []
   for ts in tabstops
     add(s_snippet_tabstops, {
@@ -4204,6 +4220,8 @@ def SnippetFinish()
   s_snippet_active = false
   s_snippet_tabstops = []
   s_snippet_idx = -1
+  s_snippet_lnum = 0
+  s_snippet_start_col = 0
   try
     iunmap <buffer> <Tab>
     iunmap <buffer> <S-Tab>
@@ -4211,6 +4229,26 @@ def SnippetFinish()
     sunmap <buffer> <S-Tab>
   catch
   endtry
+enddef
+
+# True while the cursor still sits within the active snippet. Snippets are
+# single-line, so leaving is detected as moving to a different line or before
+# the snippet's start column. No upper-column bound is enforced: editing a
+# placeholder grows the line, and a strict right edge would finish the snippet
+# mid-typing.
+def SnippetCursorInRange(): bool
+  if !s_snippet_active
+    return false
+  endif
+  return line('.') == s_snippet_lnum && col('.') >= s_snippet_start_col
+enddef
+
+# Auto-finish the snippet once the cursor wanders out of its range. Called from
+# both the insert-mode and normal-mode cursor-movement autocommands.
+export def SnippetCheckRange()
+  if s_snippet_active && !SnippetCursorInRange()
+    SnippetFinish()
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════

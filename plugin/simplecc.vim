@@ -201,6 +201,7 @@ augroup simplecc
   autocmd BufUnload * simplecc#OnBufClose(str2nr(expand('<abuf>')))
   autocmd TextChanged,TextChangedI * simplecc#OnTextChanged()
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
+  autocmd CursorMoved * simplecc#OnCursorMoved()
   autocmd InsertLeave * simplecc#OnInsertLeave()
   autocmd CompleteChanged * simplecc#OnCompleteChanged()
   autocmd CompleteDone * simplecc#OnCompleteDone()
