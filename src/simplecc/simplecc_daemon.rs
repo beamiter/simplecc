@@ -9,7 +9,7 @@ use lsp::client::LspClient;
 use lsp::types;
 use registry::{EventTx, Registry};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
@@ -825,10 +825,9 @@ async fn handle_request(
             let clients = {
                 let mut registry = registry.write().await;
                 if let Some(ref mut registry) = *registry {
-                    if let Ok(Some(_name)) = registry.ensure_server(&language_id, &uri).await {
-                        registry.clients_for_filetype(&language_id)
-                    } else {
-                        Vec::new()
+                    match registry.ensure_server(&language_id, &uri).await {
+                        Ok(Some(_name)) => registry.clients_for_filetype(&language_id),
+                        _ => Vec::new(),
                     }
                 } else {
                     Vec::new()
@@ -1938,10 +1937,12 @@ mod request_tests {
         let reply: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
         assert_eq!(reply["type"], "error");
         assert_eq!(reply["id"], 73);
-        assert!(reply["message"]
-            .as_str()
-            .unwrap()
-            .contains("no active language server"));
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("no active language server")
+        );
     }
 
     #[test]

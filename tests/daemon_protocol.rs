@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -101,11 +101,15 @@ fn malformed_input_does_not_poison_the_next_request() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
 
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "initialized" && event["id"] == 7));
-    assert!(events
-        .iter()
-        .any(|event| event["type"] == "shutdown" && event["id"] == 8));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "initialized" && event["id"] == 7)
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "shutdown" && event["id"] == 8)
+    );
     let _ = std::fs::remove_dir_all(workspace);
 }

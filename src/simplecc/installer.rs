@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -924,10 +924,12 @@ mod tests {
             let command = meta.install_command.unwrap()(&current_platform(), install_dir);
             assert_eq!(command.program, "npm");
             assert!(command.args.iter().any(|arg| arg == "--prefix"));
-            assert!(command
-                .args
-                .iter()
-                .any(|arg| arg == &install_dir.to_string_lossy()));
+            assert!(
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == &install_dir.to_string_lossy())
+            );
             assert!(!command.args.iter().any(|arg| arg == "-g"));
             assert!((meta.binary_rel_path)(&current_platform()).contains("node_modules/.bin"));
         }
