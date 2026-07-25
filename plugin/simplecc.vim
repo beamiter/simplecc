@@ -31,6 +31,8 @@ g:simplecc_complete_resolve_delay = get(g:, 'simplecc_complete_resolve_delay', 1
 # does not know about yet.
 g:simplecc_complete_buffer_words = get(g:, 'simplecc_complete_buffer_words', 1)
 g:simplecc_complete_buffer_max_items = get(g:, 'simplecc_complete_buffer_max_items', 20)
+# Automatically show signature help when typing '(' or ',' in insert mode.
+g:simplecc_signature_help  = get(g:, 'simplecc_signature_help', 1)
 g:simplecc_sign_error      = get(g:, 'simplecc_sign_error', 'E>')
 g:simplecc_sign_warn       = get(g:, 'simplecc_sign_warn', 'W>')
 g:simplecc_sign_info       = get(g:, 'simplecc_sign_info', 'I>')
@@ -199,10 +201,14 @@ augroup simplecc
   autocmd BufEnter * simplecc#OnBufEnter()
   autocmd BufWritePost * simplecc#OnBufSave()
   autocmd BufUnload * simplecc#OnBufClose(str2nr(expand('<abuf>')))
+  autocmd BufLeave * simplecc#OnBufLeave()
   autocmd TextChanged,TextChangedI * simplecc#OnTextChanged()
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
   autocmd CursorMoved * simplecc#OnCursorMoved()
   autocmd InsertLeave * simplecc#OnInsertLeave()
+  # CTRL-C leaves insert mode without firing InsertLeave; ModeChanged still
+  # fires and OnInsertLeave is idempotent for the Esc path.
+  autocmd ModeChanged i*:n* simplecc#OnInsertLeave()
   autocmd CompleteChanged * simplecc#OnCompleteChanged()
   autocmd CompleteDone * simplecc#OnCompleteDone()
   autocmd CursorHold * simplecc#OnCursorHold()

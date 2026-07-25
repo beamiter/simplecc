@@ -66,6 +66,16 @@ call simplecc#ApplyTextEdits(bufnr('%'), [
       \ ])
 call assert_equal(['aM', 'N行'], getline(1, '$'))
 
+" Statusline diagnostic counts: the exported function returns the documented
+" shape even for buffers with no diagnostics or a bufnr that does not exist.
+let s:zero_counts = {'error': 0, 'warning': 0, 'info': 0, 'hint': 0}
+call assert_equal(s:zero_counts, simplecc#DiagCounts())
+call assert_equal(s:zero_counts, simplecc#DiagCounts(bufnr('%')))
+call assert_equal(s:zero_counts, simplecc#DiagCounts(99999))
+
+" Signature help auto-trigger is enabled by default and user-overridable.
+call assert_equal(1, g:simplecc_signature_help)
+
 " Restart is generation-aware: the replacement starts only after the old
 " daemon exits, and an old exit callback cannot reset the replacement state.
 let s:fake_daemon = tempname()

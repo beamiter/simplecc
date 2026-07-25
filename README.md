@@ -262,7 +262,16 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_semtok_priority</code> | 100 | Semantic-token property priority |
 | <code>g:simplecc_semtok_range_threshold</code> | 5000 | Use range requests above this line count |
 | <code>g:simplecc_pull_diagnostics</code> | 0 | Enable pull diagnostics |
+| <code>g:simplecc_signature_help</code> | 1 | Auto-show signature help while typing call arguments |
 | <code>g:simplecc_status</code> | empty | Current statusline-friendly state |
+
+For statuslines, <code>simplecc#DiagCounts()</code> returns the current
+buffer's diagnostic counts as <code>{error, warning, info, hint}</code>, and
+the same dictionary is cached in <code>b:simplecc_diag_counts</code> whenever
+diagnostics are displayed.
+
+Set the <code>SIMPLECC_DEBUG</code> environment variable to make the daemon
+log per-request details to stderr.
 
 ## Troubleshooting
 
@@ -278,6 +287,13 @@ Check the executable directly, for example
 <code>rust-analyzer --version</code>. Use <code>:SimpleCCInstall</code> for a
 managed server, then <code>:SimpleCCRestart</code>. Inspect
 <code>:SimpleCCLog</code> for startup errors.
+
+### Language server crashed
+
+A crashed server restarts automatically with bounded backoff (up to three
+attempts per minute) while a matching buffer is loaded. If it keeps
+stopping, inspect <code>:SimpleCCLog</code> and use
+<code>:SimpleCCRestart</code> after fixing the cause.
 
 ### Configuration does not apply
 

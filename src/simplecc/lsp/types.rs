@@ -224,6 +224,19 @@ pub struct LinkedEditingRangeItem {
     pub word_pattern: Option<String>,
 }
 
+/// Result of textDocument/prepareRename.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrepareRenameItem {
+    pub line: u32,
+    pub character: u32,
+    pub end_line: u32,
+    pub end_character: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// True when the server asked the client to derive the range itself.
+    pub default_behavior: bool,
+}
+
 /// Convert LSP CompletionItemKind to string label.
 pub fn completion_kind_label(kind: lsp_types::CompletionItemKind) -> &'static str {
     use lsp_types::CompletionItemKind;

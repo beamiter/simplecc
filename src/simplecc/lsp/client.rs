@@ -10,16 +10,28 @@ use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use super::transport::LspTransport;
 use super::types;
 
+/// Default timeout for feature requests. Long enough for a server that is
+/// still warming up, short enough that a stuck request cannot hold a daemon
+/// task for minutes.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for cursor-driven requests that are superseded on movement.
+const CURSOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Commands may compile or run project code; give them the long timeout.
+const EXECUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Semantic-token URIs kept in the delta cache before old entries are evicted.
+const SEMTOK_CACHE_LIMIT: usize = 64;
+
 #[derive(Default)]
 struct CompletionCache {
     generation: u64,
     items: Vec<lsp_types::CompletionItem>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct SemanticTokenCache {
     result_id: Option<String>,
     data: Vec<lsp_types::SemanticToken>,
+    last_used: Instant,
 }
 
 /// A single LSP server client.
@@ -33,8 +45,10 @@ pub struct LspClient {
     next_id: Arc<AtomicI64>,
     /// Pending requests: jsonrpc id -> oneshot sender
     pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>,
-    /// Newest in-flight request id per latest-wins feature key.
-    latest_requests: Arc<Mutex<HashMap<String, i64>>>,
+    /// Newest in-flight request per latest-wins feature key, stored as
+    /// (editor sequence, jsonrpc id). Recency is judged by the editor
+    /// sequence: task spawn order does not guarantee wire order.
+    latest_requests: Arc<Mutex<HashMap<String, (u64, i64)>>>,
     /// Server capabilities after initialize
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
@@ -52,6 +66,9 @@ pub struct LspClient {
     /// Methods dynamically registered by the server, such as workspace file
     /// watching requested by LanguageServer.jl.
     registered_methods: Arc<Mutex<HashSet<String>>>,
+    /// Whether the server negotiated incremental document sync. Cached after
+    /// initialize so every keystroke does not re-lock the capability mutex.
+    incremental_sync: Arc<AtomicBool>,
     /// Settings served through `workspace/configuration`. Kept mutable so a
     /// config reload can update a running language server.
     settings: Arc<RwLock<Value>>,
@@ -80,6 +97,26 @@ pub enum ServerEvent {
     ApplyEdit {
         id: Value,
         edit: types::WorkspaceEdit,
+    },
+    /// Server asked the user to pick one of `actions`; the editor must answer
+    /// through `respond_to_server` with the chosen item (or null).
+    ShowMessageRequest {
+        id: Value,
+        level: String,
+        message: String,
+        actions: Vec<String>,
+    },
+    /// Server asked the editor to open a document.
+    ShowDocument {
+        uri: String,
+        external: bool,
+        take_focus: bool,
+        selection: Option<types::RangeItem>,
+    },
+    /// Server invalidated cached feature results; `what` is one of
+    /// "semanticTokens", "inlayHint", "codeLens", or "diagnostics".
+    Refresh {
+        what: String,
     },
     Progress {
         token: String,
@@ -125,6 +162,13 @@ impl LspClient {
         let registered_methods_clone = registered_methods.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
+        let workspace_root = Arc::new((root_uri.to_string(), root_path.to_string()));
+        // Deferred-reply requests (applyEdit, showMessageRequest) forward to
+        // an editor that only starts draining events after initialize
+        // completes; until then they must be answered inline or a server that
+        // blocks initialize on the answer deadlocks startup.
+        let editor_ready = Arc::new(AtomicBool::new(false));
+        let editor_ready_clone = editor_ready.clone();
         tokio::spawn(async move {
             while let Some(msg) = incoming.recv().await {
                 // Is it a response?
@@ -137,6 +181,8 @@ impl LspClient {
                             &event_tx_clone,
                             &settings_clone,
                             &registered_methods_clone,
+                            &workspace_root,
+                            &editor_ready_clone,
                         )
                         .await;
                     } else {
@@ -183,6 +229,7 @@ impl LspClient {
             semtok_cache: Arc::new(Mutex::new(HashMap::new())),
             semtok_uri_locks: Arc::new(Mutex::new(HashMap::new())),
             registered_methods,
+            incremental_sync: Arc::new(AtomicBool::new(false)),
             settings,
             watched_file_notifications: Arc::new(Mutex::new(HashMap::new())),
             alive,
@@ -199,6 +246,7 @@ impl LspClient {
             }
             return Err(error);
         }
+        editor_ready.store(true, Ordering::Release);
 
         Ok((client, event_rx))
     }
@@ -222,7 +270,7 @@ impl LspClient {
 
     /// Send a JSON-RPC request and wait for response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.request_with_timeout(method, params, Duration::from_secs(120))
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
             .await
     }
 
@@ -245,17 +293,19 @@ impl LspClient {
     }
 
     /// Send a request where only the newest request for `key` is useful.
-    /// Starting a replacement drops the previous response channel and emits
-    /// `$/cancelRequest`. Superseded calls return `Ok(None)` without producing
-    /// a daemon error event.
+    /// `seq` is the editor's monotonically increasing request id; it decides
+    /// which of two racing requests is newer. Starting a replacement drops the
+    /// previous response channel and emits `$/cancelRequest`. Superseded calls
+    /// return `Ok(None)` without producing a daemon error event.
     async fn request_latest_with_timeout(
         &self,
         key: &str,
+        seq: u64,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>> {
-        self.request_with_timeout_inner(Some(key), method, params, timeout)
+        self.request_with_timeout_inner(Some((key, seq)), method, params, timeout)
             .await
     }
 
@@ -292,7 +342,7 @@ impl LspClient {
     /// newer request replaced this one while it was waiting for the server.
     async fn clear_latest_request(&self, key: &str, id: i64) -> bool {
         let mut latest = self.latest_requests.lock().await;
-        if latest.get(key).copied() != Some(id) {
+        if latest.get(key).map(|entry| entry.1) != Some(id) {
             return false;
         }
         latest.remove(key);
@@ -301,7 +351,7 @@ impl LspClient {
 
     async fn request_with_timeout_inner(
         &self,
-        latest_key: Option<&str>,
+        latest_key: Option<(&str, u64)>,
         method: &str,
         params: Value,
         timeout: Duration,
@@ -323,13 +373,23 @@ impl LspClient {
         // Hold the latest-request map while cancelling the previous request and
         // writing the replacement. This guarantees the server observes
         // request(old) -> cancel(old) -> request(new), never cancel-before-send.
-        let send_result = if let Some(key) = latest_key {
+        let send_result = if let Some((key, seq)) = latest_key {
             let mut latest = self.latest_requests.lock().await;
-            if let Some(previous_id) = latest.insert(key.to_string(), id) {
+            if let Some(&(existing_seq, _)) = latest.get(key) {
+                if existing_seq > seq {
+                    // This task lost the spawn race: a request the editor
+                    // issued *later* is already in flight. Supersede this one
+                    // instead of cancelling the newer request.
+                    drop(latest);
+                    self.pending.lock().await.remove(&id);
+                    return Ok(None);
+                }
+            }
+            if let Some((_, previous_id)) = latest.insert(key.to_string(), (seq, id)) {
                 self.cancel_pending_request(previous_id).await;
             }
             let result = self.send_message(&msg).await;
-            if result.is_err() && latest.get(key).copied() == Some(id) {
+            if result.is_err() && latest.get(key).map(|entry| entry.1) == Some(id) {
                 latest.remove(key);
             }
             result
@@ -346,7 +406,7 @@ impl LspClient {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
                 self.pending.lock().await.remove(&id);
-                if let Some(key) = latest_key {
+                if let Some((key, _)) = latest_key {
                     if !self.clear_latest_request(key, id).await {
                         return Ok(None);
                     }
@@ -361,7 +421,7 @@ impl LspClient {
             }
             Err(_) => {
                 self.cancel_pending_request(id).await;
-                if let Some(key) = latest_key {
+                if let Some((key, _)) = latest_key {
                     self.clear_latest_request(key, id).await;
                 }
                 bail!(
@@ -372,7 +432,7 @@ impl LspClient {
             }
         };
 
-        if let Some(key) = latest_key {
+        if let Some((key, _)) = latest_key {
             if !self.clear_latest_request(key, id).await {
                 return Ok(None);
             }
@@ -383,6 +443,17 @@ impl LspClient {
         }
 
         Ok(Some(resp.get("result").cloned().unwrap_or(Value::Null)))
+    }
+
+    /// Answer a server-initiated request whose result was produced by the
+    /// editor, such as workspace/applyEdit or window/showMessageRequest.
+    pub async fn respond_to_server(&self, id: Value, result: Value) -> Result<()> {
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        self.send_message(&msg).await
     }
 
     /// Send a JSON-RPC notification (no response expected).
@@ -422,9 +493,25 @@ impl LspClient {
             }],
         });
 
-        let result = self.request("initialize", params).await?;
+        // Initialization may block on first-run project indexing; give it far
+        // more headroom than interactive feature requests.
+        let result = self
+            .request_with_timeout("initialize", params, Duration::from_secs(120))
+            .await?;
 
         let init_result = serde_json::from_value::<InitializeResult>(result)?;
+        let incremental = matches!(
+            init_result.capabilities.text_document_sync,
+            Some(TextDocumentSyncCapability::Kind(
+                TextDocumentSyncKind::INCREMENTAL
+            )) | Some(TextDocumentSyncCapability::Options(
+                TextDocumentSyncOptions {
+                    change: Some(TextDocumentSyncKind::INCREMENTAL),
+                    ..
+                }
+            ))
+        );
+        self.incremental_sync.store(incremental, Ordering::Release);
         *self.capabilities.lock().await = Some(init_result.capabilities);
 
         self.notify("initialized", json!({})).await?;
@@ -514,22 +601,7 @@ impl LspClient {
         changes: Option<Vec<Value>>,
     ) -> Result<()> {
         let content_changes = if let Some(changes) = changes {
-            // Check if server supports incremental sync
-            let caps = self.capabilities.lock().await;
-            let supports_incremental = caps
-                .as_ref()
-                .and_then(|c| match &c.text_document_sync {
-                    Some(TextDocumentSyncCapability::Kind(kind)) => {
-                        Some(*kind == TextDocumentSyncKind::INCREMENTAL)
-                    }
-                    Some(TextDocumentSyncCapability::Options(opts)) => {
-                        opts.change.map(|k| k == TextDocumentSyncKind::INCREMENTAL)
-                    }
-                    None => None,
-                })
-                .unwrap_or(false);
-            drop(caps);
-            if supports_incremental {
+            if self.incremental_sync.load(Ordering::Acquire) {
                 json!(changes)
             } else if let Some(text) = text {
                 json!([{ "text": text }])
@@ -619,8 +691,10 @@ impl LspClient {
 
     // ─── LSP Features ───────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn completion(
         &self,
+        seq: u64,
         uri: &str,
         line: u32,
         character: u32,
@@ -672,6 +746,7 @@ impl LspClient {
         let result = match self
             .request_latest_with_timeout(
                 &request_key,
+                seq,
                 "textDocument/completion",
                 json!({
                     "textDocument": { "uri": uri },
@@ -712,23 +787,39 @@ impl LspClient {
         Ok(Some((generation, normalized)))
     }
 
-    pub async fn hover(&self, uri: &str, line: u32, character: u32) -> Result<Option<String>> {
-        let result = self
-            .request(
+    /// Outer `None` means the request was superseded by a newer one and the
+    /// reply must be skipped; inner `None` is a genuine empty hover.
+    pub async fn hover(
+        &self,
+        seq: u64,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<Option<String>>> {
+        let request_key = format!("hover:{uri}");
+        let result = match self
+            .request_latest_with_timeout(
+                &request_key,
+                seq,
                 "textDocument/hover",
                 json!({
                     "textDocument": { "uri": uri },
                     "position": { "line": line, "character": character },
                 }),
+                CURSOR_REQUEST_TIMEOUT,
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
 
         if result.is_null() {
-            return Ok(None);
+            return Ok(Some(None));
         }
 
         let hover: Hover = serde_json::from_value(result)?;
-        let text = match hover.contents {
+        let text: String = match hover.contents {
             HoverContents::Scalar(mc) => match mc {
                 MarkedString::String(s) => s,
                 MarkedString::LanguageString(ls) => {
@@ -747,7 +838,7 @@ impl LspClient {
                 .join("\n\n"),
             HoverContents::Markup(mc) => mc.value,
         };
-        Ok(Some(text))
+        Ok(Some(Some(text)))
     }
 
     pub async fn definition(
@@ -902,20 +993,41 @@ impl LspClient {
 
         let (workspace_edit, command) = match action {
             lsp_types::CodeActionOrCommand::Command(command) => (None, Some(command)),
-            lsp_types::CodeActionOrCommand::CodeAction(action) => (
-                action.edit.as_ref().map(types::from_lsp_workspace_edit),
-                action.command,
-            ),
+            lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                // Servers may defer the edit/command to codeAction/resolve. A
+                // server without resolve support keeps the original action so
+                // the caller still gets the old "no edit" outcome, not an error.
+                let action = if action.edit.is_none() && action.command.is_none() {
+                    match self
+                        .request("codeAction/resolve", serde_json::to_value(&action)?)
+                        .await
+                    {
+                        Ok(resolved) => serde_json::from_value::<lsp_types::CodeAction>(resolved)
+                            .unwrap_or(action),
+                        Err(error) => {
+                            eprintln!("[simplecc] codeAction/resolve failed: {error}");
+                            action
+                        }
+                    }
+                } else {
+                    action
+                };
+                (
+                    action.edit.as_ref().map(types::from_lsp_workspace_edit),
+                    action.command,
+                )
+            }
         };
 
         if let Some(command) = command {
             let result = self
-                .request(
+                .request_with_timeout(
                     "workspace/executeCommand",
                     json!({
                         "command": command.command,
                         "arguments": command.arguments,
                     }),
+                    EXECUTE_COMMAND_TIMEOUT,
                 )
                 .await?;
             if workspace_edit.is_none() {
@@ -964,6 +1076,84 @@ impl LspClient {
             .collect())
     }
 
+    /// Validate a rename position before prompting the user. `Ok(None)` means
+    /// the server rejected the position (or answered null).
+    pub async fn prepare_rename(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<types::PrepareRenameItem>> {
+        let supported = {
+            let caps = self.capabilities.lock().await;
+            caps.as_ref().is_some_and(|caps| {
+                matches!(
+                    caps.rename_provider,
+                    Some(OneOf::Right(RenameOptions {
+                        prepare_provider: Some(true),
+                        ..
+                    }))
+                )
+            })
+        };
+        if !supported {
+            // Servers without prepare support still rename fine; report the
+            // client-side default so the caller falls back to <cword>.
+            return Ok(Some(types::PrepareRenameItem {
+                line,
+                character,
+                end_line: line,
+                end_character: character,
+                placeholder: None,
+                default_behavior: true,
+            }));
+        }
+
+        let result = self
+            .request(
+                "textDocument/prepareRename",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "position": { "line": line, "character": character },
+                }),
+            )
+            .await?;
+
+        if result.is_null() {
+            return Ok(None);
+        }
+
+        // Range | { range, placeholder } | { defaultBehavior: true }
+        if result
+            .get("defaultBehavior")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(Some(types::PrepareRenameItem {
+                line,
+                character,
+                end_line: line,
+                end_character: character,
+                placeholder: None,
+                default_behavior: true,
+            }));
+        }
+        let placeholder = result
+            .get("placeholder")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let range_value = result.get("range").cloned().unwrap_or(result);
+        let range: Range = serde_json::from_value(range_value)?;
+        Ok(Some(types::PrepareRenameItem {
+            line: range.start.line,
+            character: range.start.character,
+            end_line: range.end.line,
+            end_character: range.end.character,
+            placeholder,
+            default_behavior: false,
+        }))
+    }
+
     pub async fn rename(
         &self,
         uri: &str,
@@ -990,29 +1180,40 @@ impl LspClient {
         Ok(Some(types::from_lsp_workspace_edit(&edit)))
     }
 
+    /// `Ok(None)` means superseded (skip the reply). An empty vector is a
+    /// genuine "no signature here" answer that should close the popup.
     pub async fn signature_help(
         &self,
+        seq: u64,
         uri: &str,
         line: u32,
         character: u32,
     ) -> Result<Option<Vec<types::SignatureInfo>>> {
-        let result = self
-            .request(
+        let request_key = format!("signatureHelp:{uri}");
+        let result = match self
+            .request_latest_with_timeout(
+                &request_key,
+                seq,
                 "textDocument/signatureHelp",
                 json!({
                     "textDocument": { "uri": uri },
                     "position": { "line": line, "character": character },
                 }),
+                Duration::from_secs(5),
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
 
         if result.is_null() {
-            return Ok(None);
+            return Ok(Some(vec![]));
         }
 
         let sh: SignatureHelp = serde_json::from_value(result)?;
         if sh.signatures.is_empty() {
-            return Ok(None);
+            return Ok(Some(vec![]));
         }
 
         let sigs: Vec<types::SignatureInfo> = sh
@@ -1120,34 +1321,49 @@ impl LspClient {
         Ok(vec![])
     }
 
-    pub async fn workspace_symbol(&self, query: &str) -> Result<Vec<types::DocumentSymbolItem>> {
-        let result = self
-            .request(
+    pub async fn workspace_symbol(
+        &self,
+        seq: u64,
+        query: &str,
+    ) -> Result<Option<Vec<types::DocumentSymbolItem>>> {
+        // The live symbol picker fires one request per keystroke; only the
+        // newest query is worth answering.
+        let result = match self
+            .request_latest_with_timeout(
+                "workspaceSymbol",
+                seq,
                 "workspace/symbol",
                 json!({
                     "query": query,
                 }),
+                CURSOR_REQUEST_TIMEOUT,
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
         if result.is_null() {
-            return Ok(vec![]);
+            return Ok(Some(vec![]));
         }
         if let Ok(infos) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result) {
-            return Ok(infos
-                .iter()
-                .map(|i| types::DocumentSymbolItem {
-                    name: i.name.clone(),
-                    kind: types::symbol_kind_label(i.kind).to_string(),
-                    detail: Some(i.location.uri.to_string()),
-                    line: i.location.range.start.line,
-                    character: i.location.range.start.character,
-                    end_line: i.location.range.end.line,
-                    end_character: i.location.range.end.character,
-                    children: vec![],
-                })
-                .collect());
+            return Ok(Some(
+                infos
+                    .iter()
+                    .map(|i| types::DocumentSymbolItem {
+                        name: i.name.clone(),
+                        kind: types::symbol_kind_label(i.kind).to_string(),
+                        detail: Some(i.location.uri.to_string()),
+                        line: i.location.range.start.line,
+                        character: i.location.range.start.character,
+                        end_line: i.location.range.end.line,
+                        end_character: i.location.range.end.character,
+                        children: vec![],
+                    })
+                    .collect(),
+            ));
         }
-        Ok(vec![])
+        Ok(Some(vec![]))
     }
 
     /// Find exact-name declarations in the server's workspace index. This is
@@ -1179,43 +1395,58 @@ impl LspClient {
 
     pub async fn document_highlight(
         &self,
+        seq: u64,
         uri: &str,
         line: u32,
         character: u32,
-    ) -> Result<Vec<types::DocumentHighlightItem>> {
-        let result = self
-            .request(
+    ) -> Result<Option<Vec<types::DocumentHighlightItem>>> {
+        let request_key = format!("documentHighlight:{uri}");
+        let result = match self
+            .request_latest_with_timeout(
+                &request_key,
+                seq,
                 "textDocument/documentHighlight",
                 json!({
                     "textDocument": { "uri": uri },
                     "position": { "line": line, "character": character },
                 }),
+                CURSOR_REQUEST_TIMEOUT,
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
         if result.is_null() {
-            return Ok(vec![]);
+            return Ok(Some(vec![]));
         }
         let highlights: Vec<lsp_types::DocumentHighlight> = serde_json::from_value(result)?;
-        Ok(highlights
-            .iter()
-            .map(|h| types::DocumentHighlightItem {
-                line: h.range.start.line,
-                character: h.range.start.character,
-                end_line: h.range.end.line,
-                end_character: h.range.end.character,
-                kind: types::highlight_kind_label(h.kind).to_string(),
-            })
-            .collect())
+        Ok(Some(
+            highlights
+                .iter()
+                .map(|h| types::DocumentHighlightItem {
+                    line: h.range.start.line,
+                    character: h.range.start.character,
+                    end_line: h.range.end.line,
+                    end_character: h.range.end.character,
+                    kind: types::highlight_kind_label(h.kind).to_string(),
+                })
+                .collect(),
+        ))
     }
 
     pub async fn inlay_hints(
         &self,
+        seq: u64,
         uri: &str,
         start_line: u32,
         end_line: u32,
-    ) -> Result<Vec<types::InlayHintItem>> {
-        let result = self
-            .request(
+    ) -> Result<Option<Vec<types::InlayHintItem>>> {
+        let request_key = format!("inlayHint:{uri}");
+        let result = match self
+            .request_latest_with_timeout(
+                &request_key,
+                seq,
                 "textDocument/inlayHint",
                 json!({
                     "textDocument": { "uri": uri },
@@ -1224,38 +1455,45 @@ impl LspClient {
                         "end": { "line": end_line, "character": 0 },
                     },
                 }),
+                CURSOR_REQUEST_TIMEOUT,
             )
-            .await?;
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
         if result.is_null() {
-            return Ok(vec![]);
+            return Ok(Some(vec![]));
         }
         let hints: Vec<lsp_types::InlayHint> = serde_json::from_value(result)?;
-        Ok(hints
-            .iter()
-            .map(|h| {
-                let label = match &h.label {
-                    lsp_types::InlayHintLabel::String(s) => s.clone(),
-                    lsp_types::InlayHintLabel::LabelParts(parts) => parts
-                        .iter()
-                        .map(|p| p.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(""),
-                };
-                let kind = match h.kind {
-                    Some(lsp_types::InlayHintKind::TYPE) => "type",
-                    Some(lsp_types::InlayHintKind::PARAMETER) => "parameter",
-                    _ => "other",
-                };
-                types::InlayHintItem {
-                    line: h.position.line,
-                    character: h.position.character,
-                    label,
-                    kind: kind.to_string(),
-                    padding_left: h.padding_left.unwrap_or(false),
-                    padding_right: h.padding_right.unwrap_or(false),
-                }
-            })
-            .collect())
+        Ok(Some(
+            hints
+                .iter()
+                .map(|h| {
+                    let label = match &h.label {
+                        lsp_types::InlayHintLabel::String(s) => s.clone(),
+                        lsp_types::InlayHintLabel::LabelParts(parts) => parts
+                            .iter()
+                            .map(|p| p.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(""),
+                    };
+                    let kind = match h.kind {
+                        Some(lsp_types::InlayHintKind::TYPE) => "type",
+                        Some(lsp_types::InlayHintKind::PARAMETER) => "parameter",
+                        _ => "other",
+                    };
+                    types::InlayHintItem {
+                        line: h.position.line,
+                        character: h.position.character,
+                        label,
+                        kind: kind.to_string(),
+                        padding_left: h.padding_left.unwrap_or(false),
+                        padding_right: h.padding_right.unwrap_or(false),
+                    }
+                })
+                .collect(),
+        ))
     }
 
     pub async fn call_hierarchy_prepare(
@@ -1446,10 +1684,44 @@ impl LspClient {
 
     async fn semantic_token_uri_lock(&self, uri: &str) -> Arc<Mutex<()>> {
         let mut locks = self.semtok_uri_locks.lock().await;
+        // A missing didClose (crashed server, forced buffer wipe) must not
+        // leak one lock per URI forever; unused locks are safe to drop.
+        if locks.len() > SEMTOK_CACHE_LIMIT * 2 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         locks
             .entry(uri.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// Insert into the semantic-token cache, evicting the least recently used
+    /// entry once the cache outgrows `SEMTOK_CACHE_LIMIT` documents.
+    async fn store_semtok_cache(
+        &self,
+        uri: &str,
+        result_id: Option<String>,
+        data: &[SemanticToken],
+    ) {
+        let mut cache = self.semtok_cache.lock().await;
+        cache.insert(
+            uri.to_string(),
+            SemanticTokenCache {
+                result_id,
+                data: data.to_vec(),
+                last_used: Instant::now(),
+            },
+        );
+        while cache.len() > SEMTOK_CACHE_LIMIT {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
     }
 
     async fn semantic_tokens_full_inner(&self, uri: &str) -> Result<Vec<types::SemanticTokenItem>> {
@@ -1468,13 +1740,8 @@ impl LspClient {
         let tokens: lsp_types::SemanticTokens = serde_json::from_value(result)?;
         let (type_names, mod_names) = self.get_semtok_legend().await;
 
-        self.semtok_cache.lock().await.insert(
-            uri.to_string(),
-            SemanticTokenCache {
-                result_id: tokens.result_id.clone(),
-                data: tokens.data.clone(),
-            },
-        );
+        self.store_semtok_cache(uri, tokens.result_id.clone(), &tokens.data)
+            .await;
 
         Ok(Self::decode_raw_tokens(
             &tokens.data,
@@ -1495,6 +1762,7 @@ impl LspClient {
             Some(SemanticTokenCache {
                 result_id: Some(result_id),
                 data,
+                ..
             }) => (result_id, data),
             _ => return self.semantic_tokens_full_inner(uri).await,
         };
@@ -1528,24 +1796,13 @@ impl LspClient {
         // Try to parse as full response first, then as delta
         if let Ok(full) = serde_json::from_value::<lsp_types::SemanticTokens>(result.clone()) {
             // Server returned full tokens
-            self.semtok_cache.lock().await.insert(
-                uri.to_string(),
-                SemanticTokenCache {
-                    result_id: full.result_id.clone(),
-                    data: full.data.clone(),
-                },
-            );
+            self.store_semtok_cache(uri, full.result_id.clone(), &full.data)
+                .await;
             Ok(Self::decode_raw_tokens(&full.data, &type_names, &mod_names))
         } else if let Ok(delta) = serde_json::from_value::<lsp_types::SemanticTokensDelta>(result) {
             match apply_semantic_token_edits(&previous_data, &delta.edits) {
                 Ok(data) => {
-                    self.semtok_cache.lock().await.insert(
-                        uri.to_string(),
-                        SemanticTokenCache {
-                            result_id: delta.result_id,
-                            data: data.clone(),
-                        },
-                    );
+                    self.store_semtok_cache(uri, delta.result_id, &data).await;
                     Ok(Self::decode_raw_tokens(&data, &type_names, &mod_names))
                 }
                 Err(error) => {
@@ -1702,12 +1959,13 @@ impl LspClient {
         };
         if let Some(ref cmd) = lens.command {
             let result = self
-                .request(
+                .request_with_timeout(
                     "workspace/executeCommand",
                     json!({
                         "command": cmd.command,
                         "arguments": cmd.arguments,
                     }),
+                    EXECUTE_COMMAND_TIMEOUT,
                 )
                 .await?;
             // Command may return a workspace edit
@@ -1801,7 +2059,9 @@ impl LspClient {
 
     // ─── Pull Diagnostics (LSP 3.17) ───────────────────────
 
-    pub async fn pull_diagnostics(&self, uri: &str) -> Result<Vec<types::DiagnosticItem>> {
+    /// Request pull diagnostics. `Ok(None)` means the report carried no new
+    /// information (an `unchanged` report) and existing diagnostics stand.
+    pub async fn pull_diagnostics(&self, uri: &str) -> Result<Option<Vec<types::DiagnosticItem>>> {
         let result = self
             .request(
                 "textDocument/diagnostic",
@@ -1811,36 +2071,36 @@ impl LspClient {
             )
             .await?;
         if result.is_null() {
-            return Ok(vec![]);
+            return Ok(Some(vec![]));
         }
-        // Parse DocumentDiagnosticReport
-        let items_val = result
-            .get("items")
-            .or_else(|| result.get("relatedDocuments"))
-            .cloned()
-            .unwrap_or_else(|| {
-                // Try full report format
-                result.get("items").cloned().unwrap_or(Value::Array(vec![]))
-            });
+        // No previousResultId is ever sent, so servers should always answer
+        // with a full DocumentDiagnosticReport; treat `unchanged` defensively
+        // as "keep the current diagnostics" instead of clearing them.
+        if result.get("kind").and_then(Value::as_str) == Some("unchanged") {
+            return Ok(None);
+        }
+        let items_val = result.get("items").cloned().unwrap_or(Value::Array(vec![]));
         if let Ok(diags) = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(items_val) {
-            return Ok(diags
-                .iter()
-                .map(|d| types::DiagnosticItem {
-                    line: d.range.start.line,
-                    character: d.range.start.character,
-                    end_line: d.range.end.line,
-                    end_character: d.range.end.character,
-                    severity: types::severity_to_u8(d.severity),
-                    message: d.message.clone(),
-                    source: d.source.clone(),
-                    code: d.code.as_ref().map(|c| match c {
-                        NumberOrString::Number(n) => n.to_string(),
-                        NumberOrString::String(s) => s.clone(),
-                    }),
-                })
-                .collect());
+            return Ok(Some(
+                diags
+                    .iter()
+                    .map(|d| types::DiagnosticItem {
+                        line: d.range.start.line,
+                        character: d.range.start.character,
+                        end_line: d.range.end.line,
+                        end_character: d.range.end.character,
+                        severity: types::severity_to_u8(d.severity),
+                        message: d.message.clone(),
+                        source: d.source.clone(),
+                        code: d.code.as_ref().map(|c| match c {
+                            NumberOrString::Number(n) => n.to_string(),
+                            NumberOrString::String(s) => s.clone(),
+                        }),
+                    })
+                    .collect(),
+            ));
         }
-        Ok(vec![])
+        Ok(Some(vec![]))
     }
 
     pub async fn folding_range(&self, uri: &str) -> Result<Vec<types::FoldingRangeItem>> {
@@ -2047,6 +2307,49 @@ mod lifecycle_tests {
     }
 }
 
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn progress_string_tokens_are_forwarded_without_json_quotes() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let msg = json!({
+            "method": "$/progress",
+            "params": {
+                "token": "rustAnalyzer/Indexing",
+                "value": { "kind": "begin", "title": "Indexing" }
+            }
+        });
+
+        handle_server_notification("$/progress", &msg, &tx).await;
+
+        match rx.recv().await.unwrap() {
+            ServerEvent::Progress { token, kind, .. } => {
+                assert_eq!(token, "rustAnalyzer/Indexing");
+                assert_eq!(kind, "begin");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_progress_tokens_survive_the_conversion() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let msg = json!({
+            "method": "$/progress",
+            "params": { "token": 17, "value": { "kind": "end" } }
+        });
+
+        handle_server_notification("$/progress", &msg, &tx).await;
+
+        match rx.recv().await.unwrap() {
+            ServerEvent::Progress { token, .. } => assert_eq!(token, "17"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}
+
 /// Parse GotoDefinitionResponse / locations.
 fn parse_locations(result: Value) -> Result<Vec<types::Location>> {
     if result.is_null() {
@@ -2227,19 +2530,45 @@ fn convert_selection_range(r: &lsp_types::SelectionRange) -> types::SelectionRan
 }
 
 /// Handle server-initiated requests (workspace/applyEdit, etc.)
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_request(
     msg: &Value,
     transport: &Arc<Mutex<LspTransport>>,
     event_tx: &mpsc::Sender<ServerEvent>,
     settings: &Arc<RwLock<Value>>,
     registered_methods: &Arc<Mutex<HashSet<String>>>,
+    workspace_root: &Arc<(String, String)>,
+    editor_ready: &Arc<AtomicBool>,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
 
     match method {
+        "workspace/applyEdit" if !editor_ready.load(Ordering::Acquire) => {
+            // Sent while initialize is still in flight: the editor is not
+            // draining events yet, so answer inline instead of deadlocking a
+            // server that blocks its initialize response on the answer.
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "applied": false,
+                    "failureReason": "editor is not ready during initialization",
+                },
+            });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "window/showMessageRequest" if !editor_ready.load(Ordering::Acquire) => {
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
         "workspace/applyEdit" => {
-            let apply_result = match msg
+            // The response is deferred: the editor applies the edit and its
+            // actual outcome travels back through `respond_to_server`. Only
+            // edits that never reach the editor are answered here.
+            let forward_result = match msg
                 .get("params")
                 .and_then(|params| params.get("edit"))
                 .cloned()
@@ -2264,14 +2593,128 @@ async fn handle_server_request(
                 Err(error) => Err(error),
             };
 
-            let result = match apply_result {
-                Ok(()) => json!({ "applied": true }),
-                Err(reason) => json!({ "applied": false, "failureReason": reason }),
+            if let Err(reason) = forward_result {
+                let resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "applied": false, "failureReason": reason },
+                });
+                let mut t = transport.lock().await;
+                let _ = t.send(&resp).await;
+            }
+        }
+        "window/showMessageRequest" => {
+            // Deferred like applyEdit: the editor's choice is returned through
+            // `respond_to_server`. Losing the editor means answering null so
+            // the server is never left waiting.
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let level = match params.get("type").and_then(Value::as_u64) {
+                Some(1) => "error",
+                Some(2) => "warn",
+                Some(3) => "info",
+                _ => "debug",
             };
+            let message = params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let actions: Vec<String> = params
+                .get("actions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|action| action.get("title")?.as_str().map(str::to_owned))
+                .collect();
+            let forwarded = event_tx
+                .send(ServerEvent::ShowMessageRequest {
+                    id: id.clone(),
+                    level: level.to_string(),
+                    message,
+                    actions,
+                })
+                .await;
+            if forwarded.is_err() {
+                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+                let mut t = transport.lock().await;
+                let _ = t.send(&resp).await;
+            }
+        }
+        "window/showDocument" => {
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let uri = params
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let external = params
+                .get("external")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let take_focus = params
+                .get("takeFocus")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let selection = params
+                .get("selection")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Range>(value).ok())
+                .map(|range| types::RangeItem {
+                    line: range.start.line,
+                    character: range.start.character,
+                    end_line: range.end.line,
+                    end_character: range.end.character,
+                });
+            // The editor surfaces external URLs but never launches other
+            // programs, so an external target was not actually "shown".
+            let forwarded = !uri.is_empty()
+                && event_tx
+                    .send(ServerEvent::ShowDocument {
+                        uri,
+                        external,
+                        take_focus,
+                        selection,
+                    })
+                    .await
+                    .is_ok();
+            let success = forwarded && !external;
             let resp = json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": result,
+                "result": { "success": success },
+            });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "workspace/semanticTokens/refresh"
+        | "workspace/inlayHint/refresh"
+        | "workspace/codeLens/refresh"
+        | "workspace/diagnostic/refresh" => {
+            let what = match method {
+                "workspace/semanticTokens/refresh" => "semanticTokens",
+                "workspace/inlayHint/refresh" => "inlayHint",
+                "workspace/codeLens/refresh" => "codeLens",
+                _ => "diagnostics",
+            };
+            let _ = event_tx
+                .send(ServerEvent::Refresh {
+                    what: what.to_string(),
+                })
+                .await;
+            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "workspace/workspaceFolders" => {
+            let (root_uri, root_path) = workspace_root.as_ref();
+            let name = std::path::Path::new(root_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace");
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [{ "uri": root_uri, "name": name }],
             });
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
@@ -2536,9 +2979,15 @@ async fn handle_server_notification(
                     let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
                     let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
                     let percentage = value.get("percentage").and_then(|p| p.as_u64());
+                    // String tokens must not gain JSON quotes, or begin/end
+                    // events for the same token stop correlating in the UI.
+                    let token = match token {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
                     let _ = event_tx
                         .send(ServerEvent::Progress {
-                            token: token.to_string(),
+                            token,
                             kind: kind.to_string(),
                             title: title.to_string(),
                             message: message.to_string(),
@@ -2608,6 +3057,10 @@ fn client_capabilities() -> ClientCapabilities {
                             "source.organizeImports".to_string(),
                         ],
                     },
+                }),
+                data_support: Some(true),
+                resolve_support: Some(CodeActionCapabilityResolveSupport {
+                    properties: vec!["edit".to_string(), "command".to_string()],
                 }),
                 ..Default::default()
             }),
@@ -2708,7 +3161,12 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         window: Some(WindowClientCapabilities {
             work_done_progress: Some(true),
-            ..Default::default()
+            show_message: Some(ShowMessageRequestClientCapabilities {
+                message_action_item: Some(MessageActionItemCapabilities {
+                    additional_properties_support: Some(false),
+                }),
+            }),
+            show_document: Some(ShowDocumentClientCapabilities { support: true }),
         }),
         workspace: Some(WorkspaceClientCapabilities {
             apply_edit: Some(true),
@@ -2728,6 +3186,24 @@ fn client_capabilities() -> ClientCapabilities {
             symbol: Some(WorkspaceSymbolClientCapabilities {
                 ..Default::default()
             }),
+            semantic_tokens: Some(SemanticTokensWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            code_lens: Some(CodeLensWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            diagnostic: Some(DiagnosticWorkspaceClientCapabilities {
+                refresh_support: Some(true),
+            }),
+            ..Default::default()
+        }),
+        general: Some(GeneralClientCapabilities {
+            // Positions cross the daemon verbatim and Vim converts to UTF-16;
+            // pinning the encoding stops servers from assuming anything else.
+            position_encodings: Some(vec![PositionEncodingKind::UTF16]),
             ..Default::default()
         }),
         ..Default::default()

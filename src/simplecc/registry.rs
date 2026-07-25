@@ -141,9 +141,11 @@ impl Registry {
 
                 // Spawn event forwarder with the receiver directly (no client lock needed)
                 let server_name = name.clone();
+                let server_filetypes = cfg.filetypes.clone();
                 let event_tx2 = self.event_tx.clone();
                 tokio::spawn(async move {
-                    forward_server_events(event_rx, &server_name, event_tx2).await;
+                    forward_server_events(event_rx, &server_name, &server_filetypes, event_tx2)
+                        .await;
                 });
 
                 // Notify running
@@ -236,7 +238,6 @@ impl Registry {
     }
 
     /// Get the client for a server name.
-    #[allow(dead_code)]
     pub fn client_by_name(&self, name: &str) -> Option<Arc<LspClient>> {
         self.clients
             .get(name)
@@ -284,6 +285,7 @@ impl Registry {
 async fn forward_server_events(
     mut event_rx: tokio::sync::mpsc::Receiver<ServerEvent>,
     server_name: &str,
+    server_filetypes: &[String],
     event_tx: EventTx,
 ) {
     while let Some(event) = event_rx.recv().await {
@@ -332,19 +334,67 @@ async fn forward_server_events(
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
-            ServerEvent::ApplyEdit { id: _, edit } => {
+            ServerEvent::ApplyEdit { id, edit } => {
+                // requestId lets the editor route its actual apply outcome
+                // back to the waiting server through a server/response call.
                 let ev = serde_json::json!({
                     "type": "applyEdit",
+                    "server": server_name,
+                    "requestId": id,
                     "edit": edit,
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
+            ServerEvent::ShowMessageRequest {
+                id,
+                level,
+                message,
+                actions,
+            } => {
+                let ev = serde_json::json!({
+                    "type": "showMessageRequest",
+                    "server": server_name,
+                    "requestId": id,
+                    "level": level,
+                    "message": message,
+                    "actions": actions,
+                });
+                let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
+            }
+            ServerEvent::ShowDocument {
+                uri,
+                external,
+                take_focus,
+                selection,
+            } => {
+                let ev = serde_json::json!({
+                    "type": "showDocument",
+                    "server": server_name,
+                    "uri": uri,
+                    "external": external,
+                    "takeFocus": take_focus,
+                    "selection": selection,
+                });
+                let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
+            }
+            ServerEvent::Refresh { what } => {
+                let ev = serde_json::json!({
+                    "type": "refresh",
+                    "server": server_name,
+                    "what": what,
+                });
+                let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
+            }
             ServerEvent::Stopped { message } => {
+                // Filetypes let the editor re-open matching buffers, which
+                // flows through ensure_server and effectively restarts the
+                // crashed server.
                 let ev = serde_json::json!({
                     "type": "serverStatus",
                     "server": server_name,
                     "status": "stopped",
                     "message": message,
+                    "filetypes": server_filetypes,
                 });
                 let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
             }
@@ -415,30 +465,54 @@ fn directory_uri(path: &Path) -> Result<String> {
         })
 }
 
+/// A command candidate produced by the synchronous filesystem probes.
+enum ResolvedCommand {
+    /// Trusted directly: a managed install or an explicit absolute path.
+    Trusted(String),
+    /// Found on PATH; must still prove it is not a broken proxy.
+    Unverified(PathBuf),
+}
+
 /// Resolve the actual command path: check managed installs first, then PATH.
 /// Managed installs take priority because PATH may contain broken proxies
 /// (e.g. rustup shims for components not installed in the toolchain).
 async fn resolve_command(server_name: &str, cmd: &str) -> Option<String> {
-    // 1. Check managed install directory first
-    // Julia's managed marker is a Project.toml rather than an executable.
-    if server_name != "julia-lsp" && super::installer::is_server_installed(server_name) {
-        if let Some(path) = super::installer::installed_binary_path(server_name) {
-            return Some(path.to_string_lossy().to_string());
+    // Install probes and PATH scans are synchronous filesystem work; keep
+    // them off the async workers that serve interactive requests.
+    let candidate = {
+        let server_name = server_name.to_string();
+        let cmd = cmd.to_string();
+        tokio::task::spawn_blocking(move || {
+            // 1. Check managed install directory first
+            // Julia's managed marker is a Project.toml rather than an executable.
+            if server_name != "julia-lsp" && super::installer::is_server_installed(&server_name) {
+                if let Some(path) = super::installer::installed_binary_path(&server_name) {
+                    return Some(ResolvedCommand::Trusted(path.to_string_lossy().to_string()));
+                }
+            }
+            // 2. Check if it's an absolute path
+            if Path::new(&cmd).is_absolute() && Path::new(&cmd).exists() {
+                return Some(ResolvedCommand::Trusted(cmd));
+            }
+            // 3. Search PATH
+            which::which(&cmd).ok().map(ResolvedCommand::Unverified)
+        })
+        .await
+        .ok()??
+    };
+
+    match candidate {
+        ResolvedCommand::Trusted(path) => Some(path),
+        ResolvedCommand::Unverified(path) => {
+            // pyright-langserver intentionally has no `--version` mode; without a
+            // transport flag it exits non-zero even when the installation is valid.
+            if server_name == "pyright" || verify_executable(&path).await {
+                Some(path.to_string_lossy().to_string())
+            } else {
+                None
+            }
         }
     }
-    // 2. Check if it's an absolute path
-    if std::path::Path::new(cmd).is_absolute() && std::path::Path::new(cmd).exists() {
-        return Some(cmd.to_string());
-    }
-    // 3. Search PATH, but verify the binary is actually executable (not a broken proxy)
-    if let Ok(p) = which::which(cmd) {
-        // pyright-langserver intentionally has no `--version` mode; without a
-        // transport flag it exits non-zero even when the installation is valid.
-        if server_name == "pyright" || verify_executable(&p).await {
-            return Some(p.to_string_lossy().to_string());
-        }
-    }
-    None
 }
 
 /// Verify a binary is actually runnable (not a broken rustup shim, etc.)

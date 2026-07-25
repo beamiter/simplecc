@@ -14,6 +14,8 @@ var s_initialized: bool = false
 var s_initializing: bool = false
 var s_stopping: bool = false
 var s_restart_pending: bool = false
+# Per-server crash-restart bookkeeping: name -> {count, last}
+var s_server_restarts: dict<any> = {}
 var s_job_generation: number = 0
 var s_initialize_id: number = 0
 var s_next_id: number = 0
@@ -67,7 +69,6 @@ var s_spinner_frames: list<string> = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', 
 # Semantic tokens auto state
 var s_semtok_timer: number = 0
 var s_semtok_has_full: dict<bool> = {}
-var s_semtok_range_mode: bool = false
 var s_semtok_modifier_cache: dict<bool> = {}
 # Workspace symbol live search state
 var s_ws_input: string = ''
@@ -76,6 +77,7 @@ var s_ws_results_popup: number = 0
 var s_ws_timer: number = 0
 var s_ws_results: list<dict<any>> = []
 var s_ws_live: bool = false
+var s_ws_selected: number = 0
 # Code lens cache for execution
 var s_code_lens_cache: list<dict<any>> = []
 # Snippet state
@@ -89,16 +91,25 @@ var s_snippet_start_col: number = 0
 # Incremental sync state
 var s_pending_changes: dict<list<dict<any>>> = {}
 var s_listener_ids: dict<number> = {}
-# Inlay hints version tracking
-var s_inlay_request_version: dict<number> = {}
+# Pending request context for buffer-targeted async replies, keyed by request
+# id.  {bufnr, changedtick} is recorded at send time so a reply that arrives
+# after the user switched buffers (or kept editing) is never rendered into the
+# wrong buffer.  Only the most recent request per feature is kept: an older
+# in-flight reply is stale by definition and gets dropped.
+var s_inlay_requests: dict<dict<any>> = {}
+var s_semtok_requests: dict<dict<any>> = {}
+var s_codelens_requests: dict<dict<any>> = {}
+var s_dochl_requests: dict<dict<any>> = {}
 # Window/buffer context for asynchronous location requests.  LSP replies can
 # arrive after the user has moved to another split, so navigation must not use
 # whichever window happens to be current when the reply is handled.
 var s_navigation_contexts: dict<dict<any>> = {}
-# Completion preview state - for real-time preview of selected completion
-var s_comp_preview_start_line: number = 0
-var s_comp_preview_start_col: number = 0
-var s_comp_preview_orig_text: string = ''
+# Per-buffer keyword cache for buffer-word completion: bufnr (as string) ->
+# {tick: changedtick at scan time, words: unique keyword list}
+var s_bufword_cache: dict<dict<any>> = {}
+# Signature help auto-trigger state
+var s_sig_timer: number = 0
+var s_sig_depth: number = 0
 
 def NextId(): number
   s_next_id += 1
@@ -139,6 +150,41 @@ def IsRunning(): bool
   return s_running && s_job != null_job && job_status(s_job) ==# 'run'
 enddef
 
+# Stop debounce/UI timers so no straggling callback fires against a dead
+# daemon or a wiped buffer.  With closing_bufnr >= 0 only the timers whose
+# pending callback targets that buffer (the debounced current-buffer work) are
+# stopped; with the default -1 everything is stopped (daemon exit / Stop).
+def StopFeatureTimers(closing_bufnr: number = -1)
+  if closing_bufnr < 0 || closing_bufnr == bufnr('%')
+    if s_change_timer > 0
+      timer_stop(s_change_timer)
+      s_change_timer = 0
+    endif
+    if s_inlay_timer > 0
+      timer_stop(s_inlay_timer)
+      s_inlay_timer = 0
+    endif
+    if s_semtok_timer > 0
+      timer_stop(s_semtok_timer)
+      s_semtok_timer = 0
+    endif
+    if s_sig_timer > 0
+      timer_stop(s_sig_timer)
+      s_sig_timer = 0
+    endif
+  endif
+  if closing_bufnr < 0
+    if s_ws_timer > 0
+      timer_stop(s_ws_timer)
+      s_ws_timer = 0
+    endif
+    if s_spinner_timer > 0
+      timer_stop(s_spinner_timer)
+      s_spinner_timer = 0
+    endif
+  endif
+enddef
+
 def OnBackendExit(generation: number, code: number)
   # A stopped daemon may exit after a replacement has already started.  Never
   # let that stale callback reset the replacement job's state.
@@ -156,6 +202,11 @@ def OnBackendExit(generation: number, code: number)
   s_job = null_job
   s_cbs = {}
   s_navigation_contexts = {}
+  s_inlay_requests = {}
+  s_semtok_requests = {}
+  s_codelens_requests = {}
+  s_dochl_requests = {}
+  StopFeatureTimers()
   if s_kill_timer > 0
     timer_stop(s_kill_timer)
     s_kill_timer = 0
@@ -368,9 +419,6 @@ def OnBackendEvent(line: string)
   elseif ev.type ==# 'foldingRange'
     OnFoldingRange(ev)
 
-  elseif ev.type ==# 'linkedEditingRange'
-    OnLinkedEditingRange(ev)
-
   elseif ev.type ==# 'completionResolve'
     OnCompletionResolve(ev)
 
@@ -406,6 +454,15 @@ def OnBackendEvent(line: string)
     else
       echo '[LSP] ' .. msg
     endif
+
+  elseif ev.type ==# 'showMessageRequest'
+    OnShowMessageRequest(ev)
+
+  elseif ev.type ==# 'showDocument'
+    OnShowDocument(ev)
+
+  elseif ev.type ==# 'refresh'
+    OnRefresh(ev)
 
   elseif ev.type ==# 'juliaEnvironment'
     s_julia_environment = get(ev, 'path', '')
@@ -870,6 +927,10 @@ export def OnBufClose(buffer: number = 0)
   var bnr = buffer > 0 ? buffer : bufnr('%')
   var uri = BufUri(bnr)
   UnregisterListener(bnr)
+  StopFeatureTimers(bnr)
+  if has_key(s_bufword_cache, string(bnr))
+    remove(s_bufword_cache, string(bnr))
+  endif
   if uri ==# 'file://'
     return
   endif
@@ -901,8 +962,13 @@ export def OnTextChanged()
   if s_change_timer > 0
     timer_stop(s_change_timer)
   endif
+  var changed_bufnr = bufnr('%')
   s_change_timer = timer_start(g:simplecc_change_delay, (_) => {
     s_change_timer = 0
+    # The buffer that scheduled this flush may have been wiped meanwhile.
+    if !bufexists(changed_bufnr)
+      return
+    endif
     SendDidChange()
     # F3: Re-request inlay hints after changes
     RequestInlayHintsDebounced()
@@ -934,10 +1000,18 @@ export def OnCursorMovedI()
   TriggerCompletion()
 enddef
 
-# Normal-mode cursor movement: only used to auto-finish a snippet when the user
-# leaves insert mode and navigates away from it. Cheap no-op otherwise.
+# Normal-mode cursor movement: auto-finish a snippet when the user leaves
+# insert mode and navigates away from it, and drop stale document highlights.
+# Cheap no-op otherwise.
 export def OnCursorMoved()
   SnippetCheckRange()
+  DocumentHighlightClear()
+enddef
+
+# Document highlights belong to the cursor position that requested them; leaving
+# the buffer makes them stale.
+export def OnBufLeave()
+  DocumentHighlightClear()
 enddef
 
 export def OnInsertLeave()
@@ -956,19 +1030,60 @@ export def OnInsertLeave()
   s_comp_resolve_requested = {}
   s_comp_resolved_items = {}
   s_comp_original_line = ''
+  if s_sig_timer > 0
+    timer_stop(s_sig_timer)
+    s_sig_timer = 0
+  endif
+  s_sig_depth = 0
   CloseSignaturePopup()
-  # Clear completion preview state
-  s_comp_preview_start_line = 0
-  s_comp_preview_start_col = 0
-  s_comp_preview_orig_text = ''
+enddef
+
+# Debounced signature help while typing.  InsertCharPre fires before the char
+# is inserted, so the request is deferred until the cursor has moved past it.
+def TriggerSignatureHelpDebounced()
+  if s_sig_timer > 0
+    timer_stop(s_sig_timer)
+  endif
+  var bnr = bufnr('%')
+  s_sig_timer = timer_start(g:simplecc_complete_delay, (_) => {
+    s_sig_timer = 0
+    if !bufexists(bnr) || bufnr('%') != bnr || mode() !~# '^i'
+      return
+    endif
+    SignatureHelp()
+  })
 enddef
 
 export def OnInsertCharPre()
+  var key = v:char
+
+  # F14: signature help auto-trigger on '(' and ','; ')' at depth zero means
+  # the call the popup described is finished, so the popup would be stale.
+  if s_initialized && g:simplecc_signature_help && BufFt() !=# ''
+    if key ==# '('
+      s_sig_depth += 1
+      TriggerSignatureHelpDebounced()
+    elseif key ==# ','
+      if s_sig_depth > 0 || s_sig_popup > 0
+        TriggerSignatureHelpDebounced()
+      endif
+    elseif key ==# ')'
+      s_sig_depth -= 1
+      if s_sig_depth <= 0
+        s_sig_depth = 0
+        if s_sig_timer > 0
+          timer_stop(s_sig_timer)
+          s_sig_timer = 0
+        endif
+        CloseSignaturePopup()
+      endif
+    endif
+  endif
+
   if !pumvisible()
     return
   endif
 
-  var key = v:char
   # Keep filtering while entering an identifier. Whitespace and punctuation
   # close the old menu; TextChangedI can then request a context-triggered menu.
   if key =~# '\k'
@@ -1271,11 +1386,69 @@ def RequestCompletion(manual: bool = false)
   })
 enddef
 
+# Return the unique keyword list for buffer `bnr`, rebuilding it only when the
+# buffer's changedtick moved since the last scan.  Buffers over 10000 lines
+# are skipped entirely to keep completion latency bounded.
+def BufferWordList(bnr: number): list<string>
+  var info = getbufinfo(bnr)
+  if empty(info) || info[0].linecount > 10000
+    return []
+  endif
+  var key = string(bnr)
+  var tick = getbufvar(bnr, 'changedtick', 0)
+  var cached = get(s_bufword_cache, key, {})
+  if !empty(cached) && get(cached, 'tick', -1) == tick
+    return cached.words
+  endif
+  var words: list<string> = []
+  var word_set: dict<bool> = {}
+  for text in getbufline(bnr, 1, '$')
+    for w in split(text, '\%(\k\)\@!.')
+      if !has_key(word_set, w)
+        word_set[w] = true
+        add(words, w)
+      endif
+    endfor
+  endfor
+  s_bufword_cache[key] = {tick: tick, words: words}
+  return words
+enddef
+
+# Append `w` to `out` when it is a new keyword match for `prefix`.  Shared by
+# the cursor-outward current-buffer scan and the cached other-buffer scan.
+def AppendWordMatch(w: string, prefix: string, lower_prefix: string,
+    ic: bool, seen: dict<bool>, existing: dict<bool>, out: list<dict<any>>)
+  # Skip words no longer than the prefix (this also drops the word the user
+  # is currently typing).
+  if strlen(w) <= strlen(prefix)
+    return
+  endif
+  if ic ? stridx(tolower(w), lower_prefix) != 0 : stridx(w, prefix) != 0
+    return
+  endif
+  var lw = ic ? tolower(w) : w
+  if has_key(seen, lw) || has_key(existing, lw)
+    return
+  endif
+  seen[lw] = true
+  add(out, {
+    word: w,
+    abbr: w,
+    menu: 'buf',
+    dup: 1,
+    icase: ic ? 1 : 0,
+    user_data: {source: 'buffer'},
+  })
+enddef
+
 # Collect keyword tokens from open buffers that start with `prefix`, skipping
-# anything already offered by the language server (`existing`). Lines are visited
-# outward from the cursor so nearby, more relevant identifiers surface first and
-# the scan stops as soon as `limit` candidates are found. Other loaded buffers of
-# the same filetype are scanned after the current one for cross-file matches.
+# anything already offered by the language server (`existing`). Current-buffer
+# lines are visited outward from the cursor so nearby, more relevant
+# identifiers surface first and the scan stops as soon as `limit` candidates
+# are found. Other loaded buffers of the same filetype contribute cross-file
+# matches through a per-buffer word cache that is only rebuilt when a buffer's
+# changedtick moved.  The current buffer is not cached: its changedtick moves
+# on every keystroke while completing, so a cache could never be reused.
 def CollectBufferWords(prefix: string, existing: dict<bool>, limit: number): list<dict<any>>
   var out: list<dict<any>> = []
   if limit <= 0 || prefix ==# ''
@@ -1283,71 +1456,50 @@ def CollectBufferWords(prefix: string, existing: dict<bool>, limit: number): lis
   endif
   var ic = &ignorecase
   var lower_prefix = tolower(prefix)
-  var plen = strlen(prefix)
   var seen: dict<bool> = {}
   var cur = line('.')
 
-  # Build the list of (bufnr, lnum) to visit. Current buffer first, ordered by
-  # distance from the cursor; then other loaded same-filetype buffers top-down.
+  # Current buffer, ordered by distance from the cursor.
   var cur_buf = bufnr('%')
   var cur_ft = &filetype
   var total = line('$')
-  var sources: list<list<number>> = [[cur_buf, cur]]
+  var lnums: list<number> = [cur]
   var d = 1
   while cur - d >= 1 || cur + d <= total
     if cur - d >= 1
-      add(sources, [cur_buf, cur - d])
+      add(lnums, cur - d)
     endif
     if cur + d <= total
-      add(sources, [cur_buf, cur + d])
+      add(lnums, cur + d)
     endif
     d += 1
   endwhile
-  for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
-    if b.bufnr == cur_buf || getbufvar(b.bufnr, '&filetype', '') !=# cur_ft
-      continue
-    endif
-    for lnum in range(1, b.linecount)
-      add(sources, [b.bufnr, lnum])
-    endfor
-  endfor
-
-  var last_buf = -1
-  var buf_lines: list<string> = []
-  for src in sources
+  var buf_lines = getbufline(cur_buf, 1, '$')
+  for lnum in lnums
     if len(out) >= limit
-      break
+      return out
     endif
-    if src[0] != last_buf
-      buf_lines = getbufline(src[0], 1, '$')
-      last_buf = src[0]
-    endif
-    var text = get(buf_lines, src[1] - 1, '')
-    for w in split(text, '\%(\k\)\@!.')
+    for w in split(get(buf_lines, lnum - 1, ''), '\%(\k\)\@!.')
       if len(out) >= limit
         break
       endif
-      # Skip words no longer than the prefix (this also drops the word the user
-      # is currently typing).
-      if strlen(w) <= plen
-        continue
+      AppendWordMatch(w, prefix, lower_prefix, ic, seen, existing, out)
+    endfor
+  endfor
+
+  # Other loaded same-filetype buffers, via the cached word lists.
+  for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
+    if len(out) >= limit
+      break
+    endif
+    if b.bufnr == cur_buf || getbufvar(b.bufnr, '&filetype', '') !=# cur_ft
+      continue
+    endif
+    for w in BufferWordList(b.bufnr)
+      if len(out) >= limit
+        break
       endif
-      if ic ? stridx(tolower(w), lower_prefix) != 0 : stridx(w, prefix) != 0
-        continue
-      endif
-      var lw = ic ? tolower(w) : w
-      if has_key(seen, lw) || has_key(existing, lw)
-        continue
-      endif
-      seen[lw] = true
-      add(out, {
-        word: w,
-        abbr: w,
-        menu: 'buf',
-        dup: 1,
-        icase: ic ? 1 : 0,
-        user_data: {source: 'buffer'},
-      })
+      AppendWordMatch(w, prefix, lower_prefix, ic, seen, existing, out)
     endfor
   endfor
   return out
@@ -1444,13 +1596,6 @@ def OnCompletion(ev: dict<any>)
   endif
 
   if mode() ==# 'i'
-    # Save completion start position for preview
-    var current_line_nr = line('.')
-    s_comp_preview_start_line = current_line_nr - 1
-    s_comp_preview_start_col = start
-    s_comp_preview_orig_text = start < s_comp_col - 1
-          ? line_text[start : s_comp_col - 2] : ''
-
     # Save original completeopt and configure
     var saved_completeopt = &completeopt
     set completeopt=menu,menuone,noselect,noinsert
@@ -1744,20 +1889,82 @@ export def Rename()
     return
   endif
 
+  var uri = BufUri()
+  var ft = BufFt()
+  var lnum = line('.') - 1
+  var col16 = CursorUtf16()
+  var bnr = bufnr('%')
   var word = expand('<cword>')
-  var new_name = input('Rename to: ', word)
-  if new_name ==# '' || new_name ==# word
+
+  # Validate the position first; the server also supplies the exact symbol
+  # range, which often differs from <cword> (fields, qualified names).
+  SendWithCb({
+    type: 'textDocument/prepareRename',
+    id: NextId(),
+    uri: uri,
+    languageId: ft,
+    line: lnum,
+    character: col16,
+  }, (ev) => {
+    if get(ev, 'type', '') ==# 'error'
+      echohl ErrorMsg
+      echom '[SimpleCC] rename failed: ' .. get(ev, 'message', 'unknown error')
+      echohl None
+      return
+    endif
+    var result: any = get(ev, 'result', v:null)
+    if type(result) != v:t_dict
+      echohl WarningMsg
+      echom '[SimpleCC] this symbol cannot be renamed here'
+      echohl None
+      return
+    endif
+
+    var placeholder = get(result, 'placeholder', '')
+    if placeholder ==# '' && !get(result, 'default_behavior', false)
+        && get(result, 'line', -1) == get(result, 'end_line', -2)
+      var line_text = get(getbufline(bnr, get(result, 'line', 0) + 1), 0, '')
+      if line_text !=# ''
+        var sc = Utf16ToByteOffset(line_text, get(result, 'character', 0))
+        var ec = Utf16ToByteOffset(line_text, get(result, 'end_character', 0))
+        placeholder = strpart(line_text, sc, ec - sc)
+      endif
+    endif
+    if placeholder ==# ''
+      placeholder = word
+    endif
+
+    # Leave the channel-callback context before prompting the user.
+    var tick = getbufvar(bnr, 'changedtick', -1)
+    timer_start(0, (_) => PromptRename(uri, ft, lnum, col16, placeholder, bnr, tick))
+  })
+enddef
+
+def PromptRename(uri: string, ft: string, lnum: number, col16: number,
+    placeholder: string, bnr: number, tick: number)
+  # The position was captured before the prepareRename round-trip; edits in
+  # the meantime would make the rename fire at stale coordinates.
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != tick
+    echohl WarningMsg
+    echom '[SimpleCC] buffer changed during rename; try again'
+    echohl None
     return
   endif
 
-  var id = NextId()
+  inputsave()
+  var new_name = input('Rename to: ', placeholder)
+  inputrestore()
+  if new_name ==# '' || new_name ==# placeholder
+    return
+  endif
+
   Send({
     type: 'textDocument/rename',
-    id: id,
-    uri: BufUri(),
-    languageId: BufFt(),
-    line: line('.') - 1,
-    character: CursorUtf16(),
+    id: NextId(),
+    uri: uri,
+    languageId: ft,
+    line: lnum,
+    character: col16,
     newName: new_name,
   })
 enddef
@@ -1854,6 +2061,9 @@ def DisplayDiagnostics(uri: string)
   sign_unplace('simplecc', {buffer: bufnr})
 
   var items = get(s_diagnostics, uri, [])
+  # Cache per-buffer severity counts (of the unfiltered set) so statuslines can
+  # read b:simplecc_diag_counts without recounting on every redraw.
+  setbufvar(bufnr, 'simplecc_diag_counts', CountDiagnostics(items))
   # Filter by minimum severity level
   var min_sev = get(g:, 'simplecc_diag_min_severity', 4)
   items = filter(copy(items), (_, v) => get(v, 'severity', 3) <= min_sev)
@@ -1932,6 +2142,32 @@ def UpdateDiagHighlights(bufnr: number, items: list<dict<any>>)
   endfor
 enddef
 
+def CountDiagnostics(items: list<dict<any>>): dict<number>
+  var counts = {error: 0, warning: 0, info: 0, hint: 0}
+  for item in items
+    var sev = get(item, 'severity', 3)
+    if sev == 1
+      counts.error += 1
+    elseif sev == 2
+      counts.warning += 1
+    elseif sev == 4
+      counts.hint += 1
+    else
+      counts.info += 1
+    endif
+  endfor
+  return counts
+enddef
+
+# Per-buffer diagnostic severity counts for statusline integration.
+export def DiagCounts(bufnr: number = 0): dict<number>
+  var bnr = bufnr == 0 ? bufnr('%') : bufnr
+  if !bufexists(bnr)
+    return {error: 0, warning: 0, info: 0, hint: 0}
+  endif
+  return CountDiagnostics(get(s_diagnostics, BufUri(bnr), []))
+enddef
+
 export def DiagList()
   var uri = BufUri()
   var items = get(s_diagnostics, uri, [])
@@ -1952,11 +2188,17 @@ export def DiagList()
     elseif sev == 4
       sev_text = 'H'
     endif
+    # Convert the UTF-16 column against the diagnostic's own buffer/file, not
+    # whichever buffer happens to be current; fall back to the raw column when
+    # no line text is available.
+    var lnum = get(item, 'line', 0) + 1
+    var line_text = PathLine(fpath, lnum)
     add(qf_items, {
       filename: fpath,
-      lnum: get(item, 'line', 0) + 1,
-      col: Utf16LineColumn(
-          getline(get(item, 'line', 0) + 1), get(item, 'character', 0)),
+      lnum: lnum,
+      col: line_text ==# ''
+          ? get(item, 'character', 0) + 1
+          : Utf16LineColumn(line_text, get(item, 'character', 0)),
       text: get(item, 'message', ''),
       type: sev_text,
     })
@@ -2060,7 +2302,163 @@ def OnServerStatus(ev: dict<any>)
     echohl ErrorMsg
     echom printf('[SimpleCC] %s: %s', server, msg)
     echohl None
+  elseif status ==# 'stopped'
+    g:simplecc_status = ''
+    ScheduleServerRestart(server, get(ev, 'filetypes', []))
   endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Crash auto-restart
+# ═════════════════════════════════════════════════════════
+
+# A crashed server restarts automatically by re-opening its buffers, which
+# flows through the daemon's lazy server startup. Bounded backoff prevents a
+# crash-looping server from restarting forever.
+def ScheduleServerRestart(server: string, filetypes: list<any>)
+  if !s_initialized || empty(filetypes)
+    return
+  endif
+
+  var has_buffer = false
+  for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
+    if b.name !=# '' && index(filetypes, getbufvar(b.bufnr, '&filetype')) >= 0
+      has_buffer = true
+      break
+    endif
+  endfor
+  if !has_buffer
+    return
+  endif
+
+  var now = localtime()
+  var state = get(s_server_restarts, server, {count: 0, last: 0})
+  if now - state.last > 60
+    state.count = 0
+  endif
+  if state.count >= 3
+    echohl ErrorMsg
+    echom printf('[SimpleCC] %s keeps stopping; run :SimpleCCRestart to retry', server)
+    echohl None
+    return
+  endif
+  state.count += 1
+  state.last = now
+  s_server_restarts[server] = state
+
+  var delay = [500, 2000, 5000][state.count - 1]
+  Log(printf('scheduling %s restart attempt %d in %dms', server, state.count, delay))
+  echom printf('[SimpleCC] %s stopped; restarting (attempt %d/3)', server, state.count)
+  var generation = s_job_generation
+  timer_start(delay, (_) => ReopenBuffersForFiletypes(filetypes, generation))
+enddef
+
+def ReopenBuffersForFiletypes(filetypes: list<any>, generation: number)
+  # A daemon restarted in the meantime has already re-opened every buffer.
+  if !s_initialized || generation != s_job_generation
+    return
+  endif
+  for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
+    if b.name !=# '' && index(filetypes, getbufvar(b.bufnr, '&filetype')) >= 0
+      SendDidOpen(b.bufnr)
+    endif
+  endfor
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Server-initiated requests
+# ═════════════════════════════════════════════════════════
+
+def ReplyToServer(server: string, request_id: any, result: any)
+  Send({
+    type: 'server/response',
+    id: NextId(),
+    server: server,
+    requestId: request_id,
+    result: result,
+  })
+enddef
+
+def OnShowMessageRequest(ev: dict<any>)
+  var server = get(ev, 'server', '')
+  var message = get(ev, 'message', '')
+  var actions: list<any> = get(ev, 'actions', [])
+  if server ==# '' || !has_key(ev, 'requestId')
+    return
+  endif
+  var request_id = ev.requestId
+
+  if empty(actions)
+    echo '[LSP] ' .. message
+    ReplyToServer(server, request_id, v:null)
+    return
+  endif
+
+  echo '[LSP] ' .. message
+  popup_menu(actions, {
+    title: ' ' .. server .. ' ',
+    callback: (_, idx) => {
+      var result: any = v:null
+      if idx > 0 && idx <= len(actions)
+        result = {title: actions[idx - 1]}
+      endif
+      ReplyToServer(server, request_id, result)
+    },
+  })
+enddef
+
+def OnShowDocument(ev: dict<any>)
+  var uri = get(ev, 'uri', '')
+  if uri ==# ''
+    return
+  endif
+  if get(ev, 'external', false)
+    # Never launch external programs on a server's behalf; surface the URL.
+    echom '[SimpleCC] server requested external document: ' .. uri
+    return
+  endif
+
+  var fpath = UriToPath(uri)
+  if fpath ==# ''
+    return
+  endif
+  try
+    execute 'edit ' .. fnameescape(fpath)
+  catch
+    # E37 (unsaved changes) and friends: fall back to a split so the
+    # request still succeeds without discarding user state.
+    try
+      execute 'split ' .. fnameescape(fpath)
+    catch
+      echohl ErrorMsg
+      echom '[SimpleCC] could not open ' .. fpath .. ': ' .. v:exception
+      echohl None
+      return
+    endtry
+  endtry
+  var selection = get(ev, 'selection', v:null)
+  if type(selection) == v:t_dict
+    var lnum = get(selection, 'line', 0) + 1
+    var col = Utf16ToByteOffset(getline(lnum), get(selection, 'character', 0)) + 1
+    cursor(lnum, col)
+  endif
+enddef
+
+def OnRefresh(ev: dict<any>)
+  var what = get(ev, 'what', '')
+  if !s_initialized
+    return
+  endif
+  if what ==# 'semanticTokens'
+    RequestSemanticTokensDebounced()
+  elseif what ==# 'inlayHint'
+    RequestInlayHintsDebounced()
+  elseif what ==# 'diagnostics'
+    if g:simplecc_pull_diagnostics
+      PullDiagnostics()
+    endif
+  endif
+  # codeLens: lenses render on demand; the next :SimpleCCCodeLens re-requests.
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -2068,36 +2466,71 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 def OnApplyEdit(ev: dict<any>)
+  var applied = true
+  var failure = ''
+  var total_edits = 0
+  var file_count = 0
+
   var edit = get(ev, 'edit', {})
   if type(edit) != v:t_dict
-    return
+    applied = false
+    failure = 'invalid workspace edit payload'
+  else
+    var changes = get(edit, 'changes', [])
+    file_count = len(changes)
+    for file_edit in changes
+      var uri = get(file_edit, 'uri', '')
+      var edits = get(file_edit, 'edits', [])
+      var fpath = UriToPath(uri)
+      if fpath ==# ''
+        # bufnr('') would resolve to the current buffer and silently apply
+        # the server's edits to whatever the user is looking at.
+        applied = false
+        failure = 'workspace edit for an unresolvable URI: ' .. uri
+        continue
+      endif
+      var bnr = bufnr(fpath)
+
+      # :edit can abort (E37, swap prompts, autocmd errors); the try block
+      # guarantees the server still receives its applyEdit answer below.
+      try
+        if bnr < 0
+          execute 'edit ' .. fnameescape(fpath)
+          bnr = bufnr(fpath)
+        endif
+
+        if bnr >= 0
+          ApplyTextEdits(bnr, edits)
+          total_edits += len(edits)
+        else
+          applied = false
+          failure = 'could not open a buffer for ' .. fpath
+        endif
+      catch
+        applied = false
+        failure = printf('failed to apply edits to %s: %s', fpath, v:exception)
+      endtry
+    endfor
+
+    if file_count > 0 && applied
+      echo printf('Applied %d edits across %d files', total_edits, file_count)
+    elseif !applied
+      echohl ErrorMsg
+      echom '[SimpleCC] ' .. failure
+      echohl None
+    endif
   endif
 
-  var changes = get(edit, 'changes', [])
-  if empty(changes)
-    return
+  # A server-initiated workspace/applyEdit is still waiting on its actual
+  # outcome; requestId is absent for editor-initiated edits (rename, actions).
+  var server = get(ev, 'server', '')
+  if server !=# '' && has_key(ev, 'requestId')
+    var result: dict<any> = {applied: applied}
+    if !applied
+      result.failureReason = failure
+    endif
+    ReplyToServer(server, ev.requestId, result)
   endif
-
-  var total_edits = 0
-  for file_edit in changes
-    var uri = get(file_edit, 'uri', '')
-    var edits = get(file_edit, 'edits', [])
-    var fpath = UriToPath(uri)
-    var bnr = bufnr(fpath)
-
-    if bnr < 0
-      # Open the file
-      execute 'edit ' .. fnameescape(fpath)
-      bnr = bufnr(fpath)
-    endif
-
-    if bnr >= 0
-      ApplyTextEdits(bnr, edits)
-      total_edits += len(edits)
-    endif
-  endfor
-
-  echo printf('Applied %d edits across %d files', total_edits, len(changes))
 enddef
 
 export def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
@@ -2358,6 +2791,7 @@ export def Stop(restarting: bool = false)
   s_initialized = false
   s_initializing = false
   s_initialize_id = 0
+  StopFeatureTimers()
   g:simplecc_status = 'stopping'
   var generation = s_job_generation
   var job_to_stop = s_job
@@ -2675,15 +3109,20 @@ enddef
 # Document Highlight
 # ═════════════════════════════════════════════════════════
 
-var s_dochighlight_ids: list<number> = []
+# Buffer the currently displayed document highlights live in (-1 = none).
+var s_dochighlight_bufnr: number = -1
+const DOCHL_PROP_TYPES = ['SimpleCCDocHighlightText', 'SimpleCCDocHighlightRead',
+    'SimpleCCDocHighlightWrite']
 
 export def DocumentHighlight()
   if !s_initialized
     return
   endif
+  var id = NextId()
+  s_dochl_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
   Send({
     type: 'textDocument/documentHighlight',
-    id: NextId(),
+    id: id,
     uri: BufUri(),
     languageId: BufFt(),
     line: line('.') - 1,
@@ -2692,36 +3131,63 @@ export def DocumentHighlight()
 enddef
 
 export def DocumentHighlightClear()
-  for mid in s_dochighlight_ids
-    try
-      matchdelete(mid)
-    catch
-    endtry
-  endfor
-  s_dochighlight_ids = []
+  if s_dochighlight_bufnr < 0
+    return
+  endif
+  if bufexists(s_dochighlight_bufnr)
+    for ptype in DOCHL_PROP_TYPES
+      try
+        prop_remove({type: ptype, bufnr: s_dochighlight_bufnr, all: true})
+      catch
+      endtry
+    endfor
+  endif
+  s_dochighlight_bufnr = -1
 enddef
 
 def OnDocumentHighlightResult(ev: dict<any>)
   DocumentHighlightClear()
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_dochl_requests, key)
+    return
+  endif
+  var req = remove(s_dochl_requests, key)
+  var bnr = req.bufnr
+  # Highlights are position-sensitive: drop the reply when the buffer is gone
+  # or was edited during the round-trip.
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+    return
+  endif
   var highlights = get(ev, 'highlights', [])
   if empty(highlights)
     return
   endif
+  for ptype in DOCHL_PROP_TYPES
+    try
+      prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: 90})
+    catch
+      # Already exists
+    endtry
+  endfor
   for h in highlights
     var kind = get(h, 'kind', 'text')
-    var hl_group = 'SimpleCCDocHighlightText'
+    var ptype = 'SimpleCCDocHighlightText'
     if kind ==# 'read'
-      hl_group = 'SimpleCCDocHighlightRead'
+      ptype = 'SimpleCCDocHighlightRead'
     elseif kind ==# 'write'
-      hl_group = 'SimpleCCDocHighlightWrite'
+      ptype = 'SimpleCCDocHighlightWrite'
     endif
     var sl = get(h, 'line', 0) + 1
     var el = get(h, 'end_line', 0) + 1
-    var sc = Utf16LineColumn(getline(sl), get(h, 'character', 0))
-    var ec = Utf16LineColumn(getline(el), get(h, 'end_character', 0))
+    var sc = Utf16LineColumn(get(getbufline(bnr, sl), 0, ''), get(h, 'character', 0))
+    var ec = Utf16LineColumn(get(getbufline(bnr, el), 0, ''), get(h, 'end_character', 0))
     try
-      var mid = matchadd(hl_group, '\%' .. sl .. 'l\%' .. sc .. 'c\_.*\%' .. el .. 'l\%' .. ec .. 'c')
-      add(s_dochighlight_ids, mid)
+      if sl == el
+        prop_add(sl, sc, {type: ptype, end_col: ec, bufnr: bnr})
+      else
+        prop_add(sl, sc, {type: ptype, end_lnum: el, end_col: ec, bufnr: bnr})
+      endif
+      s_dochighlight_bufnr = bnr
     catch
     endtry
   endfor
@@ -2743,7 +3209,7 @@ export def InlayHintsToggle()
     RequestInlayHints()
   else
     echo '[SimpleCC] Inlay hints OFF'
-    ClearInlayHints()
+    ClearInlayHints(bufnr('%'))
   endif
 enddef
 
@@ -2751,7 +3217,12 @@ def RequestInlayHintsDebounced()
   if s_inlay_timer > 0
     timer_stop(s_inlay_timer)
   endif
+  var bnr = bufnr('%')
   s_inlay_timer = timer_start(500, (_) => {
+    s_inlay_timer = 0
+    if !bufexists(bnr)
+      return
+    endif
     RequestInlayHints()
   })
 enddef
@@ -2764,9 +3235,13 @@ def RequestInlayHints()
   if ft ==# ''
     return
   endif
+  var id = NextId()
+  # Record which buffer snapshot this request was issued for so the async
+  # reply is never rendered into whatever buffer is current at reply time.
+  s_inlay_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
   Send({
     type: 'textDocument/inlayHint',
-    id: NextId(),
+    id: id,
     uri: BufUri(),
     languageId: ft,
     startLine: 0,
@@ -2774,13 +3249,13 @@ def RequestInlayHints()
   })
 enddef
 
-def ClearInlayHints()
+def ClearInlayHints(bnr: number)
   try
-    prop_type_add('SimpleCCInlay', {bufnr: bufnr('%'), highlight: 'SimpleCCInlayHint'})
+    prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
   endtry
   try
-    prop_remove({type: 'SimpleCCInlay', bufnr: bufnr('%'), all: true})
+    prop_remove({type: 'SimpleCCInlay', bufnr: bnr, all: true})
   catch
   endtry
 enddef
@@ -2789,18 +3264,30 @@ def OnInlayHints(ev: dict<any>)
   if !s_inlay_enabled
     return
   endif
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_inlay_requests, key)
+    return
+  endif
+  var req = remove(s_inlay_requests, key)
+  var bnr = req.bufnr
+  # Hints are position-sensitive: drop the reply when the buffer was wiped or
+  # edited during the round-trip (the next change re-requests anyway).
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+    Log('inlay hints: dropped stale reply for buffer ' .. bnr)
+    return
+  endif
   var hints = get(ev, 'hints', [])
   if empty(hints)
     return
   endif
   # Cache for later restoration
   s_inlay_cache = hints
-  s_inlay_cache_bufnr = bufnr('%')
-  ApplyInlayHints(hints, bufnr('%'))
+  s_inlay_cache_bufnr = bnr
+  ApplyInlayHints(hints, bnr)
 enddef
 
 def ApplyInlayHints(hints: list<any>, bnr: number)
-  ClearInlayHints()
+  ClearInlayHints(bnr)
   try
     prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
@@ -3040,14 +3527,22 @@ export def SemanticTokens()
     return
   endif
   var uri = BufUri()
+  var id = NextId()
+  # Record the buffer snapshot (and clearing range) this request was issued
+  # for; the reply validates against it instead of the then-current buffer.
+  var req = {bufnr: bufnr('%'), changedtick: b:changedtick,
+    range_mode: false, top: 0, bot: 0}
   if line('$') > g:simplecc_semtok_range_threshold
     # Large file: use range request for visible area + buffer
     var top = max([0, line('w0') - 1 - 100])
     var bot = min([line('$') - 1, line('w$') - 1 + 100])
-    s_semtok_range_mode = true
+    req.range_mode = true
+    req.top = top + 1
+    req.bot = bot + 1
+    s_semtok_requests = {[string(id)]: req}
     Send({
       type: 'textDocument/semanticTokens/range',
-      id: NextId(),
+      id: id,
       uri: uri,
       languageId: BufFt(),
       startLine: top,
@@ -3057,19 +3552,19 @@ export def SemanticTokens()
     })
   elseif has_key(s_semtok_has_full, uri) && s_semtok_has_full[uri]
     # Subsequent request: use delta
-    s_semtok_range_mode = false
+    s_semtok_requests = {[string(id)]: req}
     Send({
       type: 'textDocument/semanticTokens/delta',
-      id: NextId(),
+      id: id,
       uri: uri,
       languageId: BufFt(),
     })
   else
     # First request: full
-    s_semtok_range_mode = false
+    s_semtok_requests = {[string(id)]: req}
     Send({
       type: 'textDocument/semanticTokens',
-      id: NextId(),
+      id: id,
       uri: uri,
       languageId: BufFt(),
     })
@@ -3140,58 +3635,61 @@ def ResolveSemanticHighlight(ttype: string, mods: list<any>): list<any>
 enddef
 
 def OnSemanticTokens(ev: dict<any>)
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_semtok_requests, key)
+    return
+  endif
+  var req = remove(s_semtok_requests, key)
+  var bnr = req.bufnr
+  # Token positions are tied to the requested snapshot: drop the reply when
+  # the buffer was wiped or edited during the round-trip (the change path
+  # already schedules a fresh request).
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+    Log('semantic tokens: dropped stale reply for buffer ' .. bnr)
+    return
+  endif
   var tokens = get(ev, 'tokens', [])
   if empty(tokens)
     echo 'No semantic tokens'
     return
   endif
-  var bnr = bufnr('%')
-  var uri = BufUri()
+  var uri = BufUri(bnr)
   var prio = g:simplecc_semtok_priority
+  var range_mode: bool = req.range_mode
 
-  if s_semtok_range_mode
-    # Range mode: only clear props in visible region
-    var top = max([1, line('w0') - 100])
-    var bot = min([line('$'), line('w$') + 100])
-    for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
-        'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
-        'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
-        'Number', 'Operator', 'Decorator']
-      var ptype = 'SimpleCCSemantic' .. tt
-      try
-        prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: prio})
-      catch
-      endtry
-      for lnum in range(top, bot)
-        try
-          prop_remove({type: ptype, bufnr: bnr, lnum: lnum})
-        catch
-        endtry
-      endfor
-    endfor
-  else
-    # Full/delta mode: clear all props
-    for tt in ['Namespace', 'Type', 'Class', 'Enum', 'Interface', 'Struct',
-        'TypeParameter', 'Parameter', 'Variable', 'Property', 'EnumMember',
-        'Function', 'Method', 'Macro', 'Keyword', 'Comment', 'String',
-        'Number', 'Operator', 'Decorator']
-      var ptype = 'SimpleCCSemantic' .. tt
-      try
-        prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: prio})
-      catch
-      endtry
-      try
+  # Every prop type this plugin may have placed: the 20 base token types plus
+  # any modifier-combined types created so far.  Registering them here also
+  # means the per-token loop below never has to.
+  var all_ptypes = mapnew(['Namespace', 'Type', 'Class', 'Enum', 'Interface',
+    'Struct', 'TypeParameter', 'Parameter', 'Variable', 'Property',
+    'EnumMember', 'Function', 'Method', 'Macro', 'Keyword', 'Comment',
+    'String', 'Number', 'Operator', 'Decorator'],
+    (_, tt) => 'SimpleCCSemantic' .. tt) + keys(s_semtok_modifier_cache)
+  var registered: dict<bool> = {}
+  for ptype in all_ptypes
+    try
+      prop_type_add(ptype, {bufnr: bnr, highlight: ptype, priority: prio})
+    catch
+    endtry
+    registered[ptype] = true
+    # One ranged prop_remove per type instead of one call per line per type.
+    try
+      if range_mode
+        prop_remove({type: ptype, bufnr: bnr, all: true}, req.top, req.bot)
+      else
         prop_remove({type: ptype, bufnr: bnr, all: true})
-      catch
-      endtry
-    endfor
+      endif
+    catch
+    endtry
+  endfor
+  if !range_mode
     # Mark that full tokens have been received for delta support
     s_semtok_has_full[uri] = true
   endif
 
   for t in tokens
     var lnum = get(t, 'line', 0) + 1
-    var line_text = getline(lnum)
+    var line_text = get(getbufline(bnr, lnum), 0, '')
     var start_utf16 = get(t, 'start', 0)
     var end_utf16 = start_utf16 + get(t, 'length', 0)
     var start_byte = Utf16ToByteOffset(line_text, start_utf16)
@@ -3204,10 +3702,15 @@ def OnSemanticTokens(ev: dict<any>)
     var ptype: string = resolved[0]
     var hl_group: string = resolved[1]
     if lnum > 0 && col > 0 && length > 0
-      try
-        prop_type_add(ptype, {bufnr: bnr, highlight: hl_group, priority: prio})
-      catch
-      endtry
+      # Only modifier-combined types created by this reply still need to be
+      # registered; everything else was handled by the setup loop above.
+      if !has_key(registered, ptype)
+        try
+          prop_type_add(ptype, {bufnr: bnr, highlight: hl_group, priority: prio})
+        catch
+        endtry
+        registered[ptype] = true
+      endif
       try
         prop_add(lnum, col, {type: ptype, length: length, bufnr: bnr})
       catch
@@ -3226,15 +3729,29 @@ export def CodeLens()
     echom '[SimpleCC] not initialized'
     return
   endif
+  var id = NextId()
+  s_codelens_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
   Send({
     type: 'textDocument/codeLens',
-    id: NextId(),
+    id: id,
     uri: BufUri(),
     languageId: BufFt(),
   })
 enddef
 
 def OnCodeLens(ev: dict<any>)
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_codelens_requests, key)
+    return
+  endif
+  var req = remove(s_codelens_requests, key)
+  var bnr = req.bufnr
+  # Lens lines are position-sensitive: drop the reply when the buffer was
+  # wiped or edited during the round-trip.
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+    Log('code lens: dropped stale reply for buffer ' .. bnr)
+    return
+  endif
   var lenses = get(ev, 'lenses', [])
   if empty(lenses)
     echo 'No code lenses'
@@ -3242,7 +3759,6 @@ def OnCodeLens(ev: dict<any>)
   endif
   # Cache for execution
   s_code_lens_cache = lenses
-  var bnr = bufnr('%')
   try
     prop_type_add('SimpleCCCodeLens', {bufnr: bnr, highlight: 'Comment'})
   catch
@@ -3251,10 +3767,12 @@ def OnCodeLens(ev: dict<any>)
     prop_remove({type: 'SimpleCCCodeLens', bufnr: bnr, all: true})
   catch
   endtry
+  var info = getbufinfo(bnr)
+  var line_count = empty(info) ? 0 : info[0].linecount
   for l in lenses
     var lnum = get(l, 'line', 0) + 1
     var title = get(l, 'command_title', '')
-    if title !=# '' && lnum > 0 && lnum <= line('$')
+    if title !=# '' && lnum > 0 && lnum <= line_count
       try
         prop_add(lnum, 0, {type: 'SimpleCCCodeLens', text: '  ' .. title, text_align: 'after', bufnr: bnr})
       catch
@@ -3300,23 +3818,6 @@ def OnFoldingRange(ev: dict<any>)
     endif
   endfor
   echo printf('[SimpleCC] Created %d folds', len(ranges))
-enddef
-
-# ═════════════════════════════════════════════════════════
-# Linked Editing Range
-# ═════════════════════════════════════════════════════════
-
-def OnLinkedEditingRange(ev: dict<any>)
-  # Placeholder for linked editing support
-  var result = get(ev, 'result', {})
-  if type(result) != v:t_dict
-    return
-  endif
-  var ranges = get(result, 'ranges', [])
-  if empty(ranges)
-    return
-  endif
-  echo printf('[SimpleCC] %d linked ranges', len(ranges))
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -3797,6 +4298,7 @@ export def WorkspaceSymbolLive()
   endif
   s_ws_input = ''
   s_ws_results = []
+  s_ws_selected = 0
   s_ws_live = true
 
   s_ws_popup = popup_create(['Type to search workspace symbols...'], {
@@ -3825,21 +4327,34 @@ def WsSymbolFilter(id: number, key: string): bool
     popup_close(id, -1)
     return true
   endif
+  # Move the selection across the currently displayed results.
+  if key ==# "\<C-n>" || key ==# "\<Down>"
+    if s_ws_selected < min([len(s_ws_results), 20]) - 1
+      s_ws_selected += 1
+    endif
+    UpdateWsResults()
+    return true
+  endif
+  if key ==# "\<C-p>" || key ==# "\<Up>"
+    if s_ws_selected > 0
+      s_ws_selected -= 1
+    endif
+    UpdateWsResults()
+    return true
+  endif
   if key ==# "\<CR>"
-    # Jump to selected result
+    # Jump to the selected result
     if !empty(s_ws_results)
-      var sel = 0  # First result
-      if sel < len(s_ws_results)
-        popup_close(id, sel)
-        var item = s_ws_results[sel]
-        var uri = get(item, 'detail', get(item, 'uri', ''))
-        var fpath = UriToPath(uri)
-        if fpath !=# '' && filereadable(fpath)
-          execute 'edit ' .. fnameescape(fpath)
-          var lnum = get(item, 'line', 0) + 1
-          cursor(lnum, Utf16LineColumn(getline(lnum), get(item, 'character', 0)))
-          normal! zz
-        endif
+      var sel = max([0, min([s_ws_selected, len(s_ws_results) - 1])])
+      popup_close(id, sel)
+      var item = s_ws_results[sel]
+      var uri = get(item, 'detail', get(item, 'uri', ''))
+      var fpath = UriToPath(uri)
+      if fpath !=# '' && filereadable(fpath)
+        execute 'edit ' .. fnameescape(fpath)
+        var lnum = get(item, 'line', 0) + 1
+        cursor(lnum, Utf16LineColumn(getline(lnum), get(item, 'character', 0)))
+        normal! zz
       endif
     endif
     return true
@@ -3853,6 +4368,8 @@ def WsSymbolFilter(id: number, key: string): bool
   else
     return false
   endif
+  # A new query invalidates the previous selection.
+  s_ws_selected = 0
   # Update popup content to show query
   popup_settext(id, ['> ' .. s_ws_input])
   # Debounced request
@@ -3861,6 +4378,10 @@ def WsSymbolFilter(id: number, key: string): bool
   endif
   if len(s_ws_input) >= 2
     s_ws_timer = timer_start(300, (_) => {
+      s_ws_timer = 0
+      if !s_ws_live
+        return
+      endif
       Send({
         type: 'workspace/symbol',
         id: NextId(),
@@ -3876,19 +4397,50 @@ def UpdateWsResults()
   if !s_ws_live || s_ws_popup == 0
     return
   endif
+  var shown = min([len(s_ws_results), 20])
+  if s_ws_selected >= shown
+    s_ws_selected = shown > 0 ? shown - 1 : 0
+  endif
   var lines = ['> ' .. s_ws_input, '']
+  var idx = 0
   for item in s_ws_results[: 19]
     var kind = get(item, 'kind', '')
     var name = get(item, 'name', '')
     var detail = get(item, 'detail', '')
     var fpath = UriToPath(detail)
     var short = fnamemodify(fpath, ':t')
-    add(lines, printf('  [%s] %s  %s', kind, name, short))
+    var marker = idx == s_ws_selected ? '▸ ' : '  '
+    add(lines, printf('%s[%s] %s  %s', marker, kind, name, short))
+    idx += 1
   endfor
   if empty(s_ws_results)
     add(lines, '  (no results)')
   endif
   popup_settext(s_ws_popup, lines)
+  # Highlight the selected line with a text property in the popup buffer.
+  if shown > 0
+    var pbuf = winbufnr(s_ws_popup)
+    if pbuf > 0
+      try
+        prop_type_add('SimpleCCWsSelected', {bufnr: pbuf, highlight: 'SimpleCCPmenuSel'})
+      catch
+        # Already exists
+      endtry
+      try
+        prop_remove({type: 'SimpleCCWsSelected', bufnr: pbuf, all: true})
+      catch
+      endtry
+      var sel_lnum = 3 + s_ws_selected
+      var sel_text = get(getbufline(pbuf, sel_lnum), 0, '')
+      if sel_text !=# ''
+        try
+          prop_add(sel_lnum, 1, {type: 'SimpleCCWsSelected',
+            length: strlen(sel_text), bufnr: pbuf})
+        catch
+        endtry
+      endif
+    endif
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -4032,11 +4584,6 @@ export def OnCompleteDone()
   if !s_initialized
     return
   endif
-  # Clear completion preview state
-  s_comp_preview_start_line = 0
-  s_comp_preview_start_col = 0
-  s_comp_preview_orig_text = ''
-
   var ci = v:completed_item
   if empty(ci)
     return
@@ -4310,7 +4857,12 @@ def RequestSemanticTokensDebounced()
   if s_semtok_timer > 0
     timer_stop(s_semtok_timer)
   endif
+  var bnr = bufnr('%')
   s_semtok_timer = timer_start(1000, (_) => {
+    s_semtok_timer = 0
+    if !bufexists(bnr)
+      return
+    endif
     SemanticTokens()
   })
 enddef

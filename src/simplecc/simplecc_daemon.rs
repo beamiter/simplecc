@@ -15,6 +15,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use workspace_watcher::WorkspaceWatcher;
 
+/// Per-keystroke request logging is opt-in: set SIMPLECC_DEBUG=1.
+fn debug_enabled() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| {
+        std::env::var("SIMPLECC_DEBUG").is_ok_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 // ─── Vim → Daemon request types ──────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +176,15 @@ enum Request {
         tab_size: u32,
         #[serde(default = "default_true")]
         insert_spaces: bool,
+    },
+    #[serde(rename = "textDocument/prepareRename")]
+    PrepareRename {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
     },
     #[serde(rename = "textDocument/rename")]
     Rename {
@@ -376,6 +401,19 @@ enum Request {
     InstallServer { id: u64, server: String },
     #[serde(rename = "server/listInstallable")]
     ListInstallable { id: u64 },
+
+    /// Editor answer to a server-initiated request that was forwarded to Vim
+    /// (workspace/applyEdit outcomes, window/showMessageRequest choices).
+    #[serde(rename = "server/response")]
+    ServerResponse {
+        #[serde(default)]
+        id: u64,
+        server: String,
+        #[serde(rename = "requestId")]
+        request_id: Value,
+        #[serde(default)]
+        result: Value,
+    },
 }
 
 impl Request {
@@ -391,6 +429,9 @@ impl Request {
                 | Self::JuliaActivateEnvironment { .. }
                 | Self::JuliaRefreshLanguageServer { .. }
                 | Self::ReloadConfiguration { .. }
+                // A pending language server is blocked until its answer
+                // arrives; never queue it behind slow feature tasks.
+                | Self::ServerResponse { .. }
         )
     }
 
@@ -595,7 +636,18 @@ async fn handle_request(
             root,
             config_path,
         } => {
-            let cfg = match config::Config::load_selected(&root, config_path.as_deref()) {
+            // Configuration discovery walks the filesystem; keep it off the
+            // async workers.
+            let load_result = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let config_path = config_path.clone();
+                move || config::Config::load_selected(&root, config_path.as_deref())
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(anyhow::anyhow!("configuration loader task failed: {error}"))
+            });
+            let cfg = match load_result {
                 Ok(config) => config,
                 Err(error) => {
                     send_event(
@@ -865,6 +917,7 @@ async fn handle_request(
                 };
                 match c
                     .completion(
+                        id,
                         &uri,
                         line,
                         character,
@@ -902,25 +955,30 @@ async fn handle_request(
             line,
             character,
         } => {
-            eprintln!(
+            debug_log!(
                 "[simplecc] hover request: uri={} lang={} line={} char={}",
-                uri, language_id, line, character
+                uri,
+                language_id,
+                line,
+                character
             );
 
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.hover(&uri, line, character).await {
-                    Ok(Some(contents)) => {
-                        eprintln!("[simplecc] hover result: {} bytes", contents.len());
+                match c.hover(id, &uri, line, character).await {
+                    Ok(Some(Some(contents))) => {
+                        debug_log!("[simplecc] hover result: {} bytes", contents.len());
                         send_event(
                             &out,
                             json!({"type": "hover", "id": id, "contents": contents}),
                         );
                     }
-                    Ok(None) => {
-                        eprintln!("[simplecc] hover result: none");
+                    Ok(Some(None)) => {
+                        debug_log!("[simplecc] hover result: none");
                         send_event(&out, json!({"type": "hover", "id": id, "contents": null}));
                     }
+                    // Superseded by a newer hover; that reply follows.
+                    Ok(None) => {}
                     Err(e) => {
                         eprintln!("[simplecc] hover error: {}", e);
                         send_event(
@@ -929,8 +987,6 @@ async fn handle_request(
                         );
                     }
                 }
-            } else {
-                eprintln!("[simplecc] hover: no client for filetype: {}", language_id);
             }
         }
 
@@ -942,9 +998,12 @@ async fn handle_request(
             character,
             symbol,
         } => {
-            eprintln!(
+            debug_log!(
                 "[simplecc] definition request: uri={} lang={} line={} char={}",
-                uri, language_id, line, character
+                uri,
+                language_id,
+                line,
+                character
             );
 
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
@@ -960,7 +1019,7 @@ async fn handle_request(
                             match c.workspace_symbol_locations(&symbol).await {
                                 Ok(fallback) => {
                                     if !fallback.is_empty() {
-                                        eprintln!(
+                                        debug_log!(
                                             "[simplecc] definition workspace fallback: symbol={} locations={}",
                                             symbol,
                                             fallback.len()
@@ -973,7 +1032,7 @@ async fn handle_request(
                                 ),
                             }
                         }
-                        eprintln!("[simplecc] definition result: {} locations", locs.len());
+                        debug_log!("[simplecc] definition result: {} locations", locs.len());
                         send_event(
                             &out,
                             json!({"type": "definition", "id": id, "locations": locs}),
@@ -987,8 +1046,6 @@ async fn handle_request(
                         );
                     }
                 }
-            } else {
-                eprintln!("[simplecc] no client for filetype: {}", language_id);
             }
         }
 
@@ -1087,6 +1144,32 @@ async fn handle_request(
             }
         }
 
+        Request::PrepareRename {
+            id,
+            uri,
+            language_id,
+            line,
+            character,
+        } => {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
+                let c = client;
+                match c.prepare_rename(&uri, line, character).await {
+                    Ok(Some(item)) => send_event(
+                        &out,
+                        json!({"type": "prepareRename", "id": id, "result": item}),
+                    ),
+                    Ok(None) => send_event(
+                        &out,
+                        json!({"type": "prepareRename", "id": id, "result": null}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
+                }
+            }
+        }
+
         Request::Rename {
             id,
             uri,
@@ -1119,15 +1202,18 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.signature_help(&uri, line, character).await {
-                    Ok(Some(sigs)) => send_event(
+                match c.signature_help(id, &uri, line, character).await {
+                    Ok(Some(sigs)) if !sigs.is_empty() => send_event(
                         &out,
                         json!({"type": "signatureHelp", "id": id, "signatures": sigs}),
                     ),
-                    Ok(None) => send_event(
+                    Ok(Some(_)) => send_event(
                         &out,
                         json!({"type": "signatureHelp", "id": id, "signatures": null}),
                     ),
+                    // Superseded by a newer request; skip so a stale null can
+                    // never close the popup the newest reply just opened.
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -1207,11 +1293,13 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.workspace_symbol(&query).await {
-                    Ok(symbols) => send_event(
+                match c.workspace_symbol(id, &query).await {
+                    Ok(Some(symbols)) => send_event(
                         &out,
                         json!({"type": "workspaceSymbol", "id": id, "symbols": symbols}),
                     ),
+                    // Superseded by a newer query; the newer reply follows.
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -1229,11 +1317,14 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.document_highlight(&uri, line, character).await {
-                    Ok(highlights) => send_event(
+                match c.document_highlight(id, &uri, line, character).await {
+                    Ok(Some(highlights)) => send_event(
                         &out,
                         json!({"type": "documentHighlight", "id": id, "highlights": highlights}),
                     ),
+                    // Superseded by a newer cursor position; skip the reply so
+                    // stale results never overwrite the upcoming ones.
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -1251,10 +1342,12 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.inlay_hints(&uri, start_line, end_line).await {
-                    Ok(hints) => {
+                match c.inlay_hints(id, &uri, start_line, end_line).await {
+                    Ok(Some(hints)) => {
                         send_event(&out, json!({"type": "inlayHint", "id": id, "hints": hints}))
                     }
+                    // Superseded by a newer viewport; skip the stale reply.
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -1677,10 +1770,12 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.pull_diagnostics(&uri).await {
-                    Ok(items) => send_event(
+                    Ok(Some(items)) => send_event(
                         &out,
                         json!({"type": "diagnostics", "id": id, "uri": uri, "items": items}),
                     ),
+                    // An unchanged report keeps the currently displayed set.
+                    Ok(None) => {}
                     Err(e) => send_event(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -1739,6 +1834,30 @@ async fn handle_request(
                     "servers": servers,
                 }),
             );
+        }
+
+        Request::ServerResponse {
+            id: _,
+            server,
+            request_id,
+            result,
+        } => {
+            let client = {
+                let registry = registry.read().await;
+                registry
+                    .as_ref()
+                    .and_then(|registry| registry.client_by_name(&server))
+            };
+            match client {
+                Some(client) => {
+                    if let Err(error) = client.respond_to_server(request_id, result).await {
+                        eprintln!("[simplecc] failed to answer {server} request: {error}");
+                    }
+                }
+                None => {
+                    eprintln!("[simplecc] server response for unknown server: {server}");
+                }
+            }
         }
     }
 }
@@ -1823,6 +1942,44 @@ mod request_tests {
             .as_str()
             .unwrap()
             .contains("no active language server"));
+    }
+
+    #[test]
+    fn parses_prepare_rename_requests() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "textDocument/prepareRename",
+            "id": 3,
+            "uri": "file:///tmp/main.rs",
+            "languageId": "rust",
+            "line": 1,
+            "character": 2
+        }))
+        .unwrap();
+
+        assert!(matches!(request, Request::PrepareRename { id: 3, .. }));
+    }
+
+    #[test]
+    fn parses_server_responses_and_keeps_them_ordered() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "server/response",
+            "server": "rust-analyzer",
+            "requestId": 7,
+            "result": { "applied": true }
+        }))
+        .unwrap();
+
+        match &request {
+            Request::ServerResponse {
+                server, request_id, ..
+            } => {
+                assert_eq!(server, "rust-analyzer");
+                assert_eq!(request_id, &json!(7));
+            }
+            _ => panic!("unexpected request variant"),
+        }
+        // A waiting language server must never queue behind feature tasks.
+        assert!(request.preserves_document_order());
     }
 
     #[test]

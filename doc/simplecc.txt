@@ -329,9 +329,31 @@ g:simplecc_semtok_range_threshold number default: 5000
 g:simplecc_pull_diagnostics      number  default: 0
         Enable pull diagnostics.
 
+                                           *g:simplecc_signature_help*
+g:simplecc_signature_help        number  default: 1
+        Automatically show signature help while typing call arguments.
+        Triggered by '(' and ',' inside a call; closed by the matching ')'
+        or when leaving insert mode.
+
                                                     *g:simplecc_status*
 g:simplecc_status                string  default: ''
         Current statusline-friendly SimpleCC state.
+
+                                                *b:simplecc_diag_counts*
+b:simplecc_diag_counts           dict
+        Cached per-buffer diagnostic counts, updated whenever diagnostics
+        are displayed: {error, warning, info, hint}.  Cheap to read from a
+        statusline.
+
+                                                  *simplecc#DiagCounts()*
+simplecc#DiagCounts([{bufnr}])
+        Return the diagnostic counts for {bufnr} (default: current buffer)
+        as a dictionary with the keys error, warning, info, and hint.
+
+                                                       *$SIMPLECC_DEBUG*
+SIMPLECC_DEBUG                   environment variable
+        When set, the daemon logs per-request details (hover, definition)
+        to stderr.  Unset in normal use.
 
 ==============================================================================
 LANGUAGES                                                 *simplecc-languages*
