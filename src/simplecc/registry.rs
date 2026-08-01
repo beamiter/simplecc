@@ -41,12 +41,11 @@ impl Registry {
         self.prune_dead_clients();
 
         // Already mapped and running?
-        if let Some(names) = self.ft_map.get(filetype) {
-            if let Some(name) = names.first() {
-                if self.clients.contains_key(name) {
-                    return Ok(Some(name.clone()));
-                }
-            }
+        if let Some(names) = self.ft_map.get(filetype)
+            && let Some(name) = names.first()
+            && self.clients.contains_key(name)
+        {
+            return Ok(Some(name.clone()));
         }
 
         // Find server config
@@ -485,10 +484,11 @@ async fn resolve_command(server_name: &str, cmd: &str) -> Option<String> {
         tokio::task::spawn_blocking(move || {
             // 1. Check managed install directory first
             // Julia's managed marker is a Project.toml rather than an executable.
-            if server_name != "julia-lsp" && super::installer::is_server_installed(&server_name) {
-                if let Some(path) = super::installer::installed_binary_path(&server_name) {
-                    return Some(ResolvedCommand::Trusted(path.to_string_lossy().to_string()));
-                }
+            if server_name != "julia-lsp"
+                && super::installer::is_server_installed(&server_name)
+                && let Some(path) = super::installer::installed_binary_path(&server_name)
+            {
+                return Some(ResolvedCommand::Trusted(path.to_string_lossy().to_string()));
             }
             // 2. Check if it's an absolute path
             if Path::new(&cmd).is_absolute() && Path::new(&cmd).exists() {

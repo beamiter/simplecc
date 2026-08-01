@@ -440,12 +440,10 @@ What it guarantees:
         uptime, crash and restart counts, and whether the crash-loop breaker
         has tripped, alongside this plugin's own diagnostics.
 
-                                                      *:SimpleCCRestart*
 :SimpleCCRestart
         Stop the daemon and start a fresh one. Clears the crash-loop breaker,
         so this is the way back after repeated failures.
 
-                                                      *:SimpleCCLog*
 :SimpleCCLog
         Open the daemon transcript in a scratch buffer: start and exit events,
         restarts, protocol handshakes, send failures and stderr.

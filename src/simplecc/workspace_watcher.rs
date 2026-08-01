@@ -120,10 +120,10 @@ impl WorkspaceWatcher {
             return Ok(());
         }
 
-        if let Some(previous) = self.julia_environment.take() {
-            if !previous.starts_with(&self.root) {
-                let _ = self.watcher.unwatch(&previous);
-            }
+        if let Some(previous) = self.julia_environment.take()
+            && !previous.starts_with(&self.root)
+        {
+            let _ = self.watcher.unwatch(&previous);
         }
 
         if !environment.starts_with(&self.root) {

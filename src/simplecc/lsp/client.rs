@@ -375,15 +375,15 @@ impl LspClient {
         // request(old) -> cancel(old) -> request(new), never cancel-before-send.
         let send_result = if let Some((key, seq)) = latest_key {
             let mut latest = self.latest_requests.lock().await;
-            if let Some(&(existing_seq, _)) = latest.get(key) {
-                if existing_seq > seq {
-                    // This task lost the spawn race: a request the editor
-                    // issued *later* is already in flight. Supersede this one
-                    // instead of cancelling the newer request.
-                    drop(latest);
-                    self.pending.lock().await.remove(&id);
-                    return Ok(None);
-                }
+            if let Some(&(existing_seq, _)) = latest.get(key)
+                && existing_seq > seq
+            {
+                // This task lost the spawn race: a request the editor
+                // issued *later* is already in flight. Supersede this one
+                // instead of cancelling the newer request.
+                drop(latest);
+                self.pending.lock().await.remove(&id);
+                return Ok(None);
             }
             if let Some((_, previous_id)) = latest.insert(key.to_string(), (seq, id)) {
                 self.cancel_pending_request(previous_id).await;
@@ -406,10 +406,10 @@ impl LspClient {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
                 self.pending.lock().await.remove(&id);
-                if let Some((key, _)) = latest_key {
-                    if !self.clear_latest_request(key, id).await {
-                        return Ok(None);
-                    }
+                if let Some((key, _)) = latest_key
+                    && !self.clear_latest_request(key, id).await
+                {
+                    return Ok(None);
                 }
                 if !self.is_alive() {
                     bail!(
@@ -432,10 +432,10 @@ impl LspClient {
             }
         };
 
-        if let Some((key, _)) = latest_key {
-            if !self.clear_latest_request(key, id).await {
-                return Ok(None);
-            }
+        if let Some((key, _)) = latest_key
+            && !self.clear_latest_request(key, id).await
+        {
+            return Ok(None);
         }
 
         if let Some(err) = resp.get("error") {
@@ -1030,10 +1030,10 @@ impl LspClient {
                     EXECUTE_COMMAND_TIMEOUT,
                 )
                 .await?;
-            if workspace_edit.is_none() {
-                if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result) {
-                    return Ok(Some(types::from_lsp_workspace_edit(&edit)));
-                }
+            if workspace_edit.is_none()
+                && let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result)
+            {
+                return Ok(Some(types::from_lsp_workspace_edit(&edit)));
             }
         }
 
@@ -2973,28 +2973,28 @@ async fn handle_server_notification(
         }
         "$/progress" => {
             // Forward progress to Vim
-            if let Some(token) = params.get("token") {
-                if let Some(value) = params.get("value") {
-                    let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                    let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
-                    let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    let percentage = value.get("percentage").and_then(|p| p.as_u64());
-                    // String tokens must not gain JSON quotes, or begin/end
-                    // events for the same token stop correlating in the UI.
-                    let token = match token {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    let _ = event_tx
-                        .send(ServerEvent::Progress {
-                            token,
-                            kind: kind.to_string(),
-                            title: title.to_string(),
-                            message: message.to_string(),
-                            percentage,
-                        })
-                        .await;
-                }
+            if let Some(token) = params.get("token")
+                && let Some(value) = params.get("value")
+            {
+                let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let title = value.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                let message = value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                let percentage = value.get("percentage").and_then(|p| p.as_u64());
+                // String tokens must not gain JSON quotes, or begin/end
+                // events for the same token stop correlating in the UI.
+                let token = match token {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let _ = event_tx
+                    .send(ServerEvent::Progress {
+                        token,
+                        kind: kind.to_string(),
+                        title: title.to_string(),
+                        message: message.to_string(),
+                        percentage,
+                    })
+                    .await;
             }
         }
         "window/workDoneProgress" => {}

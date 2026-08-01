@@ -155,17 +155,17 @@ where
             if line.is_empty() {
                 break; // End of headers
             }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    if content_length.is_some() {
-                        bail!("duplicate Content-Length header");
-                    }
-                    let length: usize = value.trim().parse().context("bad Content-Length")?;
-                    if length > MAX_CONTENT_LENGTH {
-                        bail!("Content-Length {length} exceeds {MAX_CONTENT_LENGTH} bytes");
-                    }
-                    content_length = Some(length);
+            if let Some((name, value)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case("Content-Length")
+            {
+                if content_length.is_some() {
+                    bail!("duplicate Content-Length header");
                 }
+                let length: usize = value.trim().parse().context("bad Content-Length")?;
+                if length > MAX_CONTENT_LENGTH {
+                    bail!("Content-Length {length} exceeds {MAX_CONTENT_LENGTH} bytes");
+                }
+                content_length = Some(length);
             }
         }
 

@@ -2,7 +2,7 @@
 name = "simplecc"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A Rust-powered Language Server Protocol client for Vim 9"
 repository = "https://github.com/beamiter/simplecc"
 readme = "README.md"

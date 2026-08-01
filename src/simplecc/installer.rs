@@ -845,12 +845,11 @@ async fn promote_installation(staged: &Path, destination: &Path) -> Result<()> {
     }
 
     if let Err(error) = tokio::fs::rename(staged, destination).await {
-        if had_destination {
-            if let Err(restore_error) = tokio::fs::rename(&backup, destination).await {
-                bail!(
-                    "failed to activate managed installation ({error}); also failed to restore the previous installation ({restore_error})"
-                );
-            }
+        if had_destination && let Err(restore_error) = tokio::fs::rename(&backup, destination).await
+        {
+            bail!(
+                "failed to activate managed installation ({error}); also failed to restore the previous installation ({restore_error})"
+            );
         }
         return Err(error).context("failed to activate managed installation");
     }

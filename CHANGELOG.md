@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-08-01
 
+### 构建与 CI 修复
+
+- clippy 的 `collapsible_if` 属于按 MSRV 放开的 lint;声明升到 1.88 后它开始生效,12 处已合并为 let-chain。
+- `rust-version` 由 1.85 更正为 1.88:依赖 `time`/`zip` 实际要求 1.88,原先的声明按字面根本编译不过。新增 CI 的 MSRV 作业按声明版本构建,防止再次漂移。
+- 修复 `doc/simplecc.txt` 中重复的 help tag(`:SimpleCCLog`、`:SimpleCCRestart`),`helptags` 会因此报错并让 `install.sh` 失败。
+
 ### 修复
 
 - `WsSymbolFilter` 因为在 Vim9 lambda 块里写了跨行字典字面量而触发 E723,

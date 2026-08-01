@@ -717,10 +717,10 @@ async fn handle_request(
             match primary_client(&registry, &language_id).await {
                 Some(client) => match client.julia_activate_environment(&env_path).await {
                     Ok(()) => {
-                        if let Some(watcher) = workspace_watcher.lock().await.as_mut() {
-                            if let Err(err) = watcher.watch_julia_environment(&env_path) {
-                                eprintln!("[simplecc] {err}");
-                            }
+                        if let Some(watcher) = workspace_watcher.lock().await.as_mut()
+                            && let Err(err) = watcher.watch_julia_environment(&env_path)
+                        {
+                            eprintln!("[simplecc] {err}");
                         }
                         send_event(
                             &out,
