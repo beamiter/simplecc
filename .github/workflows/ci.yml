@@ -86,3 +86,9 @@ jobs:
           vim -Nu NONE -n -i NONE -es
           -V1/tmp/simplecc-vim-test.log
           -S test/vim9_smoke.vim
+
+      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
+        run: make defcompile
+
+      - name: simplecore supervisor regression suite
+        run: make vim-core

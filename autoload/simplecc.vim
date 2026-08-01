@@ -2827,6 +2827,62 @@ export def Restart()
   endif
 enddef
 
+# A one-shot readout of everything that has to be right for SimpleCC to work,
+# so a user reporting "completion does nothing" can paste one thing.
+export def Health()
+  var exe = FindBackend()
+  echohl Title | echom '[SimpleCC] health check' | echohl None
+
+  var lines: list<string> = []
+  add(lines, printf('[%s] daemon: %s',
+    exe ==# '' ? 'ERROR' : 'OK',
+    exe ==# '' ? 'not found — run ./install.sh or set g:simplecc_daemon_path' : exe))
+  add(lines, printf('[%s] state: %s',
+    IsRunning() ? 'OK' : 'ERROR',
+    !IsRunning() ? 'not running'
+      : (s_initialized ? 'initialized' : (s_initializing ? 'initializing…' : 'running, not initialized'))))
+  add(lines, printf('[INFO] workspace root: %s', s_root ==# '' ? '(none)' : s_root))
+  add(lines, printf('[INFO] language server: %s',
+    get(g:, 'simplecc_status', '') ==# '' ? '(none active)' : g:simplecc_status))
+  if s_julia_environment !=# ''
+    add(lines, printf('[INFO] Julia environment: %s', s_julia_environment))
+  endif
+
+  var restarted: list<string> = []
+  for [server, state] in items(s_server_restarts)
+    var count = get(state, 'count', 0)
+    if count > 0
+      add(restarted, printf('%s×%d', server, count))
+    endif
+  endfor
+  if !empty(restarted)
+    add(lines, printf('[WARN] server restarts: %s', join(restarted, ', ')))
+  endif
+
+  add(lines, printf('[INFO] in-flight requests: %d', len(s_cbs)))
+  var diag_total = 0
+  for [uri, items] in items(s_diagnostics)
+    diag_total += len(items)
+  endfor
+  add(lines, printf('[INFO] diagnostics: %d across %d files', diag_total, len(s_diagnostics)))
+  add(lines, printf('[INFO] open documents: %d', len(s_doc_versions)))
+  add(lines, printf('[%s] popups: %s',
+    has('popupwin') ? 'OK' : 'WARN',
+    has('popupwin') ? 'available' : 'missing +popupwin — hover/signature disabled'))
+  add(lines, printf('[%s] text properties: %s',
+    has('textprop') ? 'OK' : 'WARN',
+    has('textprop') ? 'available' : 'missing +textprop — inlay hints disabled'))
+
+  var cfg = expand('~/.simplecc.json')
+  add(lines, printf('[INFO] user config: %s',
+    filereadable(cfg) ? cfg : '(none — :SimpleCCConfig to create one)'))
+
+  for line in lines
+    echom line
+  endfor
+  echom '[INFO] :SimpleCCLog shows the daemon transcript'
+enddef
+
 export def Status()
   if !IsRunning()
     echo '[SimpleCC] not running'
@@ -4377,20 +4433,26 @@ def WsSymbolFilter(id: number, key: string): bool
     timer_stop(s_ws_timer)
   endif
   if len(s_ws_input) >= 2
-    s_ws_timer = timer_start(300, (_) => {
-      s_ws_timer = 0
-      if !s_ws_live
-        return
-      endif
-      Send({
-        type: 'workspace/symbol',
-        id: NextId(),
-        languageId: BufFt(),
-        query: s_ws_input,
-      })
-    })
+    s_ws_timer = timer_start(300, (_) => SendWsSymbolQuery())
   endif
   return true
+enddef
+
+# Deliberately not inlined into the debounce lambda above: a multi-line
+# dictionary literal nested inside a Vim9 lambda block body fails to parse
+# (E723), which silently made this whole function uncompilable and broke live
+# filtering in :SimpleCCWorkspaceSymbol.
+def SendWsSymbolQuery()
+  s_ws_timer = 0
+  if !s_ws_live
+    return
+  endif
+  Send({
+    type: 'workspace/symbol',
+    id: NextId(),
+    languageId: BufFt(),
+    query: s_ws_input,
+  })
 enddef
 
 def UpdateWsResults()
