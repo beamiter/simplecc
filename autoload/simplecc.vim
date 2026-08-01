@@ -1449,6 +1449,20 @@ enddef
 # matches through a per-buffer word cache that is only rebuilt when a buffer's
 # changedtick moved.  The current buffer is not cached: its changedtick moves
 # on every keystroke while completing, so a cache could never be reused.
+# Split one candidate line into keywords and append the matches.  Callers
+# apply the substring pre-test inline: at ten thousand lines per keystroke the
+# function call itself is a measurable share of the work, so it is only paid
+# for lines that can actually contribute.
+def ScanLineWords(text: string, prefix: string, lower_prefix: string, ic: bool,
+    seen: dict<bool>, existing: dict<bool>, out: list<dict<any>>, limit: number)
+  for w in split(text, '\%(\k\)\@!.')
+    if len(out) >= limit
+      return
+    endif
+    AppendWordMatch(w, prefix, lower_prefix, ic, seen, existing, out)
+  endfor
+enddef
+
 def CollectBufferWords(prefix: string, existing: dict<bool>, limit: number): list<dict<any>>
   var out: list<dict<any>> = []
   if limit <= 0 || prefix ==# ''
@@ -1463,29 +1477,52 @@ def CollectBufferWords(prefix: string, existing: dict<bool>, limit: number): lis
   var cur_buf = bufnr('%')
   var cur_ft = &filetype
   var total = line('$')
-  var lnums: list<number> = [cur]
-  var d = 1
-  while cur - d >= 1 || cur + d <= total
-    if cur - d >= 1
-      add(lnums, cur - d)
-    endif
-    if cur + d <= total
-      add(lnums, cur + d)
-    endif
-    d += 1
-  endwhile
-  var buf_lines = getbufline(cur_buf, 1, '$')
-  for lnum in lnums
-    if len(out) >= limit
-      return out
-    endif
-    for w in split(get(buf_lines, lnum - 1, ''), '\%(\k\)\@!.')
-      if len(out) >= limit
-        break
+
+  # The scan is bounded.  It used to read the whole buffer and split every
+  # line on every keystroke; when the prefix matched nothing the early exit
+  # never fired, so a 60k-line file cost roughly a second per character typed.
+  # Lines are visited outward from the cursor, so the cap only ever costs the
+  # most distant candidates.
+  var max_scan = max([1, get(g:, 'simplecc_complete_buffer_max_lines', 2000)])
+  var half = max_scan / 2 + 1
+  var lo = max([1, cur - half])
+  var hi = min([total, cur + half])
+  var window = getbufline(cur_buf, lo, hi)
+
+  # A word starting with `prefix` can only occur on a line that contains
+  # `prefix` as a substring, so this test rejects nearly every line without
+  # paying for the keyword split -- 12x cheaper when nothing matches, which is
+  # exactly what happens while typing a new identifier.
+  var scanned = 0
+  var below = cur
+  var above = cur - 1
+  var text: string
+  while len(out) < limit && scanned < max_scan && (below <= hi || above >= lo)
+    if below <= hi
+      text = get(window, below - lo, '')
+      if text !=# '' && (ic ? stridx(tolower(text), lower_prefix) >= 0
+                            : stridx(text, prefix) >= 0)
+        ScanLineWords(text, prefix, lower_prefix, ic, seen, existing, out, limit)
       endif
-      AppendWordMatch(w, prefix, lower_prefix, ic, seen, existing, out)
-    endfor
-  endfor
+      below += 1
+      scanned += 1
+    endif
+    if len(out) >= limit || scanned >= max_scan
+      break
+    endif
+    if above >= lo
+      text = get(window, above - lo, '')
+      if text !=# '' && (ic ? stridx(tolower(text), lower_prefix) >= 0
+                            : stridx(text, prefix) >= 0)
+        ScanLineWords(text, prefix, lower_prefix, ic, seen, existing, out, limit)
+      endif
+      above -= 1
+      scanned += 1
+    endif
+  endwhile
+  if len(out) >= limit
+    return out
+  endif
 
   # Other loaded same-filetype buffers, via the cached word lists.
   for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})

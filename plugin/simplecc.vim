@@ -31,6 +31,11 @@ g:simplecc_complete_resolve_delay = get(g:, 'simplecc_complete_resolve_delay', 1
 # does not know about yet.
 g:simplecc_complete_buffer_words = get(g:, 'simplecc_complete_buffer_words', 1)
 g:simplecc_complete_buffer_max_items = get(g:, 'simplecc_complete_buffer_max_items', 20)
+# Upper bound on how many lines of the current buffer are scanned for
+# completion words, counted outward from the cursor. Unbounded scanning cost
+# about a second per keystroke in a 60k-line file whenever the prefix matched
+# nothing, which is exactly what happens while typing a new identifier.
+g:simplecc_complete_buffer_max_lines = get(g:, 'simplecc_complete_buffer_max_lines', 2000)
 # Automatically show signature help when typing '(' or ',' in insert mode.
 g:simplecc_signature_help  = get(g:, 'simplecc_signature_help', 1)
 g:simplecc_sign_error      = get(g:, 'simplecc_sign_error', 'E>')

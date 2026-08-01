@@ -571,7 +571,11 @@ mod tests {
             &["Cargo.toml".to_string()],
         );
 
-        assert_eq!(selected, package);
+        // server_root_path canonicalizes, and on macOS std::env::temp_dir()
+        // hands back /var/folders/... which is a symlink to /private/var/...,
+        // so the expectation has to be canonicalized too. The sibling test
+        // below already does this.
+        assert_eq!(selected, std::fs::canonicalize(&package).unwrap());
         std::fs::remove_dir_all(workspace).unwrap();
     }
 

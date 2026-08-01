@@ -105,3 +105,6 @@ jobs:
 
       - name: simplecore supervisor regression suite
         run: make vim-core
+
+      - name: Buffer-word completion bound
+        run: vim -Nu NONE -n -i NONE -es -S test/buffer_words.vim

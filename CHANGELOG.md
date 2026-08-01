@@ -2,6 +2,35 @@
 
 ## Unreleased - 2026-08-01
 
+### 性能:缓冲区词补全
+
+补全在插入模式下每次按键都会跑,而 `CollectBufferWords()` 过去会把整个 buffer
+读进来并逐行做关键字切分。前缀匹配不到任何词时提前退出永远不触发——而"匹配不到"
+恰恰是敲一个新标识符时的常态。60000 行的文件实测:
+
+| | 优化前 | 优化后 |
+|---|---|---|
+| 前缀有匹配 | 6.78 ms | **0.39 ms** |
+| 前缀无匹配(敲新名字) | **968 ms** | **1.54 ms** |
+
+- 加子串预筛:以 `prefix` 开头的词只可能出现在包含 `prefix` 的行上,所以先用
+  `stridx()` 排除绝大多数行,不必为它们付出正则切分的代价。结果与逐行切分完全
+  一致,而"无匹配"场景快 12 倍。
+- 扫描有上界:新增 `g:simplecc_complete_buffer_max_lines`(默认 2000),从光标向
+  两侧展开,所以被截掉的只会是离光标最远的候选。此前无论 buffer 多大都会全扫。
+- 不再预先构造覆盖全 buffer 的行号列表,也不再整体 `getbufline()`,只取光标附近
+  的窗口。
+- 新增 `test/buffer_words.vim`:验证匹配、距离排序、去重、上限、以及扫描上界确实
+  生效(把上界去掉该测试会失败)。
+
+### 修复
+
+- `registry` 的 `root_patterns_choose_the_nearest_marker_without_crossing_workspace`
+  在 macOS 上一直失败:`std::env::temp_dir()` 返回 `/var/folders/...`,而它是
+  `/private/var/...` 的符号链接,`server_root_path()` 会做 canonicalize,两边对不上。
+  期望值改为同样 canonicalize(与相邻的那个测试一致)。simplecc 的 CI 至少从
+  2026-07-21 起就因此挂着。
+
 ### 构建与 CI 修复
 
 - clippy 的 `collapsible_if` 属于按 MSRV 放开的 lint;声明升到 1.88 后它开始生效,12 处已合并为 let-chain。
