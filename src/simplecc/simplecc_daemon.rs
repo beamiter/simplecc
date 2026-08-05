@@ -536,8 +536,85 @@ async fn filetype_clients(
 
 // ─── Main ────────────────────────────────────────────────
 
+const USAGE: &str = "\
+Usage: simplecc-daemon [OPTION]
+
+With no arguments the daemon serves newline-delimited JSON requests on stdin
+and writes replies to stdout.  That is how the Vim plugin starts it; there is
+nothing useful to do with it interactively.
+
+Options:
+  -V, --version    print the version and exit
+  -h, --help       print this help and exit
+      --self-test  check the built-in language-server table resolves, and exit
+";
+
+/// Checks that the built-in language-server table is self-consistent.
+///
+/// The installer needs to know that the binary it just built actually works,
+/// and a version string only proves the file is not corrupt.  Every filetype a
+/// bundled server claims must resolve back to a server: when it does not, that
+/// filetype silently gets no completion at all, which is the kind of failure
+/// nobody reports as a bug.
+fn self_test() -> Result<()> {
+    let config = config::Config::default();
+    if config.language_servers.is_empty() {
+        anyhow::bail!("the built-in table declares no language servers");
+    }
+
+    let filetypes: std::collections::BTreeSet<String> = config
+        .language_servers
+        .values()
+        .flat_map(|server| server.filetypes.iter().cloned())
+        .collect();
+    for filetype in &filetypes {
+        if config.server_for_filetype(filetype).is_none() {
+            anyhow::bail!("filetype '{filetype}' is claimed by a server but resolves to none");
+        }
+    }
+
+    println!(
+        "ok ({} servers, {} filetypes)",
+        config.language_servers.len(),
+        filetypes.len()
+    );
+    Ok(())
+}
+
 #[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        None => match serve().await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("simplecc-daemon: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Some("--version" | "-V") => {
+            println!("simplecc-daemon {}", env!("CARGO_PKG_VERSION"));
+            std::process::ExitCode::SUCCESS
+        }
+        Some("--help" | "-h") => {
+            println!("simplecc-daemon {}\n\n{USAGE}", env!("CARGO_PKG_VERSION"));
+            std::process::ExitCode::SUCCESS
+        }
+        Some("--self-test") => match self_test() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("self-test failed: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+        Some(other) => {
+            eprintln!("unknown argument: {other}\n\n{USAGE}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+async fn serve() -> Result<()> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
