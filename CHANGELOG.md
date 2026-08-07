@@ -2,6 +2,15 @@
 
 ## Unreleased - 2026-08-05
 
+### 按需诊断详情
+
+- 新增 `:SimpleCCDiag` 与 `<Plug>(simplecc-show-diagnostic)`:即使关闭自动
+  diagnostic float,也可显式查看当前行的全部可见诊断,完整展示 severity、source、
+  字符串或整数 code,并保留多行 message。
+- 手动与 `CursorHold` 自动浮窗现在复用 `g:simplecc_diag_min_severity`,多条诊断按
+  severity、位置稳定排序;隐藏的 info/hint 不会只在浮窗里意外重现。
+- fake-daemon 冒烟测试覆盖 source/code 类型归一、按需弹窗与严重级过滤。
+
 ### 诊断工作流升级
 
 - `:SimpleCCDiagnostics[!] [severity]` 现在同时覆盖两种常用视角:无 `!` 保持

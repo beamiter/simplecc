@@ -72,6 +72,7 @@ command! -nargs=0 SimpleCCAction        simplecc#CodeAction()
 command! -bang -nargs=? -complete=customlist,simplecc#CompleteDiagnosticSeverity SimpleCCDiagnostics simplecc#DiagList('<bang>' ==# '!', <q-args>)
 command! -nargs=0 SimpleCCNextDiag      simplecc#DiagNext()
 command! -nargs=0 SimpleCCPrevDiag      simplecc#DiagPrev()
+command! -nargs=0 SimpleCCDiag          simplecc#Diag()
 command! -nargs=0 SimpleCCSignatureHelp simplecc#SignatureHelp()
 command! -nargs=0 SimpleCCLog           simplecc#ShowLog()
 command! -nargs=0 SimpleCCHealth        simplecc#Health()
@@ -112,6 +113,7 @@ nnoremap <silent> <Plug>(simplecc-code-action) <Cmd>SimpleCCAction<CR>
 nnoremap <silent> <Plug>(simplecc-format) <Cmd>SimpleCCFormat<CR>
 nnoremap <silent> <Plug>(simplecc-prev-diagnostic) <Cmd>SimpleCCPrevDiag<CR>
 nnoremap <silent> <Plug>(simplecc-next-diagnostic) <Cmd>SimpleCCNextDiag<CR>
+nnoremap <silent> <Plug>(simplecc-show-diagnostic) <Cmd>SimpleCCDiag<CR>
 nnoremap <silent> <Plug>(simplecc-implementation) <Cmd>SimpleCCImplementation<CR>
 nnoremap <silent> <Plug>(simplecc-type-definition) <Cmd>SimpleCCTypeDef<CR>
 nnoremap <silent> <Plug>(simplecc-outline) <Cmd>SimpleCCOutline<CR>

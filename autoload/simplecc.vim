@@ -2238,7 +2238,7 @@ def DiagnosticQfItem(uri: string, item: dict<any>): dict<any>
     col: line_text ==# ''
         ? get(item, 'character', 0) + 1
         : Utf16LineColumn(line_text, get(item, 'character', 0)),
-    text: get(item, 'message', ''),
+    text: DiagnosticText(item),
     type: DiagnosticType(get(item, 'severity', 3)),
   }
 enddef
@@ -2395,16 +2395,37 @@ export def DiagPrev()
   echo DiagMessage(last)
 enddef
 
+def DiagnosticSource(item: dict<any>): string
+  var raw_src = get(item, 'source', '')
+  return type(raw_src) == v:t_string ? raw_src : ''
+enddef
+
+def DiagnosticCode(item: dict<any>): string
+  var raw_code = get(item, 'code', '')
+  # LSP permits either a string or an integer diagnostic code.  Ignore
+  # structured/malformed values instead of letting a detail popup fail while
+  # concatenating an `any` value.
+  return type(raw_code) == v:t_string ? raw_code
+    : type(raw_code) == v:t_number ? string(raw_code) : ''
+enddef
+
+def DiagnosticText(item: dict<any>): string
+  var raw_message = get(item, 'message', '')
+  return type(raw_message) == v:t_string && raw_message !=# ''
+    ? raw_message : '(no diagnostic message)'
+enddef
+
 def DiagMessage(item: dict<any>): string
   var sev = get(item, 'severity', 3)
   var prefix = sev == 1 ? 'Error' : sev == 2 ? 'Warning' : sev == 4 ? 'Hint' : 'Info'
-  var src = get(item, 'source', '')
-  var code = get(item, 'code', '')
+  var src = DiagnosticSource(item)
+  var code = DiagnosticCode(item)
   var tag = src !=# '' ? src : ''
   if code !=# ''
     tag ..= tag !=# '' ? '(' .. code .. ')' : code
   endif
-  return printf('[%s%s] %s', prefix, tag !=# '' ? ' ' .. tag : '', item.message)
+  return printf('[%s%s] %s', prefix, tag !=# '' ? ' ' .. tag : '',
+      DiagnosticText(item))
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -4128,7 +4149,7 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     var shown = diags[: max_per_line - 1]
     var msgs: list<string> = []
     for d in shown
-      var msg = substitute(get(d, 'message', ''), "\n", ' ', 'g')
+      var msg = substitute(DiagnosticText(d), "\n", ' ', 'g')
       if strchars(msg) > 60
         msg = strcharpart(msg, 0, 57) .. '...'
       endif
@@ -4164,29 +4185,60 @@ export def OnCursorHold()
   s_selection_ranges = []
   # Show diagnostic float if enabled
   if g:simplecc_diag_float
-    ShowDiagFloat()
+    ShowDiagFloat(false)
   endif
 enddef
 
-def ShowDiagFloat()
+def CompareDiagnosticDetail(a: dict<any>, b: dict<any>): number
+  var severity = get(a, 'severity', 3) - get(b, 'severity', 3)
+  if severity != 0
+    return severity
+  endif
+  var position = CompareDiagnosticPosition(a, b)
+  if position != 0
+    return position
+  endif
+  # Vim's sort() is not stable. Use the displayed metadata as deterministic
+  # tie-breakers so same-position diagnostics never flicker across refreshes.
+  var asource = DiagnosticSource(a)
+  var bsource = DiagnosticSource(b)
+  if asource !=# bsource
+    return asource <# bsource ? -1 : 1
+  endif
+  var acode = DiagnosticCode(a)
+  var bcode = DiagnosticCode(b)
+  if acode !=# bcode
+    return acode <# bcode ? -1 : 1
+  endif
+  var atext = DiagnosticText(a)
+  var btext = DiagnosticText(b)
+  return atext <# btext ? -1 : atext ==# btext ? 0 : 1
+enddef
+
+def ShowDiagFloat(notify_empty: bool)
   if s_diag_popup > 0
     popup_close(s_diag_popup)
     s_diag_popup = 0
   endif
   var uri = BufUri()
-  var items = get(s_diagnostics, uri, [])
-  if empty(items)
-    return
-  endif
+  var items = VisibleDiagnostics(uri)
   var cur_line = line('.') - 1
   var line_items = filter(copy(items), (_, v) => get(v, 'line', -1) == cur_line)
   if empty(line_items)
+    if notify_empty
+      echo 'No visible diagnostics on current line'
+    endif
     return
   endif
+  sort(line_items, CompareDiagnosticDetail)
   var lines: list<string> = []
   for item in line_items
-    add(lines, DiagMessage(item))
+    extend(lines, split(DiagMessage(item), "\n", true))
   endfor
+  if !has('popupwin')
+    echo join(lines, ' | ')
+    return
+  endif
   s_diag_popup = popup_atcursor(lines, {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
@@ -4196,6 +4248,13 @@ def ShowDiagFloat()
     highlight: 'Normal',
     borderhighlight: ['SimpleCCFloatBorder'],
   })
+enddef
+
+# Show diagnostics on demand even when g:simplecc_diag_float is disabled.
+# This shares the exact visibility boundary used by signs, virtual text and
+# [d/]d, so hidden info/hints do not unexpectedly reappear in the inspector.
+export def Diag()
+  ShowDiagFloat(true)
 enddef
 
 # ═════════════════════════════════════════════════════════

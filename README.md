@@ -204,6 +204,7 @@ npm, the Go module proxy, or Julia package registries.
 | Command | Action |
 | --- | --- |
 | <code>:SimpleCCDiagnostics[!] [severity]</code> | List current-buffer diagnostics; use `!` for the workspace and optionally filter one severity |
+| <code>:SimpleCCDiag</code> | Show all visible diagnostics on the current line, including source and code |
 | <code>:SimpleCCNextDiag</code> | Jump to the next diagnostic |
 | <code>:SimpleCCPrevDiag</code> | Jump to the previous diagnostic |
 | <code>:SimpleCCPullDiag</code> | Request pull diagnostics |
@@ -218,6 +219,13 @@ example `:SimpleCCDiagnostics! error`. Both lists are sorted deterministically
 by path and position. `[d` and `]d` follow
 `g:simplecc_diag_min_severity`, including same-line diagnostics, and wrap in
 position order.
+
+`:SimpleCCDiag` is the explicit counterpart to `g:simplecc_diag_float`: it
+works even when automatic diagnostic popups are disabled. Multiple diagnostics
+are ordered by severity and position, multiline messages are preserved, and
+the popup uses the same `g:simplecc_diag_min_severity` boundary as signs,
+virtual text, and navigation. Map `<Plug>(simplecc-show-diagnostic)` if you
+want a dedicated key.
 
 ## Default mappings
 

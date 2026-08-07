@@ -26,7 +26,7 @@ while IFS= read -r line; do
       if [[ "$open_count" == "1" ]]; then
         # Mixed severities let the Vim smoke test exercise exact filtering and
         # navigation's g:simplecc_diag_min_severity boundary.
-        printf '{"type":"diagnostics","uri":"%s","items":[{"line":0,"character":0,"end_line":0,"end_character":1,"severity":1,"message":"source error"},{"line":1,"character":5,"end_line":1,"end_character":6,"severity":2,"message":"source warning"},{"line":2,"character":1,"end_line":2,"end_character":2,"severity":4,"message":"source hint"}]}\n' "$uri"
+        printf '{"type":"diagnostics","uri":"%s","items":[{"line":0,"character":0,"end_line":0,"end_character":1,"severity":2,"source":"lint","code":7,"message":"same-position warning"},{"line":0,"character":0,"end_line":0,"end_character":1,"severity":2,"source":"alint","code":9,"message":"lexically first warning"},{"line":0,"character":0,"end_line":0,"end_character":1,"severity":1,"source":"rustc","code":"E0001","message":"source error"},{"line":1,"character":5,"end_line":1,"end_character":6,"severity":2,"source":"lint","code":42,"message":"source warning"},{"line":1,"character":1,"end_line":1,"end_character":2,"severity":4,"message":"hidden hint"},{"line":2,"character":1,"end_line":2,"end_character":2,"severity":4,"message":null}]}\n' "$uri"
       else
         printf '{"type":"diagnostics","uri":"%s","items":[{"line":0,"character":0,"end_line":0,"end_character":1,"severity":1,"message":"workspace error"}]}\n' "$uri"
       fi

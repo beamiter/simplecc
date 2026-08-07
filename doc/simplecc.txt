@@ -190,6 +190,13 @@ Diagnostics and Julia ~
                                 Gather every diagnostic snapshot currently
                                 known to SimpleCC in the global quickfix list.
                                 Results are sorted by file and position.
+*:SimpleCCDiag*                 Show every visible diagnostic on the current
+                                line, including its source and string/integer
+                                code. Multiple entries are ordered by severity
+                                then position; multiline messages are kept.
+                                This works independently of
+                                |g:simplecc_diag_float| and obeys
+                                |g:simplecc_diag_min_severity|.
 *:SimpleCCNextDiag*              Jump to the next diagnostic.
 *:SimpleCCPrevDiag*              Jump to the previous diagnostic.
 *:SimpleCCPullDiag*              Request pull diagnostics.
@@ -212,6 +219,10 @@ gy              Type definition
 <Leader>o       Document outline
 <Leader>ih      Toggle inlay hints
 [d / ]d        Previous / next diagnostic
+
+Optional diagnostic mapping target:
+
+  <Plug>(simplecc-show-diagnostic)   |:SimpleCCDiag|
 
 Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
 Tab is context-aware and acts on the first of these that applies: advance the

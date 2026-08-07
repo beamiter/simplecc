@@ -14,6 +14,7 @@ defcompile
 
 call assert_match('simplecc_existing_mapping_ran', maparg('gd', 'n'))
 call assert_match('SimpleCCDefinition', maparg('<Plug>(simplecc-definition)', 'n'))
+call assert_match('SimpleCCDiag', maparg('<Plug>(simplecc-show-diagnostic)', 'n'))
 call assert_false(exists('g:simplecc_sign_definition_injected'))
 
 " LSP positions are UTF-16 code units; Vim columns and string slices are bytes.
@@ -106,7 +107,7 @@ sleep 150m
 
 " Diagnostics stay split-local by default, while :SimpleCCDiagnostics! gathers
 " all known buffers.  An exact severity argument must filter both scopes.
-call assert_equal({'error': 1, 'warning': 1, 'info': 0, 'hint': 1},
+call assert_equal({'error': 1, 'warning': 3, 'info': 0, 'hint': 2},
       \ simplecc#DiagCounts())
 SimpleCCDiagnostics error
 let s:source_loclist = getloclist(win_id2win(s:source_winid))
@@ -126,6 +127,27 @@ call win_gotoid(s:source_winid)
 " Navigation follows the same visible-severity boundary as signs and virtual
 " text, and wraps using the sorted diagnostic order.
 let g:simplecc_diag_min_severity = 2
+" The on-demand inspector works even with automatic floats disabled, shares
+" the visible-severity filter, and normalizes string/integer LSP codes.
+call cursor(1, 1)
+let s:before_popups = popup_list()
+SimpleCCDiag
+let s:new_popups = filter(popup_list(), {_, id -> index(s:before_popups, id) < 0})
+call assert_equal(1, len(s:new_popups))
+call assert_equal(['[Error rustc(E0001)] source error',
+      \ '[Warning alint(9)] lexically first warning',
+      \ '[Warning lint(7)] same-position warning'],
+      \ getbufline(winbufnr(s:new_popups[0]), 1, '$'))
+call popup_close(s:new_popups[0])
+call cursor(2, 1)
+let s:before_popups = popup_list()
+SimpleCCDiag
+let s:new_popups = filter(popup_list(), {_, id -> index(s:before_popups, id) < 0})
+call assert_equal(1, len(s:new_popups))
+call assert_equal(['[Warning lint(42)] source warning'],
+      \ getbufline(winbufnr(s:new_popups[0]), 1, '$'))
+call popup_close(s:new_popups[0])
+
 call cursor(1, 1)
 call simplecc#DiagNext()
 call assert_equal([2, 6], [line('.'), col('.')])
@@ -134,6 +156,17 @@ call assert_equal([1, 1], [line('.'), col('.')])
 call simplecc#DiagPrev()
 call assert_equal([2, 6], [line('.'), col('.')])
 let g:simplecc_diag_min_severity = 4
+
+" Empty/malformed messages still render a useful, nonempty detail line.
+call cursor(3, 2)
+let s:before_popups = popup_list()
+SimpleCCDiag
+let s:new_popups = filter(popup_list(), {_, id -> index(s:before_popups, id) < 0})
+call assert_equal(1, len(s:new_popups))
+call assert_equal(['[Hint] (no diagnostic message)'],
+      \ getbufline(winbufnr(s:new_popups[0]), 1, '$'))
+call popup_close(s:new_popups[0])
+call cursor(2, 6)
 
 call simplecc#Definition()
 call win_gotoid(s:other_winid)
