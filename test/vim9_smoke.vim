@@ -155,6 +155,38 @@ call simplecc#DiagNext()
 call assert_equal([1, 1], [line('.'), col('.')])
 call simplecc#DiagPrev()
 call assert_equal([2, 6], [line('.'), col('.')])
+
+" An explicit exact severity is independent of the display threshold. This
+" lets users jump through hidden hints temporarily without changing signs or
+" virtual text; no argument above retains the old visible-only behaviour.
+call cursor(1, 1)
+SimpleCCNextDiag hint
+call assert_equal([2, 2], [line('.'), col('.')])
+SimpleCCNextDiag hint
+call assert_equal([3, 2], [line('.'), col('.')])
+SimpleCCPrevDiag hint
+call assert_equal([2, 2], [line('.'), col('.')])
+SimpleCCNextDiag error
+call assert_equal([1, 1], [line('.'), col('.')])
+
+" Same-position ties have a deterministic message when navigation wraps.
+call cursor(2, 6)
+let s:warning_nav = execute('SimpleCCNextDiag warning')
+call assert_equal([1, 1], [line('.'), col('.')])
+call assert_match('\[Warning alint(9)\] lexically first warning', s:warning_nav)
+
+" Invalid filters fail closed: no cursor movement and no fallback navigation.
+call cursor(2, 6)
+messages clear
+SimpleCCNextDiag fatal
+call assert_equal([2, 6], [line('.'), col('.')])
+call assert_match('diagnostic severity must be', execute('messages'))
+messages clear
+SimpleCCNextDiag warn
+call assert_equal([2, 6], [line('.'), col('.')])
+call assert_match('diagnostic severity must be', execute('messages'))
+call assert_equal(['all', 'error', 'warning', 'info', 'hint'],
+      \ simplecc#CompleteDiagnosticSeverity('', '', 0))
 let g:simplecc_diag_min_severity = 4
 
 " Empty/malformed messages still render a useful, nonempty detail line.

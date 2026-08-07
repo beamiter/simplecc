@@ -205,8 +205,8 @@ npm, the Go module proxy, or Julia package registries.
 | --- | --- |
 | <code>:SimpleCCDiagnostics[!] [severity]</code> | List current-buffer diagnostics; use `!` for the workspace and optionally filter one severity |
 | <code>:SimpleCCDiag</code> | Show all visible diagnostics on the current line, including source and code |
-| <code>:SimpleCCNextDiag</code> | Jump to the next diagnostic |
-| <code>:SimpleCCPrevDiag</code> | Jump to the previous diagnostic |
+| <code>:SimpleCCNextDiag [severity]</code> | Jump to the next diagnostic, optionally filtering one severity |
+| <code>:SimpleCCPrevDiag [severity]</code> | Jump to the previous diagnostic, optionally filtering one severity |
 | <code>:SimpleCCPullDiag</code> | Request pull diagnostics |
 | <code>:SimpleCCJuliaActivate [dir]</code> | Activate a Julia environment |
 | <code>:SimpleCCJuliaRefresh</code> | Refresh LanguageServer.jl caches |
@@ -219,6 +219,11 @@ example `:SimpleCCDiagnostics! error`. Both lists are sorted deterministically
 by path and position. `[d` and `]d` follow
 `g:simplecc_diag_min_severity`, including same-line diagnostics, and wrap in
 position order.
+
+The optional navigation severity is `all`, `error`, `warning`, `info`, or
+`hint`. With no argument, navigation keeps obeying
+`g:simplecc_diag_min_severity`; an explicit severity (or `all`) is a temporary
+one-command filter and does not change signs, virtual text, or configuration.
 
 `:SimpleCCDiag` is the explicit counterpart to `g:simplecc_diag_float`: it
 works even when automatic diagnostic popups are disabled. Multiple diagnostics

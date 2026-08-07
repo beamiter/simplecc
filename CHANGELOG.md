@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-08-05
 
+### 精确级别诊断导航
+
+- `:SimpleCCNextDiag [severity]` / `:SimpleCCPrevDiag [severity]` 可临时只在
+  `error/warning/info/hint` 中跳转，也可显式用 `all` 浏览全部诊断；无参数仍完全
+  沿用 `g:simplecc_diag_min_severity` 的可见范围。
+- 非法级别会原地报错而不移动光标；位置相同的诊断增加稳定 tie-break，回绕结果
+  不再依赖 Vim `sort()` 的非稳定顺序。
+
 ### 按需诊断详情
 
 - 新增 `:SimpleCCDiag` 与 `<Plug>(simplecc-show-diagnostic)`:即使关闭自动

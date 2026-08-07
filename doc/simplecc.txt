@@ -197,8 +197,12 @@ Diagnostics and Julia ~
                                 This works independently of
                                 |g:simplecc_diag_float| and obeys
                                 |g:simplecc_diag_min_severity|.
-*:SimpleCCNextDiag*              Jump to the next diagnostic.
-*:SimpleCCPrevDiag*              Jump to the previous diagnostic.
+*:SimpleCCNextDiag* [severity]   Jump to the next diagnostic. With no argument
+                                this obeys |g:simplecc_diag_min_severity|.
+                                Use all/error/warning/info/hint for a temporary
+                                exact filter independent of display settings.
+*:SimpleCCPrevDiag* [severity]   Jump to the previous diagnostic with the same
+                                optional filter and wrapping behaviour.
 *:SimpleCCPullDiag*              Request pull diagnostics.
 *:SimpleCCJuliaActivate* [dir]   Activate a Julia environment.
 *:SimpleCCJuliaRefresh*          Refresh LanguageServer.jl caches.

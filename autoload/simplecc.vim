@@ -2339,17 +2339,80 @@ def CompareDiagnosticPosition(a: dict<any>, b: dict<any>): number
   return get(a, 'character', 0) - get(b, 'character', 0)
 enddef
 
-export def DiagNext()
+def NavigationDiagnostics(uri: string, severity_name: string): list<dict<any>>
+  # The empty argument preserves the historical visibility boundary.  An
+  # explicit `all` is deliberately different: it lets a one-off navigation
+  # reach diagnostics hidden by g:simplecc_diag_min_severity without changing
+  # signs, virtual text, or the user's configuration.
+  if trim(severity_name) ==# ''
+    return VisibleDiagnostics(uri)
+  endif
+  var severity = DiagnosticSeverity(severity_name)
+  if severity == 0
+    return copy(get(s_diagnostics, uri, []))
+  endif
+  return filter(copy(get(s_diagnostics, uri, [])),
+      (_, item) => get(item, 'severity', 3) == severity)
+enddef
+
+def ValidateNavigationSeverity(severity_name: string): bool
+  var name = tolower(trim(severity_name))
+  # Navigation deliberately exposes only the documented exact names.  Keep
+  # DiagnosticSeverity()'s legacy `warn` alias for :SimpleCCDiagnostics, but
+  # do not let that compatibility detail widen this command's public contract.
+  if name ==# '' || index(['all', 'error', 'warning', 'info', 'hint'], name) >= 0
+    return true
+  endif
+  echohl ErrorMsg
+  echom '[SimpleCC] diagnostic severity must be all, error, warning, info, or hint'
+  echohl None
+  return false
+enddef
+
+def EmptyNavigationMessage(severity_name: string): string
+  var name = tolower(trim(severity_name))
+  return name ==# '' ? 'No visible diagnostics'
+      : name ==# 'all' ? 'No diagnostics' : $'No {name} diagnostics'
+enddef
+
+def CompareDiagnosticNavigation(a: dict<any>, b: dict<any>): number
+  var position = CompareDiagnosticPosition(a, b)
+  if position != 0
+    return position
+  endif
+  var severity = get(a, 'severity', 3) - get(b, 'severity', 3)
+  if severity != 0
+    return severity
+  endif
+  var asource = DiagnosticSource(a)
+  var bsource = DiagnosticSource(b)
+  if asource !=# bsource
+    return asource <# bsource ? -1 : 1
+  endif
+  var acode = DiagnosticCode(a)
+  var bcode = DiagnosticCode(b)
+  if acode !=# bcode
+    return acode <# bcode ? -1 : 1
+  endif
+  var atext = DiagnosticText(a)
+  var btext = DiagnosticText(b)
+  return atext <# btext ? -1 : atext ==# btext ? 0 : 1
+enddef
+
+export def DiagNext(severity_name: string = '')
+  if !ValidateNavigationSeverity(severity_name)
+    return
+  endif
   var uri = BufUri()
-  var items = VisibleDiagnostics(uri)
+  var items = NavigationDiagnostics(uri, severity_name)
   if empty(items)
-    echo 'No visible diagnostics'
+    echo EmptyNavigationMessage(severity_name)
     return
   endif
 
   var cur_line = line('.') - 1
   var cur_character = ByteOffsetToUtf16(getline('.'), col('.') - 1)
-  var sorted = sort(items, CompareDiagnosticPosition)
+  var sorted = sort(items, CompareDiagnosticNavigation)
   for item in sorted
     var item_line = get(item, 'line', 0)
     var item_character = get(item, 'character', 0)
@@ -2367,17 +2430,20 @@ export def DiagNext()
   echo DiagMessage(first)
 enddef
 
-export def DiagPrev()
+export def DiagPrev(severity_name: string = '')
+  if !ValidateNavigationSeverity(severity_name)
+    return
+  endif
   var uri = BufUri()
-  var items = VisibleDiagnostics(uri)
+  var items = NavigationDiagnostics(uri, severity_name)
   if empty(items)
-    echo 'No visible diagnostics'
+    echo EmptyNavigationMessage(severity_name)
     return
   endif
 
   var cur_line = line('.') - 1
   var cur_character = ByteOffsetToUtf16(getline('.'), col('.') - 1)
-  var sorted = reverse(sort(items, CompareDiagnosticPosition))
+  var sorted = reverse(sort(items, CompareDiagnosticNavigation))
   for item in sorted
     var item_line = get(item, 'line', 0)
     var item_character = get(item, 'character', 0)
