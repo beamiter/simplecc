@@ -2,6 +2,20 @@
 
 ## Unreleased - 2026-08-05
 
+### 诊断工作流升级
+
+- `:SimpleCCDiagnostics[!] [severity]` 现在同时覆盖两种常用视角:无 `!` 保持
+  向后兼容,打开当前 split 自己的 location list;加 `!` 汇总客户端当前已知的
+  全工作区诊断到 quickfix。可用 `all/error/warning/info/hint` 做精确严重级筛选,
+  结果按路径与位置稳定排序。
+- 筛选结果为空时也会替换并清空对应 location/quickfix list,不会把上一次的
+  旧诊断留在界面上伪装成新查询结果。
+- `[d`/`]d` 现在与 `g:simplecc_diag_min_severity` 的可见范围一致,能在同一行的
+  多个诊断间按 UTF-16 位置移动,并按排序后的首尾正确回绕。此前会跳进已隐藏的
+  hint/info,同一行诊断也无法逐个访问,向前回绕还依赖服务端原始顺序。
+- Vim 冒烟测试通过真实 fake-daemon `diagnostics` 事件覆盖当前文件/工作区筛选、
+  location list/quickfix 分流以及可见严重级导航。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

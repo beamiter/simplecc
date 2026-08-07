@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+open_count=0
 while IFS= read -r line; do
   id="$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"
   case "$line" in
@@ -17,6 +18,17 @@ while IFS= read -r line; do
         printf '{"type":"definition","id":%s,"locations":[{"uri":"%s","line":2,"character":1}]}\n' "$id" "$uri"
       else
         printf '{"type":"definition","id":%s,"locations":[{"uri":"%s","line":2,"character":1},{"uri":"%s","line":3,"character":1}]}\n' "$id" "$uri" "$uri"
+      fi
+      ;;
+    *'"type":"textDocument/didOpen"'*)
+      uri="$(printf '%s\n' "$line" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')"
+      open_count=$((open_count + 1))
+      if [[ "$open_count" == "1" ]]; then
+        # Mixed severities let the Vim smoke test exercise exact filtering and
+        # navigation's g:simplecc_diag_min_severity boundary.
+        printf '{"type":"diagnostics","uri":"%s","items":[{"line":0,"character":0,"end_line":0,"end_character":1,"severity":1,"message":"source error"},{"line":1,"character":5,"end_line":1,"end_character":6,"severity":2,"message":"source warning"},{"line":2,"character":1,"end_line":2,"end_character":2,"severity":4,"message":"source hint"}]}\n' "$uri"
+      else
+        printf '{"type":"diagnostics","uri":"%s","items":[{"line":0,"character":0,"end_line":0,"end_character":1,"severity":1,"message":"workspace error"}]}\n' "$uri"
       fi
       ;;
     *'"type":"shutdown"'*)

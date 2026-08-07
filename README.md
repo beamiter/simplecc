@@ -203,12 +203,21 @@ npm, the Go module proxy, or Julia package registries.
 
 | Command | Action |
 | --- | --- |
-| <code>:SimpleCCDiagnostics</code> | Put diagnostics in the quickfix list |
+| <code>:SimpleCCDiagnostics[!] [severity]</code> | List current-buffer diagnostics; use `!` for the workspace and optionally filter one severity |
 | <code>:SimpleCCNextDiag</code> | Jump to the next diagnostic |
 | <code>:SimpleCCPrevDiag</code> | Jump to the previous diagnostic |
 | <code>:SimpleCCPullDiag</code> | Request pull diagnostics |
 | <code>:SimpleCCJuliaActivate [dir]</code> | Activate a Julia environment |
 | <code>:SimpleCCJuliaRefresh</code> | Refresh LanguageServer.jl caches |
+
+`:SimpleCCDiagnostics` opens a location list owned by the current split.
+`:SimpleCCDiagnostics!` gathers every diagnostic snapshot currently known to
+SimpleCC into the global quickfix list. The optional severity is one of
+`all`, `error`, `warning`, `info`, or `hint` and is an exact filter, for
+example `:SimpleCCDiagnostics! error`. Both lists are sorted deterministically
+by path and position. `[d` and `]d` follow
+`g:simplecc_diag_min_severity`, including same-line diagnostics, and wrap in
+position order.
 
 ## Default mappings
 
@@ -257,7 +266,7 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_virtual_diag</code> | 1 | Enable virtual diagnostic text |
 | <code>g:simplecc_diag_max_per_line</code> | 3 | Virtual diagnostics per line |
 | <code>g:simplecc_diag_float</code> | 0 | Show diagnostics near the cursor |
-| <code>g:simplecc_diag_min_severity</code> | 4 | Include severities up to this value: 1 error, 4 hint |
+| <code>g:simplecc_diag_min_severity</code> | 4 | Include severities up to this value in signs, virtual text, and diagnostic navigation: 1 error, 4 hint |
 | <code>g:simplecc_semantic_tokens</code> | 0 | Enable automatic semantic tokens |
 | <code>g:simplecc_semtok_priority</code> | 100 | Semantic-token property priority |
 | <code>g:simplecc_semtok_range_threshold</code> | 5000 | Use range requests above this line count |

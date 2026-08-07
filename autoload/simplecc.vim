@@ -2205,57 +2205,155 @@ export def DiagCounts(bufnr: number = 0): dict<number>
   return CountDiagnostics(get(s_diagnostics, BufUri(bnr), []))
 enddef
 
-export def DiagList()
-  var uri = BufUri()
-  var items = get(s_diagnostics, uri, [])
-  if empty(items)
-    echo 'No diagnostics'
+export def CompleteDiagnosticSeverity(arglead: string, _cmdline: string,
+    _cursorpos: number): list<string>
+  var prefix = tolower(arglead)
+  return filter(['all', 'error', 'warning', 'info', 'hint'],
+      (_, name) => stridx(name, prefix) == 0)
+enddef
+
+# Return 0 for all severities, 1..4 for one exact LSP severity, and -1 for an
+# invalid command argument.  Keeping the empty/default case at "all" preserves
+# the pre-filter :SimpleCCDiagnostics behaviour.
+def DiagnosticSeverity(value: string): number
+  var name = tolower(trim(value))
+  if name ==# '' || name ==# 'all'
+    return 0
+  endif
+  var severities = {error: 1, warning: 2, warn: 2, info: 3, hint: 4}
+  return get(severities, name, -1)
+enddef
+
+def DiagnosticType(severity: number): string
+  return severity == 1 ? 'E' : severity == 2 ? 'W' : severity == 4 ? 'H' : 'I'
+enddef
+
+def DiagnosticQfItem(uri: string, item: dict<any>): dict<any>
+  var fpath = UriToPath(uri)
+  var lnum = get(item, 'line', 0) + 1
+  var line_text = PathLine(fpath, lnum)
+  return {
+    filename: fpath,
+    lnum: lnum,
+    col: line_text ==# ''
+        ? get(item, 'character', 0) + 1
+        : Utf16LineColumn(line_text, get(item, 'character', 0)),
+    text: get(item, 'message', ''),
+    type: DiagnosticType(get(item, 'severity', 3)),
+  }
+enddef
+
+def CompareDiagnosticQf(a: dict<any>, b: dict<any>): number
+  var apath = get(a, 'filename', '')
+  var bpath = get(b, 'filename', '')
+  if apath !=# bpath
+    return apath <# bpath ? -1 : 1
+  endif
+  var aline = get(a, 'lnum', 0)
+  var bline = get(b, 'lnum', 0)
+  if aline != bline
+    return aline - bline
+  endif
+  var acol = get(a, 'col', 0)
+  var bcol = get(b, 'col', 0)
+  if acol != bcol
+    return acol - bcol
+  endif
+  var atype = get(a, 'type', '')
+  var btype = get(b, 'type', '')
+  return atype <# btype ? -1 : atype ==# btype ? 0 : 1
+enddef
+
+# Without ! this is the original, split-local diagnostic list.  With ! it
+# gathers every diagnostic snapshot currently known to the client into the
+# global quickfix list.  The optional argument selects one exact severity.
+export def DiagList(workspace: bool = false, severity_name: string = '')
+  var severity = DiagnosticSeverity(severity_name)
+  if severity < 0
+    echohl ErrorMsg
+    echom '[SimpleCC] diagnostic severity must be all, error, warning, info, or hint'
+    echohl None
     return
   endif
 
   var qf_items: list<dict<any>> = []
-  var fpath = UriToPath(uri)
-  for item in items
-    var sev_text = 'I'
-    var sev = get(item, 'severity', 3)
-    if sev == 1
-      sev_text = 'E'
-    elseif sev == 2
-      sev_text = 'W'
-    elseif sev == 4
-      sev_text = 'H'
-    endif
-    # Convert the UTF-16 column against the diagnostic's own buffer/file, not
-    # whichever buffer happens to be current; fall back to the raw column when
-    # no line text is available.
-    var lnum = get(item, 'line', 0) + 1
-    var line_text = PathLine(fpath, lnum)
-    add(qf_items, {
-      filename: fpath,
-      lnum: lnum,
-      col: line_text ==# ''
-          ? get(item, 'character', 0) + 1
-          : Utf16LineColumn(line_text, get(item, 'character', 0)),
-      text: get(item, 'message', ''),
-      type: sev_text,
-    })
-  endfor
+  if workspace
+    for uri in sort(keys(s_diagnostics))
+      for item in get(s_diagnostics, uri, [])
+        if severity == 0 || get(item, 'severity', 3) == severity
+          add(qf_items, DiagnosticQfItem(uri, item))
+        endif
+      endfor
+    endfor
+  else
+    var uri = BufUri()
+    for item in get(s_diagnostics, uri, [])
+      if severity == 0 || get(item, 'severity', 3) == severity
+        add(qf_items, DiagnosticQfItem(uri, item))
+      endif
+    endfor
+  endif
 
-  setloclist(0, qf_items)
-  lopen
+  var scope = workspace ? 'workspace' : fnamemodify(expand('%:p'), ':~:.')
+  var filter_name = severity == 0 ? 'all' : tolower(severity_name)
+  var title = printf('SimpleCC diagnostics (%s, %s)', scope, filter_name)
+  if empty(qf_items)
+    # Replace the addressed list even when the filter has no matches. Leaving
+    # a previous populated list behind makes the new command appear to show
+    # diagnostics that do not satisfy its scope/severity.
+    if workspace
+      setqflist([], 'r', {title: title, items: []})
+    else
+      setloclist(0, [], 'r', {title: title, items: []})
+    endif
+    echo printf('No %sdiagnostics%s', severity_name ==# '' || severity_name ==# 'all'
+        ? '' : tolower(severity_name) .. ' ', workspace ? ' in workspace' : '')
+    return
+  endif
+
+  sort(qf_items, CompareDiagnosticQf)
+  var source_winid = win_getid()
+  if workspace
+    setqflist([], 'r', {title: title, items: qf_items})
+    copen
+  else
+    setloclist(0, [], 'r', {title: title, items: qf_items})
+    lopen
+  endif
+  w:simplecc_source_winid = source_winid
+  SetupQfMappings()
+enddef
+
+def VisibleDiagnostics(uri: string): list<dict<any>>
+  var max_severity = get(g:, 'simplecc_diag_min_severity', 4)
+  return filter(copy(get(s_diagnostics, uri, [])),
+      (_, item) => get(item, 'severity', 3) <= max_severity)
+enddef
+
+def CompareDiagnosticPosition(a: dict<any>, b: dict<any>): number
+  var aline = get(a, 'line', 0)
+  var bline = get(b, 'line', 0)
+  if aline != bline
+    return aline - bline
+  endif
+  return get(a, 'character', 0) - get(b, 'character', 0)
 enddef
 
 export def DiagNext()
   var uri = BufUri()
-  var items = get(s_diagnostics, uri, [])
+  var items = VisibleDiagnostics(uri)
   if empty(items)
-    echo 'No diagnostics'
+    echo 'No visible diagnostics'
     return
   endif
 
   var cur_line = line('.') - 1
-  for item in sort(copy(items), (a, b) => a.line - b.line)
-    if item.line > cur_line
+  var cur_character = ByteOffsetToUtf16(getline('.'), col('.') - 1)
+  var sorted = sort(items, CompareDiagnosticPosition)
+  for item in sorted
+    var item_line = get(item, 'line', 0)
+    var item_character = get(item, 'character', 0)
+    if item_line > cur_line || (item_line == cur_line && item_character > cur_character)
       cursor(item.line + 1,
           Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
       echo DiagMessage(item)
@@ -2263,7 +2361,7 @@ export def DiagNext()
     endif
   endfor
   # Wrap around
-  var first = items[0]
+  var first = sorted[0]
   cursor(first.line + 1,
       Utf16LineColumn(getline(first.line + 1), get(first, 'character', 0)))
   echo DiagMessage(first)
@@ -2271,16 +2369,19 @@ enddef
 
 export def DiagPrev()
   var uri = BufUri()
-  var items = get(s_diagnostics, uri, [])
+  var items = VisibleDiagnostics(uri)
   if empty(items)
-    echo 'No diagnostics'
+    echo 'No visible diagnostics'
     return
   endif
 
   var cur_line = line('.') - 1
-  var sorted = sort(copy(items), (a, b) => b.line - a.line)
+  var cur_character = ByteOffsetToUtf16(getline('.'), col('.') - 1)
+  var sorted = reverse(sort(items, CompareDiagnosticPosition))
   for item in sorted
-    if item.line < cur_line
+    var item_line = get(item, 'line', 0)
+    var item_character = get(item, 'character', 0)
+    if item_line < cur_line || (item_line == cur_line && item_character < cur_character)
       cursor(item.line + 1,
           Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
       echo DiagMessage(item)

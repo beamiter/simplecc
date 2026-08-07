@@ -182,7 +182,14 @@ Editing and language features ~
 
 Diagnostics and Julia ~
 
-*:SimpleCCDiagnostics*           Put diagnostics in the quickfix list.
+*:SimpleCCDiagnostics* [severity]
+                                Put current-buffer diagnostics in this
+                                split's location list. [severity] is an exact
+                                filter: all, error, warning, info, or hint.
+:SimpleCCDiagnostics! [severity]
+                                Gather every diagnostic snapshot currently
+                                known to SimpleCC in the global quickfix list.
+                                Results are sorted by file and position.
 *:SimpleCCNextDiag*              Jump to the next diagnostic.
 *:SimpleCCPrevDiag*              Jump to the previous diagnostic.
 *:SimpleCCPullDiag*              Request pull diagnostics.
@@ -311,7 +318,8 @@ g:simplecc_diag_float            number  default: 0
                                           *g:simplecc_diag_min_severity*
 g:simplecc_diag_min_severity     number  default: 4
         Include severities through this value: 1 error, 2 warning,
-        3 information, 4 hint.
+        3 information, 4 hint. Applies to signs, highlights, virtual text,
+        and |:SimpleCCNextDiag| / |:SimpleCCPrevDiag| navigation.
 
                                           *g:simplecc_semantic_tokens*
 g:simplecc_semantic_tokens       number  default: 0
