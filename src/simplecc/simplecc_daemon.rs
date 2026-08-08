@@ -502,6 +502,14 @@ async fn primary_client(
     registry.as_ref()?.client_for_filetype(language_id)
 }
 
+async fn primary_server_name(
+    registry: &Arc<RwLock<Option<Registry>>>,
+    language_id: &str,
+) -> Option<String> {
+    let registry = registry.read().await;
+    registry.as_ref()?.primary_server_name(language_id)
+}
+
 /// Resolve the active server for a request and always finish the daemon-side
 /// request when none exists. A silent `None` leaves Vim waiting forever for an
 /// id that can never receive a reply (uninitialized registry, unknown
@@ -1852,10 +1860,18 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
+                // Same publisher as this server's pushed diagnostics, so a
+                // file that gets both does not end up listed twice.
+                let server = primary_server_name(&registry, &language_id)
+                    .await
+                    .unwrap_or_default();
                 match c.pull_diagnostics(&uri).await {
                     Ok(Some(items)) => send_event(
                         &out,
-                        json!({"type": "diagnostics", "id": id, "uri": uri, "items": items}),
+                        json!({
+                            "type": "diagnostics", "id": id, "server": server,
+                            "uri": uri, "items": items
+                        }),
                     ),
                     // An unchanged report keeps the currently displayed set.
                     Ok(None) => {}

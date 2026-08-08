@@ -185,6 +185,18 @@ impl Registry {
             .cloned()
     }
 
+    /// Name of the server `client_for_filetype` would return. Pull
+    /// diagnostics have to be attributed to the same publisher as this
+    /// server's pushed ones, or the editor files them twice.
+    pub fn primary_server_name(&self, filetype: &str) -> Option<String> {
+        let names = self.ft_map.get(filetype)?;
+        let name = names.first()?;
+        self.clients
+            .get(name)
+            .filter(|client| client.is_alive())
+            .map(|_| name.clone())
+    }
+
     /// Get all clients for a filetype (for multi-server support).
     pub fn clients_for_filetype(&self, filetype: &str) -> Vec<Arc<LspClient>> {
         if let Some(names) = self.ft_map.get(filetype) {
@@ -290,8 +302,12 @@ async fn forward_server_events(
     while let Some(event) = event_rx.recv().await {
         match event {
             ServerEvent::Diagnostics { uri, diagnostics } => {
+                // The publisher's name is what keeps two servers for one
+                // filetype from overwriting each other: each publish replaces
+                // that server's whole set for the file, never the other's.
                 let ev = serde_json::json!({
                     "type": "diagnostics",
+                    "server": server_name,
                     "uri": uri,
                     "items": diagnostics,
                 });

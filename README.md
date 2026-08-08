@@ -281,6 +281,7 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_diag_max_per_line</code> | 3 | Virtual diagnostics per line |
 | <code>g:simplecc_diag_float</code> | 0 | Show diagnostics near the cursor |
 | <code>g:simplecc_diag_min_severity</code> | 4 | Include severities up to this value in signs, virtual text, and diagnostic navigation: 1 error, 4 hint |
+| <code>g:simplecc_diag_sources</code> | `[]` | Language servers whose diagnostics are shown; empty means all |
 | <code>g:simplecc_semantic_tokens</code> | 0 | Enable automatic semantic tokens |
 | <code>g:simplecc_semtok_priority</code> | 100 | Semantic-token property priority |
 | <code>g:simplecc_semtok_range_threshold</code> | 5000 | Use range requests above this line count |

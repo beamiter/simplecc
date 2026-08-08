@@ -26,8 +26,20 @@ var s_log: list<string> = []
 # Servers the user declined to install this session (avoids re-prompting)
 var s_declined_installs: dict<bool> = {}
 
-# Diagnostics state per URI
-var s_diagnostics: dict<list<dict<any>>> = {}
+# Diagnostics, keyed by resolved filesystem path and then by the server that
+# published them:  path -> server -> items.
+#
+# Never key this by URI text.  Vim's PercentEncodePath() escapes everything
+# outside A-Za-z0-9-._~/: while the daemon's `url` crate leaves
+# @ ( ) + , ; = & ' ! $ * alone, so the two spellings of one file landed in two
+# different buckets: signs still rendered (they resolve uri -> path -> bufnr)
+# while every *query* answered "no diagnostics" for, say, any
+# node_modules/@types/... file.
+#
+# The per-server level is what lets two servers for one filetype coexist.  A
+# publishDiagnostics notification replaces that server's whole set for the
+# file, so a flat list made the later publisher erase the earlier one.
+var s_diagnostics: dict<dict<list<dict<any>>>> = {}
 # Document versions
 var s_doc_versions: dict<number> = {}
 # Last Vim changedtick known to have been queued to the daemon
@@ -946,8 +958,9 @@ export def OnBufClose(buffer: number = 0)
   if has_key(s_doc_versions, uri)
     remove(s_doc_versions, uri)
   endif
-  if has_key(s_diagnostics, uri)
-    remove(s_diagnostics, uri)
+  var diag_key = DiagKey(uri)
+  if has_key(s_diagnostics, diag_key)
+    remove(s_diagnostics, diag_key)
   endif
   if has_key(s_pending_changes, uri)
     remove(s_pending_changes, uri)
@@ -2131,17 +2144,70 @@ enddef
 # Diagnostics
 # ═════════════════════════════════════════════════════════
 
-def OnDiagnostics(ev: dict<any>)
-  var uri = get(ev, 'uri', '')
-  var items = get(ev, 'items', [])
-  s_diagnostics[uri] = items
-  DisplayDiagnostics(uri)
+# The key under which diagnostics for `uri` are stored and looked up.  Going
+# through the resolved path means the daemon's URI spelling and Vim's own never
+# have to agree.
+def DiagKey(uri: string): string
+  return UriToPath(uri)
 enddef
 
-def DisplayDiagnostics(uri: string)
+def BufDiagKey(buffer: number = 0): string
+  return DiagKey(BufUri(buffer))
+enddef
+
+# Every diagnostic known for `path`, merged across the servers that published
+# them.  With more than one publisher the merged list is put back into
+# navigation order; a single publisher keeps the server's own order untouched.
+def AllDiagnostics(path: string): list<dict<any>>
+  var by_server = get(s_diagnostics, path, {})
+  if empty(by_server)
+    return []
+  endif
+  var sources = get(g:, 'simplecc_diag_sources', [])
+  var merged: list<dict<any>> = []
+  var publishers = 0
+  for server in sort(keys(by_server))
+    if !empty(sources) && index(sources, server) < 0
+      continue
+    endif
+    extend(merged, by_server[server])
+    publishers += 1
+  endfor
+  if publishers > 1
+    sort(merged, CompareDiagnosticNavigation)
+  endif
+  return merged
+enddef
+
+def OnDiagnostics(ev: dict<any>)
+  var path = DiagKey(get(ev, 'uri', ''))
+  # An older daemon sends no server name; one anonymous bucket then behaves
+  # exactly like the previous flat store.
+  var server = get(ev, 'server', '')
+  var items = get(ev, 'items', [])
+  var by_server = get(s_diagnostics, path, {})
+  if empty(items)
+    # Keeping an empty bucket would make Health() and :SimpleCCDiagnostics!
+    # report files that have nothing wrong with them.
+    if has_key(by_server, server)
+      remove(by_server, server)
+    endif
+  else
+    by_server[server] = items
+  endif
+  if empty(by_server)
+    if has_key(s_diagnostics, path)
+      remove(s_diagnostics, path)
+    endif
+  else
+    s_diagnostics[path] = by_server
+  endif
+  DisplayDiagnostics(path)
+enddef
+
+def DisplayDiagnostics(path: string)
   # Find buffer
-  var fpath = UriToPath(uri)
-  var bufnr = bufnr(fpath)
+  var bufnr = bufnr(path)
   if bufnr < 0
     return
   endif
@@ -2149,7 +2215,7 @@ def DisplayDiagnostics(uri: string)
   # Clear old signs
   sign_unplace('simplecc', {buffer: bufnr})
 
-  var items = get(s_diagnostics, uri, [])
+  var items = AllDiagnostics(path)
   # Cache per-buffer severity counts (of the unfiltered set) so statuslines can
   # read b:simplecc_diag_counts without recounting on every redraw.
   setbufvar(bufnr, 'simplecc_diag_counts', CountDiagnostics(items))
@@ -2254,7 +2320,7 @@ export def DiagCounts(bufnr: number = 0): dict<number>
   if !bufexists(bnr)
     return {error: 0, warning: 0, info: 0, hint: 0}
   endif
-  return CountDiagnostics(get(s_diagnostics, BufUri(bnr), []))
+  return CountDiagnostics(AllDiagnostics(BufDiagKey(bnr)))
 enddef
 
 export def CompleteDiagnosticSeverity(arglead: string, _cmdline: string,
@@ -2280,8 +2346,7 @@ def DiagnosticType(severity: number): string
   return severity == 1 ? 'E' : severity == 2 ? 'W' : severity == 4 ? 'H' : 'I'
 enddef
 
-def DiagnosticQfItem(uri: string, item: dict<any>): dict<any>
-  var fpath = UriToPath(uri)
+def DiagnosticQfItem(fpath: string, item: dict<any>): dict<any>
   var lnum = get(item, 'line', 0) + 1
   var line_text = PathLine(fpath, lnum)
   return {
@@ -2330,18 +2395,18 @@ export def DiagList(workspace: bool = false, severity_name: string = '')
 
   var qf_items: list<dict<any>> = []
   if workspace
-    for uri in sort(keys(s_diagnostics))
-      for item in get(s_diagnostics, uri, [])
+    for path in sort(keys(s_diagnostics))
+      for item in AllDiagnostics(path)
         if severity == 0 || get(item, 'severity', 3) == severity
-          add(qf_items, DiagnosticQfItem(uri, item))
+          add(qf_items, DiagnosticQfItem(path, item))
         endif
       endfor
     endfor
   else
-    var uri = BufUri()
-    for item in get(s_diagnostics, uri, [])
+    var path = BufDiagKey()
+    for item in AllDiagnostics(path)
       if severity == 0 || get(item, 'severity', 3) == severity
-        add(qf_items, DiagnosticQfItem(uri, item))
+        add(qf_items, DiagnosticQfItem(path, item))
       endif
     endfor
   endif
@@ -2376,9 +2441,9 @@ export def DiagList(workspace: bool = false, severity_name: string = '')
   SetupQfMappings()
 enddef
 
-def VisibleDiagnostics(uri: string): list<dict<any>>
+def VisibleDiagnostics(path: string): list<dict<any>>
   var max_severity = get(g:, 'simplecc_diag_min_severity', 4)
-  return filter(copy(get(s_diagnostics, uri, [])),
+  return filter(AllDiagnostics(path),
       (_, item) => get(item, 'severity', 3) <= max_severity)
 enddef
 
@@ -2391,19 +2456,19 @@ def CompareDiagnosticPosition(a: dict<any>, b: dict<any>): number
   return get(a, 'character', 0) - get(b, 'character', 0)
 enddef
 
-def NavigationDiagnostics(uri: string, severity_name: string): list<dict<any>>
+def NavigationDiagnostics(path: string, severity_name: string): list<dict<any>>
   # The empty argument preserves the historical visibility boundary.  An
   # explicit `all` is deliberately different: it lets a one-off navigation
   # reach diagnostics hidden by g:simplecc_diag_min_severity without changing
   # signs, virtual text, or the user's configuration.
   if trim(severity_name) ==# ''
-    return VisibleDiagnostics(uri)
+    return VisibleDiagnostics(path)
   endif
   var severity = DiagnosticSeverity(severity_name)
   if severity == 0
-    return copy(get(s_diagnostics, uri, []))
+    return AllDiagnostics(path)
   endif
-  return filter(copy(get(s_diagnostics, uri, [])),
+  return filter(AllDiagnostics(path),
       (_, item) => get(item, 'severity', 3) == severity)
 enddef
 
@@ -2455,8 +2520,7 @@ export def DiagNext(severity_name: string = '')
   if !ValidateNavigationSeverity(severity_name)
     return
   endif
-  var uri = BufUri()
-  var items = NavigationDiagnostics(uri, severity_name)
+  var items = NavigationDiagnostics(BufDiagKey(), severity_name)
   if empty(items)
     echo EmptyNavigationMessage(severity_name)
     return
@@ -2486,8 +2550,7 @@ export def DiagPrev(severity_name: string = '')
   if !ValidateNavigationSeverity(severity_name)
     return
   endif
-  var uri = BufUri()
-  var items = NavigationDiagnostics(uri, severity_name)
+  var items = NavigationDiagnostics(BufDiagKey(), severity_name)
   if empty(items)
     echo EmptyNavigationMessage(severity_name)
     return
@@ -3138,10 +3201,24 @@ export def Health()
 
   add(lines, printf('[INFO] in-flight requests: %d', len(s_cbs)))
   var diag_total = 0
-  for [uri, items] in items(s_diagnostics)
-    diag_total += len(items)
+  var diag_servers: dict<bool> = {}
+  for [path, by_server] in items(s_diagnostics)
+    for [server, items] in items(by_server)
+      diag_total += len(items)
+      diag_servers[server] = true
+    endfor
   endfor
   add(lines, printf('[INFO] diagnostics: %d across %d files', diag_total, len(s_diagnostics)))
+  # With two servers per filetype it matters which one an error came from, and
+  # which one g:simplecc_diag_sources is currently hiding.
+  if len(diag_servers) > 1
+    add(lines, printf('[INFO] diagnostic sources: %s',
+      join(sort(keys(diag_servers))->map((_, s) => s ==# '' ? '(unnamed)' : s), ', ')))
+  endif
+  var diag_filter = get(g:, 'simplecc_diag_sources', [])
+  if !empty(diag_filter)
+    add(lines, printf('[INFO] diagnostic sources shown: %s', join(diag_filter, ', ')))
+  endif
   add(lines, printf('[INFO] open documents: %d', len(s_doc_versions)))
   add(lines, printf('[%s] popups: %s',
     has('popupwin') ? 'OK' : 'WARN',
@@ -4338,8 +4415,7 @@ def ShowDiagFloat(notify_empty: bool)
     popup_close(s_diag_popup)
     s_diag_popup = 0
   endif
-  var uri = BufUri()
-  var items = VisibleDiagnostics(uri)
+  var items = VisibleDiagnostics(BufDiagKey())
   var cur_line = line('.') - 1
   var line_items = filter(copy(items), (_, v) => get(v, 'line', -1) == cur_line)
   if empty(line_items)

@@ -2,6 +2,23 @@
 
 ## Unreleased - 2026-08-05
 
+### 诊断按路径与来源服务器存储
+
+- 诊断改用解析后的文件路径作 key。此前用的是语言服务器发来的 URI 原文,而
+  Vim 的 `PercentEncodePath()` 会转义 `A-Za-z0-9-._~/:` 之外的一切,Rust `url`
+  crate 却放过 `@ ( ) + , ; = & ' ! $ *`,于是同一个文件落进两个桶:sign 和
+  virtual text 照常渲染(它们走 uri → path → bufnr),但 `simplecc#DiagCounts()`、
+  `:SimpleCCDiagnostics`、`:SimpleCCDiag`、`[d`/`]d` 对任何
+  `node_modules/@types/...` 之类的路径一律回答"没有诊断"。
+- 诊断事件开始携带 `server` 字段,存储结构变为 `path -> server -> items`。
+  一个 filetype 配两个服务器(pyright + ruff-lsp)时,双方的诊断不再互相覆盖;
+  某个服务器重新发布只替换它自己那一份。pull diagnostics 也归到同一个来源,
+  不会与 push 的结果重复入列。
+- 新增 `g:simplecc_diag_sources`(默认 `[]` 即全部),可在不停用服务器的前提下
+  只显示指定来源的诊断;`:SimpleCCHealth` 会列出当前的发布方与过滤器。
+- 新增 `test/diagnostics_store.vim`:用含 `@()+,;=&'!$*` 的真实路径回归编码
+  分歧,并覆盖双服务器共存、单服务器清空、来源过滤与 buffer 关闭清理。
+
 ### 补全排序遵循服务端意图
 
 - 守护进程现在按 `sortText` 排序之后再截断到 `maxItems`。此前是按服务端数组

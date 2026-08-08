@@ -2947,7 +2947,11 @@ async fn handle_server_notification(
                     .collect();
                 let _ = event_tx
                     .send(ServerEvent::Diagnostics {
-                        uri: pd.uri.to_string(),
+                        // Decode exactly as `Location` already does. The `url`
+                        // crate's PATH encode-set leaves @ ( ) + , ; = & ' ! $ *
+                        // alone while Vim's own encoder escapes them, so a raw
+                        // URI string is not a key the editor can look up.
+                        uri: types::decode_uri(&pd.uri.to_string()),
                         diagnostics: items,
                     })
                     .await;

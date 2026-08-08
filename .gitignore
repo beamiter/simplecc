@@ -7,3 +7,6 @@ doc/tags
 tests/*-errors.log
 tests/*divergence.log
 tests/core-not-executable
+
+# Artifacts written by the Vim smoke tests on failure.
+test/*-errors.log

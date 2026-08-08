@@ -54,6 +54,10 @@ g:simplecc_virtual_diag    = get(g:, 'simplecc_virtual_diag', 1)
 g:simplecc_diag_max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
 g:simplecc_diag_float      = get(g:, 'simplecc_diag_float', 0)
 g:simplecc_diag_min_severity = get(g:, 'simplecc_diag_min_severity', 4)
+# Server names whose diagnostics are shown. Empty (the default) means all of
+# them; naming one or more is how a second server for a filetype — ruff-lsp
+# next to pyright, say — gets silenced without being stopped.
+g:simplecc_diag_sources    = get(g:, 'simplecc_diag_sources', [])
 g:simplecc_semantic_tokens = get(g:, 'simplecc_semantic_tokens', 0)
 g:simplecc_semtok_priority = get(g:, 'simplecc_semtok_priority', 100)
 g:simplecc_semtok_range_threshold = get(g:, 'simplecc_semtok_range_threshold', 5000)
