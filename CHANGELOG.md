@@ -2,6 +2,20 @@
 
 ## Unreleased - 2026-08-05
 
+### code action 的 context.diagnostics 真的送到服务端
+
+- 编辑器发出的是扁平的 `DiagnosticItem` 形状(`line`/`character`/`end_line`/
+  `end_character`),而 `lsp_types::Diagnostic` 要求嵌套且必填的 `range`;
+  守护进程此前直接 `from_value::<Vec<Diagnostic>>(...).unwrap_or_default()`,
+  于是解析以 ``missing field `range` `` 失败后被 `unwrap_or_default()` 吞掉,
+  转发给服务端的永远是 `"context": {"diagnostics": []}`。上一版“选中范围后
+  quickfix action 能出现”的说法因此只兑现了 `refactor.extract` 那一半。
+- 新增 `types::parse_context_diagnostics()`:扁平形状转成 LSP 形状,已经是
+  LSP 形状的条目原样透传,数字形态的 `code` 还原为数字;无法解析的条目写到
+  stderr 而不是静默丢弃,下一次形状不匹配不会再无声无息。
+- 新增三个单元测试,直接喂入 `RangeDiagnostics()` 产生的那串 JSON,
+  跨越 Vim 与守护进程的边界锁死这一类 bug。
+
 ### code action 与格式化支持范围
 
 - `:SimpleCCAction` 与 `:SimpleCCFormat` 加上 `-range`。选中若干行再调用时,

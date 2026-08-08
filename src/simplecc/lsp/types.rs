@@ -421,6 +421,108 @@ pub fn severity_to_u8(sev: Option<lsp_types::DiagnosticSeverity>) -> u8 {
     }
 }
 
+/// Convert u8 severity back to the LSP enum.
+pub fn severity_from_u8(sev: u8) -> Option<lsp_types::DiagnosticSeverity> {
+    match sev {
+        1 => Some(lsp_types::DiagnosticSeverity::ERROR),
+        2 => Some(lsp_types::DiagnosticSeverity::WARNING),
+        3 => Some(lsp_types::DiagnosticSeverity::INFORMATION),
+        4 => Some(lsp_types::DiagnosticSeverity::HINT),
+        _ => None,
+    }
+}
+
+/// The editor's own view of a diagnostic: the flat shape this daemon
+/// publishes as `DiagnosticItem`, handed straight back to us as
+/// `context.diagnostics` when a code action is requested over a range.
+#[derive(Deserialize)]
+struct FlatDiagnostic {
+    line: u32,
+    character: u32,
+    end_line: Option<u32>,
+    end_character: Option<u32>,
+    severity: Option<u8>,
+    message: String,
+    source: Option<String>,
+    /// Servers publish either shape; `DiagnosticItem` stringifies numbers on
+    /// the way out, so accept both on the way back in.
+    code: Option<serde_json::Value>,
+}
+
+impl FlatDiagnostic {
+    fn into_lsp(self) -> lsp_types::Diagnostic {
+        let end_line = self.end_line.unwrap_or(self.line);
+        let end_character = self.end_character.unwrap_or(self.character);
+        lsp_types::Diagnostic {
+            range: lsp_types::Range {
+                start: lsp_types::Position {
+                    line: self.line,
+                    character: self.character,
+                },
+                end: lsp_types::Position {
+                    line: end_line,
+                    character: end_character,
+                },
+            },
+            severity: self.severity.and_then(severity_from_u8),
+            // A code that survived the round trip as digits was a number when
+            // the server published it, and servers match on the original type.
+            code: self.code.and_then(|c| match c {
+                serde_json::Value::Number(n) => n
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .map(lsp_types::NumberOrString::Number),
+                serde_json::Value::String(s) => Some(match s.parse::<i32>() {
+                    Ok(n) => lsp_types::NumberOrString::Number(n),
+                    Err(_) => lsp_types::NumberOrString::String(s),
+                }),
+                _ => None,
+            }),
+            source: self.source,
+            message: self.message,
+            ..Default::default()
+        }
+    }
+}
+
+/// Convert the `context.diagnostics` payload the editor sent into the LSP
+/// shape a language server expects.
+///
+/// The editor holds diagnostics in the flat `DiagnosticItem` shape (`line`,
+/// `character`, `end_line`, `end_character`), while `lsp_types::Diagnostic`
+/// requires a nested, mandatory `range`. Feeding the former straight into
+/// `serde_json::from_value::<Vec<lsp_types::Diagnostic>>` fails with
+/// "missing field `range`", which is how every diagnostic-bound quickfix
+/// action ("add the missing import", "remove this unused variable",
+/// `#[allow]` insertion) used to be dropped before it reached the server.
+///
+/// Entries already in LSP shape are taken verbatim, so a caller holding a
+/// server's own payload still works. Anything unreadable comes back as a
+/// message rather than being swallowed, so the next shape mismatch is loud.
+pub fn parse_context_diagnostics(
+    value: &serde_json::Value,
+) -> (Vec<lsp_types::Diagnostic>, Vec<String>) {
+    let Some(entries) = value.as_array() else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut diagnostics = Vec::with_capacity(entries.len());
+    let mut problems = Vec::new();
+    for entry in entries {
+        if entry.get("range").is_some() {
+            match serde_json::from_value::<lsp_types::Diagnostic>(entry.clone()) {
+                Ok(diagnostic) => diagnostics.push(diagnostic),
+                Err(error) => problems.push(error.to_string()),
+            }
+            continue;
+        }
+        match serde_json::from_value::<FlatDiagnostic>(entry.clone()) {
+            Ok(flat) => diagnostics.push(flat.into_lsp()),
+            Err(error) => problems.push(error.to_string()),
+        }
+    }
+    (diagnostics, problems)
+}
+
 /// Convert LSP WorkspaceEdit to our WorkspaceEdit.
 pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit {
     let mut changes = Vec::new();
@@ -520,7 +622,8 @@ pub(crate) fn decode_uri(uri: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_uri, rank_completion_items};
+    use super::{decode_uri, parse_context_diagnostics, rank_completion_items};
+    use serde_json::json;
 
     fn item(label: &str, sort_text: Option<&str>) -> lsp_types::CompletionItem {
         lsp_types::CompletionItem {
@@ -564,6 +667,85 @@ mod tests {
         // the label breaks the tie and the two sortText-"alpha" items keep the
         // order the server sent them in.
         assert_eq!(labels(&items), ["alpha", "first", "second", "beta"]);
+    }
+
+    /// Verbatim payload of `RangeDiagnostics()` in autoload/simplecc.vim, as
+    /// asserted on the wire by test/range_requests.vim.
+    fn editor_payload() -> serde_json::Value {
+        json!([{
+            "line": 2, "character": 8, "end_line": 2, "end_character": 9,
+            "severity": 2, "message": "unused variable: `y`",
+            "source": "rust-analyzer", "code": "unused_variables"
+        }])
+    }
+
+    #[test]
+    fn converts_the_editors_flat_diagnostics_into_the_lsp_shape() {
+        // The bug this guards: the flat shape has no `range`, which
+        // lsp_types::Diagnostic requires, so the straight deserialization
+        // fails ("missing field `range`") and every diagnostic-bound quickfix
+        // action was dropped before the request left the daemon.
+        let direct = serde_json::from_value::<Vec<lsp_types::Diagnostic>>(editor_payload());
+        let error = direct
+            .expect_err("the editor payload is not the LSP shape")
+            .to_string();
+        assert!(error.contains("missing field `range`"), "got: {error}");
+
+        let (diagnostics, problems) = parse_context_diagnostics(&editor_payload());
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(diagnostics.len(), 1);
+        let d = &diagnostics[0];
+        assert_eq!(d.range.start, lsp_types::Position::new(2, 8));
+        assert_eq!(d.range.end, lsp_types::Position::new(2, 9));
+        assert_eq!(d.severity, Some(lsp_types::DiagnosticSeverity::WARNING));
+        assert_eq!(d.message, "unused variable: `y`");
+        assert_eq!(d.source.as_deref(), Some("rust-analyzer"));
+        assert_eq!(
+            d.code,
+            Some(lsp_types::NumberOrString::String("unused_variables".into()))
+        );
+
+        // What reaches the server is the serialization of this, so assert the
+        // wire form the way the server reads it.
+        let wire = serde_json::to_value(d).unwrap();
+        assert_eq!(wire["range"]["start"]["line"], 2);
+        assert_eq!(wire["range"]["end"]["character"], 9);
+    }
+
+    #[test]
+    fn keeps_numeric_codes_numeric_and_lsp_shaped_entries_verbatim() {
+        // tsserver publishes numeric codes; DiagnosticItem stringifies them,
+        // and a server matching on `code` needs the number back.
+        let (diagnostics, problems) = parse_context_diagnostics(&json!([{
+            "line": 0, "character": 0, "end_line": 0, "end_character": 4,
+            "severity": 1, "message": "Type error", "code": "2345"
+        }]));
+        assert!(problems.is_empty());
+        assert_eq!(
+            diagnostics[0].code,
+            Some(lsp_types::NumberOrString::Number(2345))
+        );
+
+        // An entry already in LSP shape survives untouched.
+        let (diagnostics, problems) = parse_context_diagnostics(&json!([{
+            "range": {"start": {"line": 1, "character": 2},
+                      "end": {"line": 1, "character": 5}},
+            "severity": 1, "message": "already lsp"
+        }]));
+        assert!(problems.is_empty());
+        assert_eq!(diagnostics[0].range.end, lsp_types::Position::new(1, 5));
+        assert_eq!(diagnostics[0].message, "already lsp");
+    }
+
+    #[test]
+    fn reports_an_unreadable_entry_instead_of_dropping_it_silently() {
+        let (diagnostics, problems) =
+            parse_context_diagnostics(&json!([{"line": 1, "character": 0}, "nonsense"]));
+        assert!(diagnostics.is_empty());
+        assert_eq!(problems.len(), 2, "both entries must be reported");
+
+        // A context that is not an array is simply absent, not an error.
+        assert_eq!(parse_context_diagnostics(&json!(null)).1.len(), 0);
     }
 
     #[test]

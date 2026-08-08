@@ -941,11 +941,15 @@ impl LspClient {
         end_character: u32,
         diag_json: Value,
     ) -> Result<Vec<types::CodeAction>> {
-        let diagnostics: Vec<lsp_types::Diagnostic> = if diag_json.is_array() {
-            serde_json::from_value(diag_json).unwrap_or_default()
-        } else {
-            vec![]
-        };
+        // The editor sends its own flat diagnostic shape, not
+        // `lsp_types::Diagnostic`; converting it is what makes
+        // diagnostic-bound quickfix actions reachable at all. The failure is
+        // never swallowed — a silently emptied context is indistinguishable
+        // from a server that has nothing to offer.
+        let (diagnostics, problems) = types::parse_context_diagnostics(&diag_json);
+        for problem in &problems {
+            eprintln!("[simplecc] unreadable code-action context diagnostic: {problem}");
+        }
 
         let result = self
             .request(
