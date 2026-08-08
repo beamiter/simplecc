@@ -701,6 +701,7 @@ impl LspClient {
         max_items: usize,
         trigger_kind: u32,
         trigger_character: Option<&str>,
+        sort_items: bool,
     ) -> Result<Option<(u64, Vec<types::CompletionItem>)>> {
         // Allocate at request start, not response time. If an older request
         // returns after a newer one, it must never replace the newer cache.
@@ -768,6 +769,12 @@ impl LspClient {
         } else {
             vec![]
         };
+        // Rank before truncating. The server's array order carries no meaning;
+        // its relevance ranking is in sortText, so cutting to max_items first
+        // would discard exactly the candidates the user wants.
+        if sort_items {
+            types::rank_completion_items(&mut items);
+        }
         items.truncate(max_items.clamp(1, 500));
 
         {

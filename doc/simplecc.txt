@@ -286,6 +286,28 @@ g:simplecc_complete_max_items    number  default: 100
 g:simplecc_complete_resolve_delay number default: 120
         Completion-item resolve debounce in milliseconds.
 
+                                      *g:simplecc_complete_sort*
+g:simplecc_complete_sort         number  default: 1
+        Honour the ranking hints the language server sends with each
+        completion item:
+                - "sortText" decides the menu order. The daemon applies it
+                  before cutting the list down to
+                  |g:simplecc_complete_max_items|, so the candidates that
+                  survive the cut are the relevant ones. Items sharing a
+                  sortText keep the server's own order; an item without one
+                  sorts by its label.
+                - "filterText" is the text the server wants matched against
+                  what you typed. When it differs from the text that would
+                  be inserted (postfix completions, attribute completions),
+                  the item is marked "equal" so Vim's own prefix filter
+                  does not drop it. Requires patch-9.0.1051; on an older
+                  Vim the item is offered without the mark.
+                - "preselect" moves the server's own answer to the top of
+                  the menu and drops "noselect" for that menu, so <CR>
+                  accepts it directly.
+        Set to 0 to take the items in the order the server happened to send
+        them and filter them with Vim's rules alone.
+
                               *g:simplecc_complete_buffer_words*
 g:simplecc_complete_buffer_words number default: 1
         Supplement language-server completion with keyword matches drawn

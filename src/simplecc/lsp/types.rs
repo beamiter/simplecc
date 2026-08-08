@@ -333,6 +333,27 @@ pub fn from_lsp_text_edit(edit: &lsp_types::TextEdit) -> TextEdit {
     }
 }
 
+/// Order completion items the way the server intended.
+///
+/// `sortText` is where rust-analyzer, gopls and tsserver put their relevance
+/// ranking; the array order on the wire is not it (rust-analyzer emits roughly
+/// alphabetically, so `abort()` outranks the field you are actually reaching
+/// for). The ordering matters even more than the display suggests, because the
+/// caller truncates to `max_items` right after: sorting afterwards would keep
+/// the arbitrary first hundred and throw the relevant items away.
+///
+/// The sort is stable, so items sharing a `sortText` keep the server's own
+/// order, and the label is only a tie-break for the servers that omit
+/// `sortText` on some items but not others (the spec says to fall back to the
+/// label in exactly that case).
+pub fn rank_completion_items(items: &mut [lsp_types::CompletionItem]) {
+    items.sort_by(|a, b| {
+        let a_key = a.sort_text.as_deref().unwrap_or(a.label.as_str());
+        let b_key = b.sort_text.as_deref().unwrap_or(b.label.as_str());
+        a_key.cmp(b_key).then_with(|| a.label.cmp(&b.label))
+    });
+}
+
 /// Normalize a full LSP completion item without dropping edit semantics.
 pub fn from_lsp_completion_item(item: &lsp_types::CompletionItem, index: usize) -> CompletionItem {
     let text_edit = item.text_edit.as_ref().map(|edit| match edit {
@@ -499,7 +520,51 @@ pub(crate) fn decode_uri(uri: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_uri;
+    use super::{decode_uri, rank_completion_items};
+
+    fn item(label: &str, sort_text: Option<&str>) -> lsp_types::CompletionItem {
+        lsp_types::CompletionItem {
+            label: label.to_string(),
+            sort_text: sort_text.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn labels(items: &[lsp_types::CompletionItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_str()).collect()
+    }
+
+    #[test]
+    fn ranks_by_sort_text_before_the_caller_truncates() {
+        // Wire order as rust-analyzer actually emits it: roughly alphabetical,
+        // with relevance hidden in sortText.
+        let mut items = vec![
+            item("abort", Some("ffffffef")),
+            item("zip", Some("ffffffff")),
+            item("len", Some("ffffff00")),
+        ];
+        rank_completion_items(&mut items);
+        assert_eq!(labels(&items), ["len", "abort", "zip"]);
+
+        // The point of sorting first: a max_items cut keeps the relevant item.
+        items.truncate(1);
+        assert_eq!(labels(&items), ["len"]);
+    }
+
+    #[test]
+    fn falls_back_to_the_label_and_keeps_the_server_order_on_ties() {
+        let mut items = vec![
+            item("beta", None),
+            item("alpha", None),
+            item("first", Some("alpha")),
+            item("second", Some("alpha")),
+        ];
+        rank_completion_items(&mut items);
+        // "alpha" (the label of one item, the sortText of two) sorts equal, so
+        // the label breaks the tie and the two sortText-"alpha" items keep the
+        // order the server sent them in.
+        assert_eq!(labels(&items), ["alpha", "first", "second", "beta"]);
+    }
 
     #[test]
     fn decodes_file_uris_without_losing_unicode_or_reserved_characters() {

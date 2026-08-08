@@ -26,6 +26,12 @@ g:simplecc_complete_delay  = get(g:, 'simplecc_complete_delay', 80)
 g:simplecc_complete_min_chars = get(g:, 'simplecc_complete_min_chars', 1)
 g:simplecc_complete_max_items = get(g:, 'simplecc_complete_max_items', 100)
 g:simplecc_complete_resolve_delay = get(g:, 'simplecc_complete_resolve_delay', 120)
+# Honour the server's ranking hints: sortText decides the menu order (applied
+# in the daemon, before the g:simplecc_complete_max_items cut, so the relevant
+# candidates are the ones kept), filterText keeps an item whose inserted text
+# is not what the user types, and preselect selects the server's own answer.
+# Set to 0 for the raw order the server happened to send.
+g:simplecc_complete_sort   = get(g:, 'simplecc_complete_sort', 1)
 # Supplement LSP results with keyword matches from open buffers. Useful before a
 # server is ready, in files with no server, or for local identifiers the server
 # does not know about yet.

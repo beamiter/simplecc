@@ -114,6 +114,11 @@ enum Request {
         trigger_kind: u32,
         #[serde(rename = "triggerCharacter", default)]
         trigger_character: String,
+        /// Honour the server's `sortText` ranking before truncating to
+        /// `maxItems`. Defaults on so an older Vim layer that never sends the
+        /// field still gets the ranked list.
+        #[serde(rename = "sortItems", default = "default_true")]
+        sort_items: bool,
     },
     #[serde(rename = "textDocument/hover")]
     Hover {
@@ -976,6 +981,7 @@ async fn handle_request(
             max_items,
             trigger_kind,
             trigger_character,
+            sort_items,
         } => {
             // Do not retain the global registry lock while waiting for a
             // language server. A slow completion must not block unrelated
@@ -1000,6 +1006,7 @@ async fn handle_request(
                         max_items,
                         trigger_kind,
                         trigger_character,
+                        sort_items,
                     )
                     .await
                 {

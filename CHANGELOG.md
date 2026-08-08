@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-05
 
+### 补全排序遵循服务端意图
+
+- 守护进程现在按 `sortText` 排序之后再截断到 `maxItems`。此前是按服务端数组
+  顺序直接截断,而 rust-analyzer / gopls / tsserver 的相关度全部编码在
+  `sortText` 里,于是被丢掉的往往正是最相关的候选,留在菜单里的第一项近乎随机。
+- Vim 侧开始使用 `filterText`:当它与实际插入文本不同(postfix 补全、属性补全)
+  时给该项加上 `equal`,Vim 自己的前缀过滤不会再在下一次按键时把它删掉。
+- `preselect` 项被移到菜单首位,该次菜单去掉 `noselect`,`<CR>` 可直接接受。
+- 新增 `g:simplecc_complete_sort`(默认 1)可整体退回原先的行为。
+- 新增 `test/completion_items.vim` 与 `lsp::types` 单测,覆盖排序、截断、
+  `filterText` 与 `preselect`。
+
 ### 精确级别诊断导航
 
 - `:SimpleCCNextDiag [severity]` / `:SimpleCCPrevDiag [severity]` 可临时只在

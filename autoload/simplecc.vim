@@ -46,6 +46,12 @@ var s_comp_line: number = -1
 var s_comp_col: number = -1
 var s_comp_start_col: number = 0
 var s_comp_original_line: string = ''
+# Whether the last reply carried a `preselect` item, which decides whether the
+# menu keeps `noselect`.
+var s_comp_preselect: bool = false
+# complete()'s `equal` item field, without which an item whose filterText
+# differs from its inserted word cannot survive Vim's own prefix filter.
+var s_complete_has_equal: bool = has('patch-9.0.1051')
 # Completion item resolve debounce / stale-response protection
 var s_comp_resolve_timer: number = 0
 var s_comp_resolve_id: number = 0
@@ -1383,6 +1389,7 @@ def RequestCompletion(manual: bool = false)
     maxItems: max_items,
     triggerKind: trigger_kind,
     triggerCharacter: trigger_character,
+    sortItems: get(g:, 'simplecc_complete_sort', 1) ? true : false,
   })
 enddef
 
@@ -1569,14 +1576,57 @@ def OnCompletion(ev: dict<any>)
   var line_text = getline('.')
   var start = s_comp_start_col
 
-  # Build Vim complete items
-  var complete_items: list<dict<any>> = []
   # Words already offered by the server, so buffer completion never duplicates
   # them. Keyed with the same case-folding used when matching buffer words.
-  var ic = &ignorecase
   var existing: dict<bool> = {}
+  var complete_items = ServerCompletionItems(items, generation, existing)
+
+  # Supplement server results with keyword matches from open buffers. This also
+  # provides completion before the server is ready or in files with no server.
+  if g:simplecc_complete_buffer_words
+    var prefix = start < s_comp_col - 1 ? line_text[start : s_comp_col - 2] : ''
+    var buf_limit = max([0, g:simplecc_complete_buffer_max_items])
+    extend(complete_items, CollectBufferWords(prefix, existing, buf_limit))
+  endif
+
+  if empty(complete_items)
+    return
+  endif
+
+  if mode() ==# 'i'
+    # Save original completeopt and configure
+    var saved_completeopt = &completeopt
+    execute 'set completeopt=' .. CompletionCompleteopt(s_comp_preselect)
+    complete(start + 1, complete_items)
+    # Restore after complete() returns
+    &completeopt = saved_completeopt
+  endif
+enddef
+
+# `noselect` is what makes <CR> insert a newline until the user picks a
+# candidate.  A server that marked an item `preselect` is asking for the
+# opposite — that item is the answer and <CR> should take it — so drop
+# `noselect` for that one menu only.
+def CompletionCompleteopt(preselect: bool): string
+  return preselect ? 'menu,menuone,noinsert' : 'menu,menuone,noselect,noinsert'
+enddef
+
+# Build the popup-menu entries for one server reply.  Split out of
+# OnCompletion so the LSP-field -> complete()-field mapping is testable without
+# an insert-mode session; `existing` is filled with every offered word so the
+# buffer-word fallback never duplicates one.
+def ServerCompletionItems(items: list<any>, generation: number,
+    existing: dict<bool>): list<dict<any>>
+  s_comp_preselect = false
+  var complete_items: list<dict<any>> = []
+  var ic = &ignorecase
   var idx = 0
   var max_items = max([1, g:simplecc_complete_max_items])
+  # The server's ranking hints: sortText (applied in the daemon, before the
+  # max_items cut), filterText and preselect.  One switch covers all three
+  # because they are one decision — trust the server's ranking or do not.
+  var honour_hints = get(g:, 'simplecc_complete_sort', 1)
+  var preselected = -1
   for item in items
     if idx >= max_items
       break
@@ -1605,6 +1655,18 @@ def OnCompletion(ev: dict<any>)
         commit_characters: get(item, 'commit_characters', []),
       },
     }
+    # LSP filterText is the text the server wants matched against what the user
+    # typed; Vim only ever matches its own `word`.  When they differ — postfix
+    # snippets, attribute completions, anything whose insertion text is not
+    # what you type — Vim's prefix filter drops the item on the next keystroke.
+    # `equal` (Vim 9.0.1051) keeps it in the menu and lets the server's own
+    # filtering stand.
+    if honour_hints && s_complete_has_equal
+      var filter_text = get(item, 'filter_text', '')
+      if filter_text !=# '' && filter_text !=# word
+        ci.equal = 1
+      endif
+    endif
     var detail = get(item, 'detail', '')
     if detail !=# ''
       ci.info = detail
@@ -1613,6 +1675,9 @@ def OnCompletion(ev: dict<any>)
     if doc !=# ''
       ci.info = get(ci, 'info', '') !=# '' ? ci.info .. "\n\n" .. doc : doc
     endif
+    if honour_hints && preselected < 0 && get(item, 'preselect', false)
+      preselected = len(complete_items)
+    endif
     add(complete_items, ci)
     if word !=# ''
       existing[ic ? tolower(word) : word] = true
@@ -1620,26 +1685,13 @@ def OnCompletion(ev: dict<any>)
     idx += 1
   endfor
 
-  # Supplement server results with keyword matches from open buffers. This also
-  # provides completion before the server is ready or in files with no server.
-  if g:simplecc_complete_buffer_words
-    var prefix = start < s_comp_col - 1 ? line_text[start : s_comp_col - 2] : ''
-    var buf_limit = max([0, g:simplecc_complete_buffer_max_items])
-    extend(complete_items, CollectBufferWords(prefix, existing, buf_limit))
+  # Vim can only preselect the first entry, so move the server's choice there
+  # instead of reordering the rest of the ranked menu around it.
+  if preselected > 0
+    insert(complete_items, remove(complete_items, preselected), 0)
   endif
-
-  if empty(complete_items)
-    return
-  endif
-
-  if mode() ==# 'i'
-    # Save original completeopt and configure
-    var saved_completeopt = &completeopt
-    set completeopt=menu,menuone,noselect,noinsert
-    complete(start + 1, complete_items)
-    # Restore after complete() returns
-    &completeopt = saved_completeopt
-  endif
+  s_comp_preselect = preselected >= 0
+  return complete_items
 enddef
 
 # ═════════════════════════════════════════════════════════
