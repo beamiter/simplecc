@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-05
 
+### 文档同步跟着 buffer 走,不再跟着"当前 buffer"走
+
+- `s_change_timer` 是一个全局定时器,回调里的 `SendDidChange()` 读的是*当前*
+  buffer。在 a.rs 里打完字、在 `g:simplecc_change_delay`(120ms,一次 `gd` 或
+  `<C-^>` 远远够不到)之内跳到 b.rs:定时器给 b.rs 发了一条它没有产生的
+  didChange,白白吃掉一个 version,而 a.rs 的编辑一次都没发出去。服务端会一直
+  按 a.rs 编辑前的文本回答补全、hover 和诊断,直到它再次被编辑、被保存,
+  或者在里面触发一次补全。
+- 改成每个 buffer 一个定时器(`s_change_timers: bufnr -> timer`),
+  `SendDidChange(bnr)` 的每一次读取都针对那个 buffer(`getbufline`、
+  `getbufvar('changedtick')`、`listener_flush(bnr)`),不再有"当前 buffer"。
+  `BufLeave` 会把待发的编辑立刻冲掉 —— 离开 buffer 正是它们此前被丢掉的时刻;
+  `BufWritePost` 也先冲一次,否则 didSave 声称保存的正是服务端没见过的那些编辑。
+- `test/change_sync.vim`:定时器排好之后切走,断言发出的 didChange 属于排队的
+  那个 buffer 且带着它的文本,而被切到的那个 buffer 不能收到 didChange;
+  在防抖窗口内 `:buffer` 离开必须冲掉待发编辑;两个 buffer 各自的定时器互不
+  取消。改动前四条断言全灭。
+
 ### `:SimpleCCHealth` 变成真正的体检
 
 - 此前它把十来行 echo 到消息区,内容基本是"守护进程在不在跑",而且把

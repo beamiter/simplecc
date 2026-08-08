@@ -61,7 +61,12 @@ var s_doc_versions: dict<number> = {}
 # Last Vim changedtick known to have been queued to the daemon
 var s_doc_changedticks: dict<number> = {}
 # Change timer for debouncing
-var s_change_timer: number = 0
+# One document-change debounce timer per buffer.  A single global timer meant
+# that switching buffers inside g:simplecc_change_delay cancelled the pending
+# flush for the buffer being left and re-aimed it at the buffer being entered:
+# the server kept answering from the pre-edit text of the file you had just
+# typed in, until you edited it again.  bufnr -> timer id.
+var s_change_timers: dict<number> = {}
 # Completion timer
 var s_comp_timer: number = 0
 # Completion state
@@ -196,11 +201,17 @@ enddef
 # pending callback targets that buffer (the debounced current-buffer work) are
 # stopped; with the default -1 everything is stopped (daemon exit / Stop).
 def StopFeatureTimers(closing_bufnr: number = -1)
+  # Change timers are per buffer, so they are cancelled by buffer rather than
+  # by "is this the current one".
+  if closing_bufnr < 0
+    for id in values(s_change_timers)
+      timer_stop(id)
+    endfor
+    s_change_timers = {}
+  else
+    CancelChangeTimer(closing_bufnr)
+  endif
   if closing_bufnr < 0 || closing_bufnr == bufnr('%')
-    if s_change_timer > 0
-      timer_stop(s_change_timer)
-      s_change_timer = 0
-    endif
     if s_inlay_timer > 0
       timer_stop(s_inlay_timer)
       s_inlay_timer = 0
@@ -806,22 +817,67 @@ def EnsureDocumentOpened(bufnr: number = 0)
   SendDidOpen(bnr)
 enddef
 
-def SendDidChange()
-  if !s_initialized
+def CancelChangeTimer(bnr: number)
+  var key = string(bnr)
+  if has_key(s_change_timers, key)
+    timer_stop(s_change_timers[key])
+    remove(s_change_timers, key)
+  endif
+enddef
+
+# Debounce a didChange for one buffer. The timer is keyed by that buffer, so
+# typing in a.rs and immediately jumping to b.rs still flushes a.rs.
+def ScheduleDidChange(bnr: number)
+  CancelChangeTimer(bnr)
+  s_change_timers[string(bnr)] = timer_start(g:simplecc_change_delay, (_) => {
+    if has_key(s_change_timers, string(bnr))
+      remove(s_change_timers, string(bnr))
+    endif
+    # The buffer that scheduled this flush may have been wiped meanwhile.
+    if !bufexists(bnr)
+      return
+    endif
+    SendDidChange(bnr)
+    # Hints and tokens are only ever rendered into the buffer on screen, and
+    # both read the current window's viewport.
+    if bnr == bufnr('%')
+      RequestInlayHintsDebounced()
+      RequestSemanticTokensDebounced()
+    endif
+  })
+enddef
+
+# Send a buffer's pending edits now instead of waiting out the debounce.
+def FlushDidChange(bnr: number)
+  if !has_key(s_change_timers, string(bnr))
     return
   endif
-  var uri = BufUri()
-  var ft = BufFt()
+  CancelChangeTimer(bnr)
+  SendDidChange(bnr)
+enddef
+
+# Flush one buffer's edits to the server.
+#
+# Every read here is against `bnr` and never against the current buffer: this
+# runs from a debounce timer that may fire long after the user moved on, and
+# reading the wrong buffer burned a version number on a file nobody edited
+# while leaving the edited one stale.
+def SendDidChange(bnr: number)
+  if !s_initialized || !bufexists(bnr)
+    return
+  endif
+  var uri = BufUri(bnr)
+  var ft = BufFt(bnr)
   if ft ==# '' || uri ==# 'file://'
     return
   endif
   # Ensure document is opened before sending changes
   if !has_key(s_doc_versions, uri)
     Log(printf('SendDidChange: document not opened yet, sending didOpen first, uri=%s', uri))
-    SendDidOpen(bufnr('%'))
+    SendDidOpen(bnr)
     return
   endif
-  listener_flush(bufnr('%'))
+  listener_flush(bnr)
   var version = DocVersion(uri)
   # For newly opened documents (version <= 2), always send full text to avoid
   # incremental sync issues when large content is pasted into an empty file
@@ -838,7 +894,7 @@ def SendDidChange()
       changes: changes,
     })
   else
-    var text = join(getline(1, '$'), "\n") .. "\n"
+    var text = join(getbufline(bnr, 1, '$'), "\n") .. "\n"
     # Clear pending changes since we're sending full text
     if has_key(s_pending_changes, uri)
       s_pending_changes[uri] = []
@@ -852,7 +908,7 @@ def SendDidChange()
       text: text,
     })
   endif
-  s_doc_changedticks[uri] = b:changedtick
+  s_doc_changedticks[uri] = getbufvar(bnr, 'changedtick', 0)
 enddef
 
 export def OnBufOpen()
@@ -896,6 +952,9 @@ export def OnBufSave()
   if uri ==# 'file://'
     return
   endif
+  # didChange has to reach the server before the didSave that claims to be the
+  # saved state of those very edits.
+  FlushDidChange(bufnr('%'))
   var text = join(getline(1, '$'), "\n") .. "\n"
   Send({type: 'textDocument/didSave', id: NextId(), uri: uri, text: text})
   if IsActiveConfigBuffer()
@@ -946,22 +1005,7 @@ export def OnTextChanged()
     return
   endif
 
-  if s_change_timer > 0
-    timer_stop(s_change_timer)
-  endif
-  var changed_bufnr = bufnr('%')
-  s_change_timer = timer_start(g:simplecc_change_delay, (_) => {
-    s_change_timer = 0
-    # The buffer that scheduled this flush may have been wiped meanwhile.
-    if !bufexists(changed_bufnr)
-      return
-    endif
-    SendDidChange()
-    # F3: Re-request inlay hints after changes
-    RequestInlayHintsDebounced()
-    # F2: Auto semantic tokens
-    RequestSemanticTokensDebounced()
-  })
+  ScheduleDidChange(bufnr('%'))
 
   # TextChangedI is a more accurate completion trigger than relying only on
   # CursorMovedI. TriggerCompletion itself snapshots the cursor and changedtick,
@@ -998,6 +1042,9 @@ enddef
 # Document highlights belong to the cursor position that requested them; leaving
 # the buffer makes them stale.
 export def OnBufLeave()
+  # Leaving a buffer inside the debounce window is exactly when its edits used
+  # to be dropped; flush them while this buffer is still the current one.
+  FlushDidChange(bufnr('%'))
   DocumentHighlightClear()
 enddef
 
@@ -1291,14 +1338,11 @@ export def SelectEnterKey(): string
 enddef
 
 def SyncDocumentForCompletion()
-  if s_change_timer > 0
-    timer_stop(s_change_timer)
-    s_change_timer = 0
-  endif
-
-  var uri = BufUri()
+  var bnr = bufnr('%')
+  CancelChangeTimer(bnr)
+  var uri = BufUri(bnr)
   if uri !=# 'file://' && get(s_doc_changedticks, uri, -1) != b:changedtick
-    SendDidChange()
+    SendDidChange(bnr)
   endif
 enddef
 
