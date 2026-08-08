@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-08-05
 
+### 每个值得绑键的命令都有 `<Plug>` 目标
+
+- 44 个命令里只有 17 个有 `<Plug>` 目标。选区展开/收缩、文档高亮、签名帮助、
+  调用与类型层级、code lens、折叠、工作区符号与实时符号搜索都没有,于是
+  `g:simplecc_no_default_maps = 1`(文档里推荐的"自己掌控按键"的做法)的用户
+  只能靠敲完整命令名来用这半个插件。现在补齐,并在 doc 与 README 里列全。
+- `workspace-symbol` 与 `workspace-symbol-live` 用 `:` 而不是 `<Cmd>`:两者都会
+  `input()` 提示,而 `<Cmd>` 映射执行期间 textlock 生效,`input()` 会抛 E1105。
+- `test/native_options.vim` 断言这 33 个 `<Plug>` 目标逐个存在。
+
 ### 文档同步跟着 buffer 走,不再跟着"当前 buffer"走
 
 - `s_change_timer` 是一个全局定时器,回调里的 `SendDidChange()` 读的是*当前*

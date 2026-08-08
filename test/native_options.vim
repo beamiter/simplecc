@@ -175,6 +175,23 @@ call assert_equal(v:null, simplecc#TagFunc('other', 'c', {}),
       \ 'CTRL-] works without a daemon')
 call assert_equal([], simplecc#OmniFunc(0, ''), 'CTRL-X CTRL-O without a daemon')
 
+" ------------------------------------------------------------ <Plug> targets ---
+
+" A user who took control of the mappings with g:simplecc_no_default_maps must
+" still be able to reach every feature by name rather than by command.
+for s:plug in ['definition', 'references', 'hover', 'rename', 'code-action',
+      \ 'format', 'selection-expand', 'selection-shrink', 'prev-diagnostic',
+      \ 'next-diagnostic', 'show-diagnostic', 'diagnostics',
+      \ 'diagnostics-workspace', 'pull-diagnostics', 'implementation',
+      \ 'type-definition', 'outline', 'inlay-hints', 'signature-help',
+      \ 'document-highlight', 'document-highlight-clear', 'incoming-calls',
+      \ 'outgoing-calls', 'supertypes', 'subtypes', 'code-lens',
+      \ 'code-lens-run', 'fold', 'semantic-tokens', 'workspace-symbol',
+      \ 'workspace-symbol-live', 'health', 'restart']
+  call assert_notequal('', maparg('<Plug>(simplecc-' .. s:plug .. ')', 'n'),
+        \ '<Plug>(simplecc-' .. s:plug .. ') must exist')
+endfor
+
 call delete(s:daemon)
 call delete(s:trace)
 call delete(s:file)

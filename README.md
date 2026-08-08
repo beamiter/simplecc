@@ -253,6 +253,10 @@ disable all default mappings.
 | <code>[d</code> / <code>]d</code> | Previous / next diagnostic |
 | Insert-mode Tab, Shift-Tab, arrows, Enter | Navigate and accept completion |
 
+Every command worth a key also has a <code>&lt;Plug&gt;</code> target, so
+<code>g:simplecc_no_default_maps = 1</code> does not mean typing command names
+in full -- see <code>:help simplecc-mappings</code> for the list.
+
 ### Vim's own extension points
 
 In every buffer the daemon serves, SimpleCC also points three Vim options at the

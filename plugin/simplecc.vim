@@ -161,6 +161,29 @@ nnoremap <silent> <Plug>(simplecc-selection-expand) <Cmd>SimpleCCSelExpand<CR>
 nnoremap <silent> <Plug>(simplecc-selection-shrink) <Cmd>SimpleCCSelShrink<CR>
 xnoremap <silent> <Plug>(simplecc-selection-expand) :SimpleCCSelExpand<CR>
 xnoremap <silent> <Plug>(simplecc-selection-shrink) :SimpleCCSelShrink<CR>
+# Every remaining command that is worth a key.  Without these, taking control
+# of the mappings with g:simplecc_no_default_maps means reaching half the
+# plugin only by typing command names in full.
+nnoremap <silent> <Plug>(simplecc-signature-help) <Cmd>SimpleCCSignatureHelp<CR>
+nnoremap <silent> <Plug>(simplecc-document-highlight) <Cmd>SimpleCCHighlight<CR>
+nnoremap <silent> <Plug>(simplecc-document-highlight-clear) <Cmd>SimpleCCHighlightClear<CR>
+nnoremap <silent> <Plug>(simplecc-incoming-calls) <Cmd>SimpleCCIncomingCalls<CR>
+nnoremap <silent> <Plug>(simplecc-outgoing-calls) <Cmd>SimpleCCOutgoingCalls<CR>
+nnoremap <silent> <Plug>(simplecc-supertypes) <Cmd>SimpleCCSupertypes<CR>
+nnoremap <silent> <Plug>(simplecc-subtypes) <Cmd>SimpleCCSubtypes<CR>
+nnoremap <silent> <Plug>(simplecc-code-lens) <Cmd>SimpleCCCodeLens<CR>
+nnoremap <silent> <Plug>(simplecc-code-lens-run) <Cmd>SimpleCCCodeLensRun<CR>
+nnoremap <silent> <Plug>(simplecc-fold) <Cmd>SimpleCCFold<CR>
+nnoremap <silent> <Plug>(simplecc-semantic-tokens) <Cmd>SimpleCCSemanticTokens<CR>
+nnoremap <silent> <Plug>(simplecc-pull-diagnostics) <Cmd>SimpleCCPullDiag<CR>
+nnoremap <silent> <Plug>(simplecc-diagnostics) <Cmd>SimpleCCDiagnostics<CR>
+nnoremap <silent> <Plug>(simplecc-diagnostics-workspace) <Cmd>SimpleCCDiagnostics!<CR>
+# Not <Cmd>: both prompt with input(), which is forbidden while a <Cmd> mapping
+# runs (E1105 / textlock).
+nnoremap <silent> <Plug>(simplecc-workspace-symbol) :SimpleCCWorkspaceSymbol<CR>
+nnoremap <silent> <Plug>(simplecc-workspace-symbol-live) :SimpleCCWorkspaceSymbolLive<CR>
+nnoremap <silent> <Plug>(simplecc-health) <Cmd>SimpleCCHealth<CR>
+nnoremap <silent> <Plug>(simplecc-restart) <Cmd>SimpleCCRestart<CR>
 nnoremap <silent> <Plug>(simplecc-prev-diagnostic) <Cmd>SimpleCCPrevDiag<CR>
 nnoremap <silent> <Plug>(simplecc-next-diagnostic) <Cmd>SimpleCCNextDiag<CR>
 nnoremap <silent> <Plug>(simplecc-show-diagnostic) <Cmd>SimpleCCDiag<CR>

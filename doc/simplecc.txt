@@ -242,13 +242,32 @@ that intersect it, which is what makes "extract function", "extract variable",
 |:SimpleCCFormat| uses textDocument/rangeFormatting and formats only those
 lines. Without a range both behave exactly as before.
 
-Optional mapping targets:
+Optional mapping targets. Every command worth a key has one, so taking control
+with |g:simplecc_no_default_maps| does not mean typing command names in full:
 
-  <Plug>(simplecc-show-diagnostic)   |:SimpleCCDiag|
-  <Plug>(simplecc-selection-expand)  |:SimpleCCSelExpand|  (Normal and Visual)
-  <Plug>(simplecc-selection-shrink)  |:SimpleCCSelShrink|  (Normal and Visual)
-  <Plug>(simplecc-code-action)       |:SimpleCCAction|     (Normal and Visual)
-  <Plug>(simplecc-format)            |:SimpleCCFormat|     (Normal and Visual)
+  <Plug>(simplecc-show-diagnostic)          |:SimpleCCDiag|
+  <Plug>(simplecc-diagnostics)              |:SimpleCCDiagnostics|
+  <Plug>(simplecc-diagnostics-workspace)    :SimpleCCDiagnostics!
+  <Plug>(simplecc-pull-diagnostics)         |:SimpleCCPullDiag|
+  <Plug>(simplecc-selection-expand)         |:SimpleCCSelExpand| (Normal, Visual)
+  <Plug>(simplecc-selection-shrink)         |:SimpleCCSelShrink| (Normal, Visual)
+  <Plug>(simplecc-code-action)              |:SimpleCCAction|    (Normal, Visual)
+  <Plug>(simplecc-format)                   |:SimpleCCFormat|    (Normal, Visual)
+  <Plug>(simplecc-signature-help)           |:SimpleCCSignatureHelp|
+  <Plug>(simplecc-document-highlight)       |:SimpleCCHighlight|
+  <Plug>(simplecc-document-highlight-clear) |:SimpleCCHighlightClear|
+  <Plug>(simplecc-incoming-calls)           |:SimpleCCIncomingCalls|
+  <Plug>(simplecc-outgoing-calls)           |:SimpleCCOutgoingCalls|
+  <Plug>(simplecc-supertypes)               |:SimpleCCSupertypes|
+  <Plug>(simplecc-subtypes)                 |:SimpleCCSubtypes|
+  <Plug>(simplecc-code-lens)                |:SimpleCCCodeLens|
+  <Plug>(simplecc-code-lens-run)            |:SimpleCCCodeLensRun|
+  <Plug>(simplecc-fold)                     |:SimpleCCFold|
+  <Plug>(simplecc-semantic-tokens)          |:SimpleCCSemanticTokens|
+  <Plug>(simplecc-workspace-symbol)         |:SimpleCCWorkspaceSymbol|
+  <Plug>(simplecc-workspace-symbol-live)    |:SimpleCCWorkspaceSymbolLive|
+  <Plug>(simplecc-health)                   |:SimpleCCHealth|
+  <Plug>(simplecc-restart)                  |:SimpleCCRestart|
 
 Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
 Tab is context-aware and acts on the first of these that applies: advance the
