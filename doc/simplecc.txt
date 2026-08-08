@@ -396,6 +396,15 @@ g:simplecc_auto_install          number  default: 0
 g:simplecc_inlay_hints           number  default: 1
         Enable inlay hints.
 
+                                              *g:simplecc_inlay_margin*
+g:simplecc_inlay_margin          number  default: 100
+        Lines above and below the visible area that inlay hints are requested
+        for. textDocument/inlayHint takes a range, and hints are only ever
+        rendered where they can be seen, so the request follows the viewport
+        and scrolling fetches the rest. The margin is what keeps a small
+        scroll from needing a round-trip; raise it to trade requests for
+        memory, or set it to 0 to ask for exactly what is on screen.
+
                                                *g:simplecc_virtual_diag*
 g:simplecc_virtual_diag          number  default: 1
         Show virtual diagnostic text.

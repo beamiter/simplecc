@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-05
 
+### inlay hint 按视口请求,语义高亮批量落属性
+
+- `textDocument/inlayHint` 本来就是范围请求,而这里每次都填 `0 .. line('$')`。
+  两万行的文件里,服务端要为整篇计算 hint,这个进程要把它们全部解码并逐条
+  `prop_add()`,只为渲染屏幕上那二十来条。现在请求视口上下各
+  `g:simplecc_inlay_margin`(默认 100)行,滚动时由 `WinScrolled` 补齐 ——
+  `OnWinScrolled()` 此前只在开了语义高亮且文件够大时才做事。
+- 语义高亮改用 `prop_add_list()`:按属性类型攒好位置,每种类型一次调用,
+  取代每个 token 一次 `prop_add()`(每次还各带一个 try/catch)。5000 行的
+  Rust 文件一次回复几万个 token,那正是每次编辑后卡顿的来源。批量调用是
+  全有或全无的,因此失败时逐条回退,不会因为一个越界位置丢掉整类高亮。
+- inlay hint 不能同样批量:`prop_add_list()` 明确不支持 `text` 字段,而且不是
+  报错而是静默忽略 —— 照搬会让每条 hint 的文字凭空消失。这一点写在代码注释里。
+- `test/viewport_hints.vim`:两千行文件里跳到第 1000 行,断言请求范围既不从
+  文件头开始也不到文件尾;`g:simplecc_inlay_margin = 0` 时正好是视口;滚动会
+  重新请求;以及一次回复里同类型的多个 token 必须全部落到属性上(批量写错时
+  只会剩第一个)。改动前前三条断言全灭。
+
 ### workspace edit 支持文件的新建 / 重命名 / 删除
 
 - 服务端发来的 `documentChanges` 里只要出现一个资源操作,守护进程就整条拒绝

@@ -3874,6 +3874,18 @@ def RequestInlayHints()
     return
   endif
   var id = NextId()
+  # textDocument/inlayHint takes a range, and this asked for the whole
+  # document every time: in a 20k-line file the server computed — and this
+  # process then decoded and turned into text properties — tens of thousands
+  # of hints, of which a screenful was ever visible.  Ask for the viewport
+  # plus a margin, the shape the semantic-token path already uses, and let
+  # scrolling fetch the rest (OnWinScrolled re-requests).
+  var margin = max([0, g:simplecc_inlay_margin])
+  var top = max([0, line('w0') - 1 - margin])
+  # A window that is not really on screen (`vim -es`, or a buffer loaded but
+  # never displayed) can report line('w$') below line('w0'); an inverted range
+  # is not something a language server should be asked to make sense of.
+  var bot = max([top, min([line('$') - 1, line('w$') - 1 + margin])])
   # Record which buffer snapshot this request was issued for so the async
   # reply is never rendered into whatever buffer is current at reply time.
   s_inlay_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
@@ -3882,8 +3894,8 @@ def RequestInlayHints()
     id: id,
     uri: BufUri(),
     languageId: ft,
-    startLine: 0,
-    endLine: line('$'),
+    startLine: top,
+    endLine: bot,
   })
 enddef
 
@@ -4337,6 +4349,13 @@ def OnSemanticTokens(ev: dict<any>)
     s_semtok_has_full[uri] = true
   endif
 
+  # Positions are collected per property type and added with one
+  # prop_add_list() call each instead of one prop_add() per token.  A 5k-line
+  # Rust file answers with tens of thousands of tokens, and that many separate
+  # calls — each inside its own try/catch — is where the pause after every
+  # edit came from.  (Inlay hints cannot do this: prop_add_list() ignores the
+  # "text" field, so batching them would silently drop every label.)
+  var batches: dict<list<list<number>>> = {}
   for t in tokens
     var lnum = get(t, 'line', 0) + 1
     var line_text = get(getbufline(bnr, lnum), 0, '')
@@ -4361,11 +4380,27 @@ def OnSemanticTokens(ev: dict<any>)
         endtry
         registered[ptype] = true
       endif
-      try
-        prop_add(lnum, col, {type: ptype, length: length, bufnr: bnr})
-      catch
-      endtry
+      if !has_key(batches, ptype)
+        batches[ptype] = []
+      endif
+      # [lnum, col, end_lnum, end_col]; a token never spans lines, and end_col
+      # is the column just after the text.
+      add(batches[ptype], [lnum, col, lnum, col + length])
     endif
+  endfor
+  for [ptype, positions] in items(batches)
+    try
+      prop_add_list({type: ptype, bufnr: bnr}, positions)
+    catch
+      # prop_add_list() is all-or-nothing, so one position the buffer no longer
+      # accepts would cost every token of that type; fall back per position.
+      for pos in positions
+        try
+          prop_add(pos[0], pos[1], {type: ptype, length: pos[3] - pos[1], bufnr: bnr})
+        catch
+        endtry
+      endfor
+    endtry
   endfor
   Log(printf('applied %d semantic tokens', len(tokens)))
 enddef
@@ -5561,10 +5596,16 @@ def RequestSemanticTokensDebounced()
 enddef
 
 export def OnWinScrolled()
-  if !s_initialized || !g:simplecc_semantic_tokens
+  if !s_initialized
     return
   endif
-  if line('$') > g:simplecc_semtok_range_threshold
+  # Both features are scoped to the viewport, so scrolling is what fetches the
+  # part that has just become visible.  Both requests are debounced, which is
+  # what keeps a held <C-d> from issuing one per redraw.
+  if g:simplecc_inlay_hints && s_inlay_enabled
+    RequestInlayHintsDebounced()
+  endif
+  if g:simplecc_semantic_tokens && line('$') > g:simplecc_semtok_range_threshold
     RequestSemanticTokensDebounced()
   endif
 enddef

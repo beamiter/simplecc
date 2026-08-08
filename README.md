@@ -282,6 +282,7 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_sign_hint</code> | H&gt; | Hint sign text |
 | <code>g:simplecc_auto_install</code> | 0 | Install missing managed servers without prompting |
 | <code>g:simplecc_inlay_hints</code> | 1 | Enable inlay hints |
+| <code>g:simplecc_inlay_margin</code> | 100 | Lines around the viewport that inlay hints are requested for |
 | <code>g:simplecc_virtual_diag</code> | 1 | Enable virtual diagnostic text |
 | <code>g:simplecc_diag_max_per_line</code> | 3 | Virtual diagnostics per line |
 | <code>g:simplecc_diag_float</code> | 0 | Show diagnostics near the cursor |

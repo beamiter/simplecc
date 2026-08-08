@@ -61,6 +61,10 @@ g:simplecc_sign_info       = get(g:, 'simplecc_sign_info', 'I>')
 g:simplecc_sign_hint       = get(g:, 'simplecc_sign_hint', 'H>')
 g:simplecc_auto_install    = get(g:, 'simplecc_auto_install', 0)
 g:simplecc_inlay_hints     = get(g:, 'simplecc_inlay_hints', 1)
+# Lines above and below the viewport that inlay hints are requested for.
+# textDocument/inlayHint takes a range; asking for the whole document made a
+# large file pay for tens of thousands of hints to render a screenful.
+g:simplecc_inlay_margin    = get(g:, 'simplecc_inlay_margin', 100)
 g:simplecc_virtual_diag    = get(g:, 'simplecc_virtual_diag', 1)
 g:simplecc_diag_max_per_line = get(g:, 'simplecc_diag_max_per_line', 3)
 g:simplecc_diag_float      = get(g:, 'simplecc_diag_float', 0)

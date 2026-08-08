@@ -24,6 +24,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/stale_props.vim
 	vim -Nu NONE -n -i NONE -es -S test/range_requests.vim
 	vim -Nu NONE -n -i NONE -es -S test/resource_operations.vim
+	vim -Nu NONE -n -i NONE -es -S test/viewport_hints.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
