@@ -16,12 +16,24 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.  The toolchain is derived from rust-version in Cargo.toml rather than
+  # pinned here: a hand-written pin that drifts below the declared MSRV makes
+  # `cargo check --locked` a hard error, which is how six repositories in this
+  # suite sat red on every push.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Read the declared MSRV from Cargo.toml
+        id: msrv
+        run: |
+          version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)"
+          test -n "$version" || { echo "Cargo.toml declares no rust-version"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV: $version"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
   rust:
@@ -94,17 +106,8 @@ jobs:
             -c 'helptags doc' \
             -c 'qa!'
 
-      - name: Run Vim9 smoke tests
-        run: >-
-          vim -Nu NONE -n -i NONE -es
-          -V1/tmp/simplecc-vim-test.log
-          -S test/vim9_smoke.vim
-
-      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
-        run: make defcompile
-
-      - name: simplecore supervisor regression suite
-        run: make vim-core
-
-      - name: Buffer-word completion bound
-        run: vim -Nu NONE -n -i NONE -es -S test/buffer_words.vim
+      # One target, not a hand-written list: `make vim-check` is the Makefile's
+      # own definition of the Vim half of `make check`, so a new test file is
+      # wired up in one place instead of two that drift apart.
+      - name: Vim9 checks (defcompile, supervisor suite, smoke tests)
+        run: make vim-check

@@ -1,6 +1,10 @@
-.PHONY: check fmt clippy test vim-test vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-check vim-test vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test
+check: fmt clippy test vim-check
+
+# The Vim half of `check`, as one target.  CI's Vim job runs exactly this, so a
+# new test file is wired up here and nowhere else.
+vim-check: core-verify defcompile vim-core vim-test
 
 fmt:
 	cargo fmt --all -- --check
