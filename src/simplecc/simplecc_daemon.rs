@@ -182,6 +182,21 @@ enum Request {
         #[serde(default = "default_true")]
         insert_spaces: bool,
     },
+    #[serde(rename = "textDocument/rangeFormatting")]
+    RangeFormatting {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+        line: u32,
+        character: u32,
+        end_line: u32,
+        end_character: u32,
+        #[serde(default = "default_tab_size")]
+        tab_size: u32,
+        #[serde(default = "default_true")]
+        insert_spaces: bool,
+    },
     #[serde(rename = "textDocument/prepareRename")]
     PrepareRename {
         id: u64,
@@ -1223,6 +1238,45 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.formatting(&uri, tab_size, insert_spaces).await {
+                    Ok(edits) => send_event(
+                        &out,
+                        json!({"type": "formatting", "id": id, "edits": edits}),
+                    ),
+                    Err(e) => send_event(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()}),
+                    ),
+                }
+            }
+        }
+
+        Request::RangeFormatting {
+            id,
+            uri,
+            language_id,
+            line,
+            character,
+            end_line,
+            end_character,
+            tab_size,
+            insert_spaces,
+        } => {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
+                let c = client;
+                match c
+                    .range_formatting(
+                        &uri,
+                        line,
+                        character,
+                        end_line,
+                        end_character,
+                        tab_size,
+                        insert_spaces,
+                    )
+                    .await
+                {
+                    // Same reply type as whole-document formatting: the editor
+                    // applies the edits identically either way.
                     Ok(edits) => send_event(
                         &out,
                         json!({"type": "formatting", "id": id, "edits": edits}),

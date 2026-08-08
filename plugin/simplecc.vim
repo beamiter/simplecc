@@ -84,8 +84,13 @@ command! -nargs=0 SimpleCCHover         simplecc#Hover()
 command! -nargs=0 SimpleCCDefinition    simplecc#Definition()
 command! -nargs=0 SimpleCCReferences    simplecc#References()
 command! -nargs=0 SimpleCCRename        simplecc#Rename()
-command! -nargs=0 SimpleCCFormat        simplecc#Format()
-command! -nargs=0 SimpleCCAction        simplecc#CodeAction()
+# -range so a visual selection reaches the language server: rangeFormatting for
+# :SimpleCCFormat, and a real code-action range, which is what makes
+# refactor.extract available at all.  <range> is the number of range items the
+# user actually supplied, so a plain :SimpleCCFormat still formats the whole
+# document rather than the cursor line.
+command! -range -nargs=0 SimpleCCFormat  simplecc#Format(<range> > 0 ? v:true : v:false, <line1>, <line2>)
+command! -range -nargs=0 SimpleCCAction  simplecc#CodeAction(<range> > 0 ? v:true : v:false, <line1>, <line2>)
 command! -bang -nargs=? -complete=customlist,simplecc#CompleteDiagnosticSeverity SimpleCCDiagnostics simplecc#DiagList('<bang>' ==# '!', <q-args>)
 command! -nargs=? -complete=customlist,simplecc#CompleteDiagnosticSeverity SimpleCCNextDiag simplecc#DiagNext(<q-args>)
 command! -nargs=? -complete=customlist,simplecc#CompleteDiagnosticSeverity SimpleCCPrevDiag simplecc#DiagPrev(<q-args>)
@@ -102,8 +107,10 @@ command! -nargs=0 SimpleCCHighlightClear simplecc#DocumentHighlightClear()
 command! -nargs=0 SimpleCCInlayHints    simplecc#InlayHintsToggle()
 command! -nargs=0 SimpleCCIncomingCalls simplecc#IncomingCalls()
 command! -nargs=0 SimpleCCOutgoingCalls simplecc#OutgoingCalls()
-command! -nargs=0 SimpleCCSelExpand     simplecc#SelectionExpand()
-command! -nargs=0 SimpleCCSelShrink     simplecc#SelectionShrink()
+# -range only so that repeating the command from the visual selection the last
+# one created does not abort with E481; the range itself is not used.
+command! -range -nargs=0 SimpleCCSelExpand simplecc#SelectionExpand()
+command! -range -nargs=0 SimpleCCSelShrink simplecc#SelectionShrink()
 command! -nargs=0 SimpleCCSemanticTokens simplecc#SemanticTokens()
 command! -nargs=0 SimpleCCCodeLens      simplecc#CodeLens()
 command! -nargs=0 SimpleCCFold          simplecc#FoldingRange()
@@ -128,6 +135,15 @@ nnoremap <silent> <Plug>(simplecc-hover) <Cmd>SimpleCCHover<CR>
 nnoremap <silent> <Plug>(simplecc-rename) <Cmd>SimpleCCRename<CR>
 nnoremap <silent> <Plug>(simplecc-code-action) <Cmd>SimpleCCAction<CR>
 nnoremap <silent> <Plug>(simplecc-format) <Cmd>SimpleCCFormat<CR>
+# `:` and not `<Cmd>`: <Cmd> does not leave Visual mode, so '< and '> still
+# describe the *previous* selection and the command aborts with E20.  Leaving
+# Visual mode is what sets them, and Vim then inserts the '<,'> range itself.
+xnoremap <silent> <Plug>(simplecc-code-action) :SimpleCCAction<CR>
+xnoremap <silent> <Plug>(simplecc-format) :SimpleCCFormat<CR>
+nnoremap <silent> <Plug>(simplecc-selection-expand) <Cmd>SimpleCCSelExpand<CR>
+nnoremap <silent> <Plug>(simplecc-selection-shrink) <Cmd>SimpleCCSelShrink<CR>
+xnoremap <silent> <Plug>(simplecc-selection-expand) :SimpleCCSelExpand<CR>
+xnoremap <silent> <Plug>(simplecc-selection-shrink) :SimpleCCSelShrink<CR>
 nnoremap <silent> <Plug>(simplecc-prev-diagnostic) <Cmd>SimpleCCPrevDiag<CR>
 nnoremap <silent> <Plug>(simplecc-next-diagnostic) <Cmd>SimpleCCNextDiag<CR>
 nnoremap <silent> <Plug>(simplecc-show-diagnostic) <Cmd>SimpleCCDiag<CR>
@@ -148,6 +164,8 @@ if !g:simplecc_no_default_maps
   if maparg('<leader>rn', 'n') ==# '' | nmap <silent> <leader>rn <Plug>(simplecc-rename)| endif
   if maparg('<leader>ca', 'n') ==# '' | nmap <silent> <leader>ca <Plug>(simplecc-code-action)| endif
   if maparg('<leader>fm', 'n') ==# '' | nmap <silent> <leader>fm <Plug>(simplecc-format)| endif
+  if maparg('<leader>ca', 'x') ==# '' | xmap <silent> <leader>ca <Plug>(simplecc-code-action)| endif
+  if maparg('<leader>fm', 'x') ==# '' | xmap <silent> <leader>fm <Plug>(simplecc-format)| endif
   if maparg('[d', 'n') ==# '' | nmap <silent> [d <Plug>(simplecc-prev-diagnostic)| endif
   if maparg(']d', 'n') ==# '' | nmap <silent> ]d <Plug>(simplecc-next-diagnostic)| endif
   if maparg('gi', 'n') ==# '' | nmap <silent> gi <Plug>(simplecc-implementation)| endif

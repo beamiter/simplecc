@@ -169,8 +169,13 @@ Navigation ~
 Editing and language features ~
 
 *:SimpleCCRename*                Rename the symbol under the cursor.
-*:SimpleCCFormat*                Format the current buffer.
-*:SimpleCCAction*                Select and execute a code action.
+*:SimpleCCFormat*                Format the current buffer. Accepts a range:
+                                over a selection it uses
+                                textDocument/rangeFormatting.
+*:SimpleCCAction*                Select and execute a code action. Accepts a
+                                range: over a selection it sends that range
+                                and the diagnostics inside it, which is what
+                                makes the extract refactorings reachable.
 *:SimpleCCSignatureHelp*         Show signature help.
 *:SimpleCCInlayHints*            Toggle inlay hints.
 *:SimpleCCSelExpand*             Expand selection using selection ranges.
@@ -219,14 +224,29 @@ gi              Implementation
 gy              Type definition
 <Leader>rn      Rename
 <Leader>ca      Code action
-<Leader>f       Format
+<Leader>fm      Format
 <Leader>o       Document outline
 <Leader>ih      Toggle inlay hints
 [d / ]d        Previous / next diagnostic
 
-Optional diagnostic mapping target:
+Default Visual-mode mappings:
+
+<Leader>ca      Code action over the selection
+<Leader>fm      Format the selection
+
+Over a selection, |:SimpleCCAction| sends the real range and the diagnostics
+that intersect it, which is what makes "extract function", "extract variable",
+"move to a new file" and diagnostic-bound quickfix actions available at all;
+|:SimpleCCFormat| uses textDocument/rangeFormatting and formats only those
+lines. Without a range both behave exactly as before.
+
+Optional mapping targets:
 
   <Plug>(simplecc-show-diagnostic)   |:SimpleCCDiag|
+  <Plug>(simplecc-selection-expand)  |:SimpleCCSelExpand|  (Normal and Visual)
+  <Plug>(simplecc-selection-shrink)  |:SimpleCCSelShrink|  (Normal and Visual)
+  <Plug>(simplecc-code-action)       |:SimpleCCAction|     (Normal and Visual)
+  <Plug>(simplecc-format)            |:SimpleCCFormat|     (Normal and Visual)
 
 Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
 Tab is context-aware and acts on the first of these that applies: advance the

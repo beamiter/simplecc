@@ -1083,6 +1083,60 @@ impl LspClient {
             .collect())
     }
 
+    /// Format one range instead of the whole document.
+    ///
+    /// Gated on the advertised capability rather than left to fail as a
+    /// -32601: a server without range formatting must not silently reformat
+    /// the entire buffer when the user selected six lines.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_formatting(
+        &self,
+        uri: &str,
+        start_line: u32,
+        start_character: u32,
+        end_line: u32,
+        end_character: u32,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Vec<types::TextEdit>> {
+        {
+            let caps = self.capabilities.lock().await;
+            let supported = caps.as_ref().is_some_and(|caps| {
+                matches!(
+                    caps.document_range_formatting_provider,
+                    Some(OneOf::Left(true)) | Some(OneOf::Right(_))
+                )
+            });
+            if !supported {
+                bail!("the language server does not support range formatting");
+            }
+        }
+
+        let result = self
+            .request(
+                "textDocument/rangeFormatting",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": { "line": start_line, "character": start_character },
+                        "end": { "line": end_line, "character": end_character },
+                    },
+                    "options": {
+                        "tabSize": tab_size,
+                        "insertSpaces": insert_spaces,
+                    },
+                }),
+            )
+            .await?;
+
+        if result.is_null() {
+            return Ok(vec![]);
+        }
+
+        let edits: Vec<lsp_types::TextEdit> = serde_json::from_value(result)?;
+        Ok(edits.iter().map(types::from_lsp_text_edit).collect())
+    }
+
     /// Validate a rename position before prompting the user. `Ok(None)` means
     /// the server rejected the position (or answered null).
     pub async fn prepare_rename(

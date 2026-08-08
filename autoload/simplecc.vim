@@ -1819,25 +1819,59 @@ enddef
 # Code Action
 # ═════════════════════════════════════════════════════════
 
-export def CodeAction()
+# The LSP range covering whole lines line1..line2, in UTF-16 units.  It ends
+# at the last line's end rather than at column 0 of the next line, so a
+# selection that reaches the final line of the buffer is still expressible.
+def LineRange(line1: number, line2: number): dict<number>
+  var first = max([1, min([line1, line2])])
+  var last = min([line('$'), max([line1, line2])])
+  return {
+    line: first - 1,
+    character: 0,
+    end_line: last - 1,
+    end_character: ByteOffsetToUtf16(getline(last), strlen(getline(last))),
+  }
+enddef
+
+# Diagnostics intersecting the requested range, in the shape the daemon
+# forwards as `context.diagnostics`.  Quickfix actions — "add the missing
+# import", "remove this unused variable" — are bound to a diagnostic, so
+# sending the empty list this always sent is what made them unavailable.
+def RangeDiagnostics(range: dict<number>): list<dict<any>>
+  return filter(AllDiagnostics(BufDiagKey()),
+      (_, item) => get(item, 'end_line', get(item, 'line', 0)) >= range.line
+        && get(item, 'line', 0) <= range.end_line)
+enddef
+
+# Without a range this is the cursor position, exactly as before.  Over a
+# selection it sends the real range, which is the only way a server offers
+# refactor.extract — "extract function", "extract variable", TypeScript's
+# "move to a new file".
+export def CodeAction(range_given: bool = false, line1: number = 0, line2: number = 0)
   if !s_initialized
     echom '[SimpleCC] not initialized'
     return
   endif
 
   var id = NextId()
-  var lnum = line('.') - 1
-  var cchar = CursorUtf16()
+  var range: dict<number>
+  if range_given
+    range = LineRange(line1, line2)
+  else
+    var lnum = line('.') - 1
+    var cchar = CursorUtf16()
+    range = {line: lnum, character: cchar, end_line: lnum, end_character: cchar}
+  endif
   Send({
     type: 'textDocument/codeAction',
     id: id,
     uri: BufUri(),
     languageId: BufFt(),
-    line: lnum,
-    character: cchar,
-    end_line: lnum,
-    end_character: cchar,
-    diagnostics: [],
+    line: range.line,
+    character: range.character,
+    end_line: range.end_line,
+    end_character: range.end_character,
+    diagnostics: RangeDiagnostics(range),
   })
 enddef
 
@@ -1897,7 +1931,10 @@ enddef
 # Formatting
 # ═════════════════════════════════════════════════════════
 
-export def Format()
+# Without a range this formats the whole document, as it always has.  Over a
+# selection it uses textDocument/rangeFormatting; the reply is the same shape,
+# so the edits are applied by the same handler.
+export def Format(range_given: bool = false, line1: number = 0, line2: number = 0)
   var uri = BufUri()
   var ft = BufFt()
   Log(printf('Format called: uri=%s, ft=%s, has_version=%d', uri, ft, has_key(s_doc_versions, uri)))
@@ -1910,7 +1947,24 @@ export def Format()
   EnsureDocumentOpened()
 
   var id = NextId()
-  Log(printf('Format: sending formatting request, id=%d', id))
+  Log(printf('Format: sending formatting request, id=%d, range=%d',
+    id, range_given ? 1 : 0))
+  if range_given
+    var range = LineRange(line1, line2)
+    Send({
+      type: 'textDocument/rangeFormatting',
+      id: id,
+      uri: uri,
+      languageId: ft,
+      line: range.line,
+      character: range.character,
+      end_line: range.end_line,
+      end_character: range.end_character,
+      tab_size: &tabstop,
+      insert_spaces: &expandtab,
+    })
+    return
+  endif
   Send({
     type: 'textDocument/formatting',
     id: id,

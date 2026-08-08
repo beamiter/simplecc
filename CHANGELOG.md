@@ -2,6 +2,27 @@
 
 ## Unreleased - 2026-08-05
 
+### code action 与格式化支持范围
+
+- `:SimpleCCAction` 与 `:SimpleCCFormat` 加上 `-range`。选中若干行再调用时,
+  code action 会带上真实范围与范围内的诊断作为 `context.diagnostics` —— 这是
+  `refactor.extract`(提取函数、提取变量、TypeScript 的 move to a new file)
+  以及绑定在诊断上的 quickfix action 能出现的前提;此前请求永远是
+  `end_line == line` 且 `diagnostics: []`,这一整类重构根本无法触达。
+- 新增 `textDocument/rangeFormatting`(守护进程 `Request::RangeFormatting` +
+  `LspClient::range_formatting`),按服务端能力位判断;不支持时明确报错,而不是
+  悄悄把整个 buffer 重排。不带范围的调用行为完全不变。
+- `:SimpleCCSelExpand` / `:SimpleCCSelShrink` 也加上 `-range`:从上一次展开
+  留下的可视选区里再次调用,不会再因为 Vim 自动插入的 `'<,'>` 而抛 E481。
+- 新增 visual 模式的 `<Plug>(simplecc-code-action)` / `(simplecc-format)`,
+  以及 normal + visual 的 `<Plug>(simplecc-selection-expand)` /
+  `(simplecc-selection-shrink)`;默认 `<leader>ca`、`<leader>fm` 现在同时映射
+  到 visual 模式。
+- 修正文档漂移:README 与 help 一直写着 `<leader>f`,实际映射是 `<leader>fm`;
+  README 命令表补上 `:SimpleCCHealth`。
+- 新增 `test/range_requests.vim`,用记录请求的 fake daemon 断言无范围与有范围
+  两条路径各自发出的报文,并回归 E481。
+
 ### 空回复现在会清除,而不是被忽略
 
 - inlay hint 与 semantic token 的空回复此前都在 `prop_remove` 之前提前 return。

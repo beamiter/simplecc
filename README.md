@@ -161,6 +161,7 @@ npm, the Go module proxy, or Julia package registries.
 | <code>:SimpleCCConfig</code> | Open or create the active configuration |
 | <code>:SimpleCCReloadConfig</code> | Validate configuration and hot-reload server settings |
 | <code>:SimpleCCLog</code> | Open the in-memory SimpleCC log |
+| <code>:SimpleCCHealth</code> | One-paste readout: daemon, uptime, crashes, config, diagnostics |
 | <code>:SimpleCCInstall [server]</code> | Install a managed language server |
 | <code>:SimpleCCServers</code> | List managed server installation state |
 
@@ -188,8 +189,8 @@ npm, the Go module proxy, or Julia package registries.
 | Command | Action |
 | --- | --- |
 | <code>:SimpleCCRename</code> | Rename the symbol under the cursor |
-| <code>:SimpleCCFormat</code> | Format the current buffer |
-| <code>:SimpleCCAction</code> | Select a code action |
+| <code>:SimpleCCFormat</code> | Format the current buffer, or a <code>:'&lt;,'&gt;</code> range |
+| <code>:SimpleCCAction</code> | Select a code action at the cursor, or over a <code>:'&lt;,'&gt;</code> range |
 | <code>:SimpleCCSignatureHelp</code> | Show signature help |
 | <code>:SimpleCCInlayHints</code> | Toggle inlay hints |
 | <code>:SimpleCCSelExpand</code> | Expand the current selection |
@@ -245,8 +246,8 @@ disable all default mappings.
 | <code>gi</code> | Implementation |
 | <code>gy</code> | Type definition |
 | <code>&lt;leader&gt;rn</code> | Rename |
-| <code>&lt;leader&gt;ca</code> | Code action |
-| <code>&lt;leader&gt;f</code> | Format |
+| <code>&lt;leader&gt;ca</code> | Code action (Normal and Visual; a selection unlocks the extract refactorings) |
+| <code>&lt;leader&gt;fm</code> | Format (Normal and Visual; a selection uses range formatting) |
 | <code>&lt;leader&gt;o</code> | Document outline |
 | <code>&lt;leader&gt;ih</code> | Toggle inlay hints |
 | <code>[d</code> / <code>]d</code> | Previous / next diagnostic |
