@@ -27,6 +27,10 @@ g:simplecc_max_restarts    = get(g:, 'simplecc_max_restarts', 5)
 # Milliseconds before a request with a registered callback is answered with an
 # error instead of waiting on a wedged daemon forever. 0 disables the timeout.
 g:simplecc_request_timeout = get(g:, 'simplecc_request_timeout', 30000)
+# Apply the create/rename/delete steps of a workspace edit. Set to 0 to accept
+# only the text half; the server is then told the whole edit was rejected, so a
+# refactor that moves files reports failure instead of half-applying.
+g:simplecc_resource_operations = get(g:, 'simplecc_resource_operations', 1)
 g:simplecc_auto_complete   = get(g:, 'simplecc_auto_complete', 1)
 g:simplecc_change_delay    = get(g:, 'simplecc_change_delay', 120)
 g:simplecc_complete_delay  = get(g:, 'simplecc_complete_delay', 80)

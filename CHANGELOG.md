@@ -2,6 +2,36 @@
 
 ## Unreleased - 2026-08-05
 
+### workspace edit 支持文件的新建 / 重命名 / 删除
+
+- 服务端发来的 `documentChanges` 里只要出现一个资源操作,守护进程就整条拒绝
+  (`resource create/rename/delete operations are not supported`),于是
+  rust-analyzer 的 "move to submodule"、TypeScript 的 "move to a new file"、
+  以及所有连带改文件名的 "rename symbol" 全部什么都不做 —— 连改好的那部分
+  文本编辑也一起丢掉。更早一步:客户端能力里从未声明
+  `workspace.workspaceEdit.resourceOperations`,服务端因此本来就不该提供这
+  类重构,能收到已经算是服务端宽容。
+- 客户端能力补上 `resourceOperations: [create, rename, delete]` 与
+  `failureHandling: abort`;`WorkspaceEdit` 新增按线序排列的 `operations`,
+  把资源操作与文本编辑放在同一条时间线上 —— 顺序是有含义的:重命名重构先改
+  文件内容再挪文件,反过来就会写进一个已经不存在的路径。原有的扁平
+  `changes` 字段保留不变,因此 Vim 端比守护进程新或旧都不会失败。
+- Vim 端按序执行,任何一步失败即停止并把失败原因回给服务端。`create` 只有在
+  服务端明写 `overwrite` 时才会覆盖已存在的文件;`rename` 会先把未保存的
+  buffer 落盘,再把窗口里的 buffer 换成新路径(否则下一次 `:write` 会把刚被
+  挪走的文件重新写回来);`delete` 会 wipe 掉对应 buffer,`BufUnload` 顺带把
+  `didClose` 发出去。新增 `g:simplecc_resource_operations`(默认 1)可整体
+  关掉,关掉时整条 edit 报失败而不是只应用一半。
+- 顺带修掉两个一直存在的问题:`bufnr({path})` 是按*模式*匹配的,路径里带
+  `.` `*` `[` 的文件会匹配不到自己或匹配到别人,现在一律走
+  `BufnrForPath()` 逐字比较;多文件 edit 不再用 `:edit` 打开目标文件 ——
+  那会把用户的窗口拖到重构最后碰到的那个文件上,而且当前 buffer 刚被同一条
+  edit 改过时会直接 E37 失败,改用 `bufadd()` + `bufload()`。
+- `test/resource_operations.vim`:重命名重构(改 importer + 挪文件 + buffer
+  跟着换名)、create 后紧跟一条填充 edit、`ignoreIfExists` 不许截断已有文件、
+  delete 连带 wipe buffer、不存在的删除目标要报错、`g:simplecc_resource_operations = 0`
+  必须整条拒绝、以及只发 `changes` 的旧守护进程仍然可用。改动前前四条断言全灭。
+
 ### code action 的 context.diagnostics 真的送到服务端
 
 - 编辑器发出的是扁平的 `DiagnosticItem` 形状(`line`/`character`/`end_line`/

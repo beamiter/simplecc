@@ -301,6 +301,23 @@ g:simplecc_request_timeout       number  default: 30000
         answered with an error instead of waiting on a daemon that has
         wedged. Set to 0 to wait forever.
 
+                                     *g:simplecc_resource_operations*
+g:simplecc_resource_operations   number  default: 1
+        Apply the create / rename / delete steps of a workspace edit, not only
+        its text edits. This is what makes a rename-file refactor work:
+        rust-analyzer's "move to submodule", TypeScript's "move to a new
+        file", and every "rename symbol" that also renames the file it lives
+        in send the file move and the edits to its importers as one edit.
+        The steps are applied in the order the server sent them, and the first
+        one that fails stops the rest — a half-applied refactor is worse than
+        none.
+        A file that already exists is never truncated or replaced unless the
+        server explicitly asks to overwrite it. Buffers follow the files: a
+        renamed buffer is reopened under its new name, a deleted one is wiped.
+        Set to 0 to accept only the text half; the server is then told the
+        whole edit was rejected rather than being left to believe the files
+        moved.
+
                                              *g:simplecc_auto_complete*
 g:simplecc_auto_complete         number  default: 1
         Enable automatic completion.

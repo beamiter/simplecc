@@ -100,15 +100,53 @@ pub struct ParameterInfo {
 }
 
 /// Workspace edit for multi-file changes.
+///
+/// `changes` is the flat text-edit view every release so far has sent, kept so
+/// that a Vim half older than this daemon still applies the text half of an
+/// edit instead of choking on an unknown field.  `operations` is the ordered
+/// superset that also carries the create/rename/delete steps.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceEdit {
     pub changes: Vec<FileEdit>,
+    pub operations: Vec<WorkspaceOperation>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEdit {
     pub uri: String,
     pub edits: Vec<TextEdit>,
+}
+
+/// One entry of an LSP `documentChanges` array, in the order the server sent
+/// it.
+///
+/// The order is load-bearing and cannot be recovered from `changes`: a
+/// rename-file refactor edits a file and *then* moves it, so applying the move
+/// first would write the edits to a path that no longer exists — and
+/// TypeScript's "move to a new file" creates the target before filling it in.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum WorkspaceOperation {
+    Edit {
+        uri: String,
+        edits: Vec<TextEdit>,
+    },
+    Create {
+        uri: String,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    Rename {
+        uri: String,
+        new_uri: String,
+        overwrite: bool,
+        ignore_if_exists: bool,
+    },
+    Delete {
+        uri: String,
+        recursive: bool,
+        ignore_if_not_exists: bool,
+    },
 }
 
 /// Document symbol for outline view.
@@ -524,24 +562,23 @@ pub fn parse_context_diagnostics(
 }
 
 /// Convert LSP WorkspaceEdit to our WorkspaceEdit.
+///
+/// Both views are produced in one pass: `changes` for the text edits alone and
+/// `operations` for the same edits interleaved with the resource operations in
+/// wire order.  A server may send `changes` *or* `documentChanges`; only the
+/// latter can carry resource operations at all.
 pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit {
     let mut changes = Vec::new();
+    let mut operations = Vec::new();
+
     if let Some(ref ch) = edit.changes {
         for (uri, edits) in ch {
-            let file_edits: Vec<TextEdit> = edits
-                .iter()
-                .map(|e| TextEdit {
-                    line: e.range.start.line,
-                    character: e.range.start.character,
-                    end_line: e.range.end.line,
-                    end_character: e.range.end.character,
-                    new_text: e.new_text.clone(),
-                })
-                .collect();
-            changes.push(FileEdit {
-                uri: uri.to_string(),
-                edits: file_edits,
-            });
+            push_edit(
+                &mut changes,
+                &mut operations,
+                uri.to_string(),
+                edits.iter().map(text_edit).collect(),
+            );
         }
     }
     // Also handle documentChanges if present
@@ -549,65 +586,120 @@ pub fn from_lsp_workspace_edit(edit: &lsp_types::WorkspaceEdit) -> WorkspaceEdit
         match doc_changes {
             lsp_types::DocumentChanges::Edits(edits) => {
                 for edit in edits {
-                    let file_edits: Vec<TextEdit> = edit
-                        .edits
-                        .iter()
-                        .map(|e| match e {
-                            lsp_types::OneOf::Left(te) => TextEdit {
-                                line: te.range.start.line,
-                                character: te.range.start.character,
-                                end_line: te.range.end.line,
-                                end_character: te.range.end.character,
-                                new_text: te.new_text.clone(),
-                            },
-                            lsp_types::OneOf::Right(ate) => TextEdit {
-                                line: ate.text_edit.range.start.line,
-                                character: ate.text_edit.range.start.character,
-                                end_line: ate.text_edit.range.end.line,
-                                end_character: ate.text_edit.range.end.character,
-                                new_text: ate.text_edit.new_text.clone(),
-                            },
-                        })
-                        .collect();
-                    changes.push(FileEdit {
-                        uri: edit.text_document.uri.to_string(),
-                        edits: file_edits,
-                    });
+                    push_edit(
+                        &mut changes,
+                        &mut operations,
+                        edit.text_document.uri.to_string(),
+                        edit.edits.iter().map(annotated_text_edit).collect(),
+                    );
                 }
             }
             lsp_types::DocumentChanges::Operations(ops) => {
                 for op in ops {
-                    if let lsp_types::DocumentChangeOperation::Edit(edit) = op {
-                        let file_edits: Vec<TextEdit> = edit
-                            .edits
-                            .iter()
-                            .map(|e| match e {
-                                lsp_types::OneOf::Left(te) => TextEdit {
-                                    line: te.range.start.line,
-                                    character: te.range.start.character,
-                                    end_line: te.range.end.line,
-                                    end_character: te.range.end.character,
-                                    new_text: te.new_text.clone(),
-                                },
-                                lsp_types::OneOf::Right(ate) => TextEdit {
-                                    line: ate.text_edit.range.start.line,
-                                    character: ate.text_edit.range.start.character,
-                                    end_line: ate.text_edit.range.end.line,
-                                    end_character: ate.text_edit.range.end.character,
-                                    new_text: ate.text_edit.new_text.clone(),
-                                },
-                            })
-                            .collect();
-                        changes.push(FileEdit {
-                            uri: edit.text_document.uri.to_string(),
-                            edits: file_edits,
-                        });
+                    match op {
+                        lsp_types::DocumentChangeOperation::Edit(edit) => push_edit(
+                            &mut changes,
+                            &mut operations,
+                            edit.text_document.uri.to_string(),
+                            edit.edits.iter().map(annotated_text_edit).collect(),
+                        ),
+                        // Resource operations have no `changes` equivalent, so
+                        // they only ever reach the editor through `operations`.
+                        lsp_types::DocumentChangeOperation::Op(resource) => {
+                            operations.push(resource_operation(resource))
+                        }
                     }
                 }
             }
         }
     }
-    WorkspaceEdit { changes }
+    WorkspaceEdit {
+        changes,
+        operations,
+    }
+}
+
+/// A text edit belongs in both views: the ordered `operations` list and the
+/// flat `changes` list an older Vim half still reads.
+fn push_edit(
+    changes: &mut Vec<FileEdit>,
+    operations: &mut Vec<WorkspaceOperation>,
+    uri: String,
+    edits: Vec<TextEdit>,
+) {
+    operations.push(WorkspaceOperation::Edit {
+        uri: uri.clone(),
+        edits: edits.clone(),
+    });
+    changes.push(FileEdit { uri, edits });
+}
+
+fn text_edit(edit: &lsp_types::TextEdit) -> TextEdit {
+    TextEdit {
+        line: edit.range.start.line,
+        character: edit.range.start.character,
+        end_line: edit.range.end.line,
+        end_character: edit.range.end.character,
+        new_text: edit.new_text.clone(),
+    }
+}
+
+/// Annotated edits differ from plain ones only by a change-annotation id, which
+/// exists to label a group of edits in a confirmation UI simplecc does not have.
+fn annotated_text_edit(
+    edit: &lsp_types::OneOf<lsp_types::TextEdit, lsp_types::AnnotatedTextEdit>,
+) -> TextEdit {
+    match edit {
+        lsp_types::OneOf::Left(te) => text_edit(te),
+        lsp_types::OneOf::Right(ate) => text_edit(&ate.text_edit),
+    }
+}
+
+/// The LSP options are all tri-state; the absent case is the spec's default —
+/// do not overwrite, do not ignore, do not recurse.
+fn resource_operation(op: &lsp_types::ResourceOp) -> WorkspaceOperation {
+    match op {
+        lsp_types::ResourceOp::Create(create) => WorkspaceOperation::Create {
+            uri: create.uri.to_string(),
+            overwrite: create
+                .options
+                .as_ref()
+                .and_then(|o| o.overwrite)
+                .unwrap_or(false),
+            ignore_if_exists: create
+                .options
+                .as_ref()
+                .and_then(|o| o.ignore_if_exists)
+                .unwrap_or(false),
+        },
+        lsp_types::ResourceOp::Rename(rename) => WorkspaceOperation::Rename {
+            uri: rename.old_uri.to_string(),
+            new_uri: rename.new_uri.to_string(),
+            overwrite: rename
+                .options
+                .as_ref()
+                .and_then(|o| o.overwrite)
+                .unwrap_or(false),
+            ignore_if_exists: rename
+                .options
+                .as_ref()
+                .and_then(|o| o.ignore_if_exists)
+                .unwrap_or(false),
+        },
+        lsp_types::ResourceOp::Delete(delete) => WorkspaceOperation::Delete {
+            uri: delete.uri.to_string(),
+            recursive: delete
+                .options
+                .as_ref()
+                .and_then(|o| o.recursive)
+                .unwrap_or(false),
+            ignore_if_not_exists: delete
+                .options
+                .as_ref()
+                .and_then(|o| o.ignore_if_not_exists)
+                .unwrap_or(false),
+        },
+    }
 }
 
 /// Decode file:// URI to proper path.

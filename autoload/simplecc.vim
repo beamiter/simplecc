@@ -2813,43 +2813,83 @@ enddef
 # Apply edits
 # ═════════════════════════════════════════════════════════
 
+# The ordered `documentChanges` view of a workspace edit.
+#
+# A daemon new enough to send `operations` interleaves the create/rename/delete
+# steps with the text edits in exactly the order the server asked for, which is
+# load-bearing: a rename-file refactor edits a file and then moves it. An older
+# daemon sends only the flat `changes` list, which is the same text edits with
+# the resource operations dropped — so an out-of-date lib/simplecc-daemon still
+# applies the half it can express instead of failing outright.
+def WorkspaceOperations(edit: dict<any>): list<dict<any>>
+  var operations = get(edit, 'operations', [])
+  if !empty(operations)
+    return operations
+  endif
+  return mapnew(get(edit, 'changes', []),
+    (_, file_edit) => extend({kind: 'edit'}, file_edit))
+enddef
+
 def OnApplyEdit(ev: dict<any>)
   var applied = true
   var failure = ''
   var total_edits = 0
   var file_count = 0
+  var resource_count = 0
 
   var edit = get(ev, 'edit', {})
   if type(edit) != v:t_dict
     applied = false
     failure = 'invalid workspace edit payload'
   else
-    var changes = get(edit, 'changes', [])
-    file_count = len(changes)
-    for file_edit in changes
-      var uri = get(file_edit, 'uri', '')
-      var edits = get(file_edit, 'edits', [])
+    for operation in WorkspaceOperations(edit)
+      var kind = get(operation, 'kind', 'edit')
+      var uri = get(operation, 'uri', '')
       var fpath = UriToPath(uri)
       if fpath ==# ''
         # bufnr('') would resolve to the current buffer and silently apply
         # the server's edits to whatever the user is looking at.
         applied = false
         failure = 'workspace edit for an unresolvable URI: ' .. uri
+        break
+      endif
+
+      if kind !=# 'edit'
+        if !g:simplecc_resource_operations
+          applied = false
+          failure = printf('%s of %s refused: g:simplecc_resource_operations is 0', kind, fpath)
+          break
+        endif
+        var problem = ApplyResourceOperation(kind, fpath, operation)
+        if problem !=# ''
+          applied = false
+          failure = problem
+          break
+        endif
+        resource_count += 1
         continue
       endif
-      var bnr = bufnr(fpath)
 
-      # :edit can abort (E37, swap prompts, autocmd errors); the try block
-      # guarantees the server still receives its applyEdit answer below.
+      var edits = get(operation, 'edits', [])
+      var bnr = BufnrForPath(fpath)
+
+      # Loading can still abort (unreadable file, swap prompts, autocmd
+      # errors); the try block guarantees the server receives its applyEdit
+      # answer below either way.
       try
-        if bnr < 0
-          execute 'edit ' .. fnameescape(fpath)
-          bnr = bufnr(fpath)
+        if bnr <= 0
+          # bufadd()+bufload() and not :edit — :edit drags the user's window to
+          # whichever file the refactor touched last, and fails outright with
+          # E37 when the current buffer already carries edits from this very
+          # workspace edit.
+          bnr = bufadd(fpath)
+          bufload(bnr)
         endif
 
-        if bnr >= 0
+        if bnr > 0
           ApplyTextEdits(bnr, edits)
           total_edits += len(edits)
+          file_count += 1
         else
           applied = false
           failure = 'could not open a buffer for ' .. fpath
@@ -2858,10 +2898,18 @@ def OnApplyEdit(ev: dict<any>)
         applied = false
         failure = printf('failed to apply edits to %s: %s', fpath, v:exception)
       endtry
+      # The remaining operations are ordered against this one, so stop rather
+      # than move a file whose contents were never rewritten.
+      if !applied
+        break
+      endif
     endfor
 
-    if file_count > 0 && applied
-      echo printf('Applied %d edits across %d files', total_edits, file_count)
+    if applied && (file_count > 0 || resource_count > 0)
+      var resources = resource_count == 0
+        ? ''
+        : printf(' and %d file operation%s', resource_count, resource_count == 1 ? '' : 's')
+      echo printf('Applied %d edits across %d files%s', total_edits, file_count, resources)
     elseif !applied
       echohl ErrorMsg
       echom '[SimpleCC] ' .. failure
@@ -2879,6 +2927,168 @@ def OnApplyEdit(ev: dict<any>)
     endif
     ReplyToServer(server, ev.requestId, result)
   endif
+enddef
+
+# bufnr({name}) matches its argument as a *pattern*, so a path holding any of
+# `. * [ ] ~ \` either misses its buffer or, worse, matches a different one.
+# Every workspace-edit path is compared literally instead.
+def BufnrForPath(fpath: string): number
+  var want = fnamemodify(fpath, ':p')
+  for info in getbufinfo()
+    if info.name !=# '' && fnamemodify(info.name, ':p') ==# want
+      return info.bufnr
+    endif
+  endfor
+  return -1
+enddef
+
+# Flush a buffer to disk without disturbing the user's window layout, alternate
+# file or autocommand state. A rename moves what is on disk, so unsaved changes
+# would otherwise be left behind pointing at a path that no longer exists.
+def WriteBufferToDisk(bnr: number): bool
+  try
+    var wins = win_findbuf(bnr)
+    if !empty(wins)
+      win_execute(wins[0], 'noautocmd silent write')
+    else
+      # :write only ever writes the current buffer, so a hidden one has to be
+      # made current for the duration; keepalt leaves '#' alone.
+      var previous = bufnr('%')
+      noautocmd execute 'keepalt buffer ' .. bnr
+      try
+        noautocmd silent write
+      finally
+        noautocmd execute 'keepalt buffer ' .. previous
+      endtry
+    endif
+  catch
+    return false
+  endtry
+  return true
+enddef
+
+def EnsureParentDirectory(fpath: string): string
+  var parent = fnamemodify(fpath, ':h')
+  if parent ==# '' || isdirectory(parent)
+    return ''
+  endif
+  try
+    mkdir(parent, 'p')
+  catch
+    return 'could not create directory ' .. parent
+  endtry
+  return ''
+enddef
+
+# A rename moves the file underneath any buffer that has it open. Leaving that
+# buffer named after the old path means the next :write recreates the file the
+# server just moved, so the buffer is replaced by one for the new name in every
+# window that showed it.
+def RetargetBuffer(old_bnr: number, new_path: string)
+  if old_bnr <= 0
+    return
+  endif
+  var new_bnr = bufadd(new_path)
+  bufload(new_bnr)
+  for win in win_findbuf(old_bnr)
+    win_execute(win, printf('keepalt buffer %d', new_bnr))
+  endfor
+  # BufUnload runs OnBufClose, which is what tells the server the old document
+  # is gone; bufload above already announced the new one.
+  try
+    execute 'bwipeout! ' .. old_bnr
+  catch
+  endtry
+enddef
+
+# Apply one create/rename/delete step of a workspace edit. Returns an empty
+# string on success, or the reason the step could not be applied.
+#
+# The LSP options are deliberately read conservatively: a server asking to
+# create or rename onto a file that already exists never means "throw the
+# user's file away" unless it says `overwrite` in so many words.
+def ApplyResourceOperation(kind: string, fpath: string, operation: dict<any>): string
+  var overwrite = get(operation, 'overwrite', false)
+
+  if kind ==# 'create'
+    if isdirectory(fpath)
+      return 'create refused, a directory is in the way: ' .. fpath
+    endif
+    if filereadable(fpath) && !overwrite
+      # ignoreIfExists, and the unspecified neither-flag case with it: the
+      # requested end state — the file exists — already holds.
+      return ''
+    endif
+    var problem = EnsureParentDirectory(fpath)
+    if problem !=# ''
+      return problem
+    endif
+    if writefile([], fpath) != 0
+      return 'could not create ' .. fpath
+    endif
+    # A buffer already holding the old contents would write them straight back.
+    var stale = BufnrForPath(fpath)
+    if stale > 0 && !getbufvar(stale, '&modified')
+      for win in win_findbuf(stale)
+        win_execute(win, 'silent! edit!')
+      endfor
+    endif
+    return ''
+  endif
+
+  if kind ==# 'rename'
+    var new_path = UriToPath(get(operation, 'new_uri', ''))
+    if new_path ==# ''
+      return 'rename of ' .. fpath .. ' has an unresolvable target URI'
+    endif
+    if !filereadable(fpath) && !isdirectory(fpath)
+      return 'rename source does not exist: ' .. fpath
+    endif
+    if (filereadable(new_path) || isdirectory(new_path)) && !overwrite
+      return get(operation, 'ignore_if_exists', false)
+        ? ''
+        : 'rename refused, target exists: ' .. new_path
+    endif
+    var problem = EnsureParentDirectory(new_path)
+    if problem !=# ''
+      return problem
+    endif
+    var bnr = BufnrForPath(fpath)
+    if bnr > 0 && getbufvar(bnr, '&modified') && !WriteBufferToDisk(bnr)
+      return 'could not save unsaved changes before renaming ' .. fpath
+    endif
+    if rename(fpath, new_path) != 0
+      return printf('could not rename %s to %s', fpath, new_path)
+    endif
+    RetargetBuffer(bnr, new_path)
+    return ''
+  endif
+
+  if kind ==# 'delete'
+    if !filereadable(fpath) && !isdirectory(fpath)
+      return get(operation, 'ignore_if_not_exists', false)
+        ? ''
+        : 'delete target does not exist: ' .. fpath
+    endif
+    var recursive = get(operation, 'recursive', false)
+    if isdirectory(fpath) && !recursive && !empty(readdir(fpath))
+      return 'delete refused, directory is not empty: ' .. fpath
+    endif
+    if delete(fpath, isdirectory(fpath) ? (recursive ? 'rf' : 'd') : '') != 0
+      return 'could not delete ' .. fpath
+    endif
+    var bnr = BufnrForPath(fpath)
+    if bnr > 0
+      # BufUnload runs OnBufClose, so the server hears about the didClose.
+      try
+        execute 'bwipeout! ' .. bnr
+      catch
+      endtry
+    endif
+    return ''
+  endif
+
+  return 'unknown workspace edit operation: ' .. kind
 enddef
 
 export def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)

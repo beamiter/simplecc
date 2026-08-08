@@ -2642,9 +2642,6 @@ async fn handle_server_request(
                     serde_json::from_value::<lsp_types::WorkspaceEdit>(value)
                         .map_err(|error| format!("invalid workspace edit: {error}"))
                 }) {
-                Ok(edit) if workspace_edit_has_resource_operations(&edit) => {
-                    Err("resource create/rename/delete operations are not supported".to_string())
-                }
                 Ok(edit) => {
                     let ws_edit = types::from_lsp_workspace_edit(&edit);
                     event_tx
@@ -2819,36 +2816,61 @@ async fn handle_server_request(
     }
 }
 
-fn workspace_edit_has_resource_operations(edit: &lsp_types::WorkspaceEdit) -> bool {
-    matches!(
-        edit.document_changes,
-        Some(lsp_types::DocumentChanges::Operations(ref operations))
-            if operations.iter().any(|operation| !matches!(
-                operation,
-                lsp_types::DocumentChangeOperation::Edit(_)
-            ))
-    )
-}
-
 #[cfg(test)]
 mod workspace_edit_tests {
     use super::*;
 
+    /// The rename-file refactor every server spells the same way: rewrite the
+    /// importers, then move the file.  Both halves used to be dropped — the
+    /// whole edit was answered `applied: false` the moment a resource
+    /// operation appeared in it.
     #[test]
-    fn rejects_resource_operations_that_the_editor_cannot_apply() {
+    fn keeps_resource_operations_in_wire_order() {
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(json!({
-            "documentChanges": [{
-                "kind": "create",
-                "uri": "file:///tmp/new.rs"
-            }]
+            "documentChanges": [
+                {
+                    "textDocument": {"uri": "file:///tmp/user.rs", "version": 1},
+                    "edits": [{
+                        "range": {
+                            "start": {"line": 0, "character": 4},
+                            "end": {"line": 0, "character": 7}
+                        },
+                        "newText": "new"
+                    }]
+                },
+                {
+                    "kind": "rename",
+                    "oldUri": "file:///tmp/old.rs",
+                    "newUri": "file:///tmp/new.rs",
+                    "options": {"overwrite": true}
+                },
+                {"kind": "delete", "uri": "file:///tmp/gone.rs"}
+            ]
         }))
         .unwrap();
 
-        assert!(workspace_edit_has_resource_operations(&edit));
+        let converted = types::from_lsp_workspace_edit(&edit);
+        let wire = serde_json::to_value(&converted).unwrap();
+        let ops = wire["operations"].as_array().unwrap();
+
+        assert_eq!(ops.len(), 3);
+        assert_eq!(ops[0]["kind"], "edit");
+        assert_eq!(ops[0]["uri"], "file:///tmp/user.rs");
+        assert_eq!(ops[1]["kind"], "rename");
+        assert_eq!(ops[1]["uri"], "file:///tmp/old.rs");
+        assert_eq!(ops[1]["new_uri"], "file:///tmp/new.rs");
+        assert_eq!(ops[1]["overwrite"], true);
+        assert_eq!(ops[1]["ignore_if_exists"], false);
+        assert_eq!(ops[2]["kind"], "delete");
+        assert_eq!(ops[2]["recursive"], false);
+
+        // The flat view an older Vim half reads still holds the text edits and
+        // nothing else, so a version-skewed install degrades instead of failing.
+        assert_eq!(wire["changes"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn accepts_text_document_edits() {
+    fn text_document_edits_appear_in_both_views() {
         let edit: lsp_types::WorkspaceEdit = serde_json::from_value(json!({
             "documentChanges": [{
                 "textDocument": {"uri": "file:///tmp/main.rs", "version": 1},
@@ -2863,7 +2885,27 @@ mod workspace_edit_tests {
         }))
         .unwrap();
 
-        assert!(!workspace_edit_has_resource_operations(&edit));
+        let converted = types::from_lsp_workspace_edit(&edit);
+        assert_eq!(converted.changes.len(), 1);
+        assert_eq!(converted.operations.len(), 1);
+        assert_eq!(converted.changes[0].edits[0].new_text, "fn main() {}");
+    }
+
+    /// `create` carries no text; the file is created empty and a following
+    /// edit fills it in.  Absent options mean the spec's defaults.
+    #[test]
+    fn create_defaults_to_neither_overwriting_nor_ignoring() {
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(json!({
+            "documentChanges": [{"kind": "create", "uri": "file:///tmp/new.rs"}]
+        }))
+        .unwrap();
+
+        let wire = serde_json::to_value(types::from_lsp_workspace_edit(&edit)).unwrap();
+        let op = &wire["operations"][0];
+        assert_eq!(op["kind"], "create");
+        assert_eq!(op["overwrite"], false);
+        assert_eq!(op["ignore_if_exists"], false);
+        assert!(wire["changes"].as_array().unwrap().is_empty());
     }
 }
 
@@ -3241,6 +3283,19 @@ fn client_capabilities() -> ClientCapabilities {
             apply_edit: Some(true),
             workspace_edit: Some(WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
+                // Without this list a server must assume the client can only
+                // rewrite files that already exist, so rust-analyzer's "move to
+                // submodule", tsserver's "move to a new file" and every
+                // rename-file refactor are never offered in the first place.
+                resource_operations: Some(vec![
+                    ResourceOperationKind::Create,
+                    ResourceOperationKind::Rename,
+                    ResourceOperationKind::Delete,
+                ]),
+                // A half-applied refactor is worse than none, and the editor
+                // half stops at the first failing operation: ask the server to
+                // treat failure as "the whole edit was rejected".
+                failure_handling: Some(FailureHandlingKind::Abort),
                 ..Default::default()
             }),
             workspace_folders: Some(true),
