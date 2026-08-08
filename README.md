@@ -161,7 +161,7 @@ npm, the Go module proxy, or Julia package registries.
 | <code>:SimpleCCConfig</code> | Open or create the active configuration |
 | <code>:SimpleCCReloadConfig</code> | Validate configuration and hot-reload server settings |
 | <code>:SimpleCCLog</code> | Open the in-memory SimpleCC log |
-| <code>:SimpleCCHealth</code> | One-paste readout: daemon, uptime, crashes, config, diagnostics |
+| <code>:SimpleCCHealth</code> | Full report in a scratch buffer: environment, daemon age vs. plugin sources, config and server-command resolution, runtime, and why this buffer is or is not served |
 | <code>:SimpleCCInstall [server]</code> | Install a managed language server |
 | <code>:SimpleCCServers</code> | List managed server installation state |
 

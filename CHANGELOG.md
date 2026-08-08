@@ -2,6 +2,31 @@
 
 ## Unreleased - 2026-08-05
 
+### `:SimpleCCHealth` 变成真正的体检
+
+- 此前它把十来行 echo 到消息区,内容基本是"守护进程在不在跑",而且把
+  `~/.simplecc.json` 说成用户配置 —— 那是一个它从来不读的文件。现在报告渲染
+  到 `buftype=nofile` 的 scratch buffer,每行都是
+  `[LEVEL] 事实 — 该怎么办`,分五节:ENVIRONMENT / BINARY / CONFIG /
+  RUNTIME / CONTEXT。
+- BINARY 节里是这套插件最常见的故障:插件管理器更新了 Vim 文件,旁边的
+  `lib/simplecc-daemon` 从来没重新编译过,两半说着不同的协议,而唯一的症状是
+  某个功能安静地什么都不做。现在直接比较守护进程的 mtime 与
+  `src/**/*.rs`、`Cargo.toml`、`autoload/**/*.vim`、`plugin/*.vim` 里最新的一个,
+  过期就报 ERROR 并给出 `run ./install.sh, then :SimpleCCRestart`。
+- CONFIG 节校验真正生效的那个配置文件(`ActiveConfigPath()`):JSON 能不能解析、
+  `g:simplecc_config_path` 指的文件在不在、每个 `languageServers` 条目有没有
+  `command` / `filetypes`,以及 command 到底能不能解析 —— 除了 $PATH 还会查
+  `:SimpleCCInstall` 装到的托管目录,那里的服务端不在 $PATH 上却完全正常。
+- CONTEXT 节回答"为什么在我的文件里没反应":buftype、filetype、这个 buffer 有
+  没有被 didOpen 过、服务端看到的 changedtick 与当前是否一致、以及
+  `omnifunc`/`tagfunc`/`formatexpr` 当前指向哪里。
+- `test/health_doctor.vim`:五个小节都在;把假守护进程 `touch` 到 2001 年必须
+  报"比插件旧"并带上 install.sh,`touch` 到明天必须不报错;JSON 语法错、
+  command 不可执行(且提示里带服务端名字)、缺 `filetypes`、缺 `command`、
+  `g:simplecc_config_path` 指向不存在的文件,各自都有对应的一行;以及报告确实
+  落在一个不可编辑的 scratch buffer 里。
+
 ### omnifunc / tagfunc / formatexpr 接到语言服务器上
 
 - 这个插件的能力此前只能通过它自己的命令和映射触达。`<C-x><C-o>`、`<C-]>`、

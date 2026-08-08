@@ -37,6 +37,10 @@ var s_declined_installs: dict<bool> = {}
 var s_server_caps: dict<dict<any>> = {}
 # Re-entrancy guard for the one synchronous wait in the plugin ('tagfunc').
 var s_tagfunc_busy: bool = false
+# This plugin's own directory, resolved while the script is sourced because
+# <sfile> is not available inside a :def function.  :SimpleCCHealth compares
+# the age of the daemon binary against the sources under it.
+const s_plugin_root: string = expand('<sfile>:p:h:h')
 
 # Diagnostics, keyed by resolved filesystem path and then by the server that
 # published them:  path -> server -> items.
@@ -3410,76 +3414,342 @@ enddef
 
 # A one-shot readout of everything that has to be right for SimpleCC to work,
 # so a user reporting "completion does nothing" can paste one thing.
-export def Health()
-  var exe = FindBackend()
-  echohl Title | echom '[SimpleCC] health check' | echohl None
+# ═════════════════════════════════════════════════════════
+# Health
+# ═════════════════════════════════════════════════════════
+#
+# :SimpleCCHealth is the first thing a user runs and the first thing that ends
+# up in a bug report, so it answers the questions a bug report has to answer:
+# what is installed, whether the two halves of the plugin are the same age,
+# what the configuration actually says, what is running, and why *this* buffer
+# is or is not being served.  Every line is
+#
+#     [LEVEL] fact — what to do about it
+#
+# and every problem carries its own remedy, because the person reading it is
+# by definition someone who does not already know.
 
-  var lines: list<string> = []
+def HealthLine(level: string, fact: string, remedy: string = ''): string
+  return printf('[%s] %s%s', level, fact, remedy ==# '' ? '' : ' — ' .. remedy)
+enddef
+
+def RelativeToPlugin(path: string): string
+  var prefix = s_plugin_root .. '/'
+  return strpart(path, 0, len(prefix)) ==# prefix ? strpart(path, len(prefix)) : path
+enddef
+
+# The newest file the daemon would have to be rebuilt from, so that a daemon
+# older than it can be reported as stale.
+def NewestPluginSource(): dict<any>
+  var newest = {name: '', time: 0}
+  for pattern in ['src/**/*.rs', 'Cargo.toml', 'autoload/**/*.vim', 'plugin/*.vim']
+    for path in glob(s_plugin_root .. '/' .. pattern, true, true)
+      var stamp = getftime(path)
+      if stamp > newest.time
+        newest = {name: RelativeToPlugin(path), time: stamp}
+      endif
+    endfor
+  endfor
+  return newest
+enddef
+
+def HealthEnvironment(): list<string>
+  var lines = ['ENVIRONMENT']
+  add(lines, HealthLine(v:version >= 900 ? 'OK' : 'ERROR',
+    printf('Vim %d.%d%s', v:version / 100, v:version % 100,
+      has('patch-9.1.0') ? ' (9.1 or newer)' : ''),
+    v:version >= 900 ? '' : 'SimpleCC needs Vim 9.0 or newer'))
+  # Each of these disables a specific feature rather than the whole plugin, so
+  # they are named with what is lost.
+  for [feature, needed_for] in items({
+      job: 'the daemon cannot be started at all',
+      channel: 'the daemon cannot be talked to at all',
+      timers: 'debounced completion, diagnostics and hints stop working',
+      textprop: 'inlay hints, virtual diagnostics and semantic tokens are off',
+      popupwin: 'hover, signature help and diagnostic floats are off',
+      })
+    add(lines, HealthLine(has(feature) ? 'OK' : 'ERROR',
+      printf('+%s: %s', feature, has(feature) ? 'available' : 'missing'),
+      has(feature) ? '' : needed_for))
+  endfor
+  # LSP positions are UTF-16 code units and every conversion here assumes the
+  # buffer bytes are UTF-8; anything else silently misplaces every column.
+  add(lines, HealthLine(&encoding ==# 'utf-8' ? 'OK' : 'ERROR',
+    'encoding: ' .. &encoding,
+    &encoding ==# 'utf-8' ? '' : 'set encoding=utf-8; LSP columns are UTF-16 over UTF-8'))
+  return lines
+enddef
+
+def HealthBinary(): list<string>
+  var lines = ['BINARY']
+  var exe = FindBackend()
   if exe ==# ''
-    add(lines, '[ERROR] daemon: not found — run ./install.sh or set g:simplecc_daemon_path')
+    add(lines, HealthLine('ERROR', 'daemon: not found',
+      'run ./install.sh in ' .. s_plugin_root .. ', or set g:simplecc_daemon_path'))
+    return lines
   endif
+  var built = getftime(exe)
+  add(lines, HealthLine('OK', printf('daemon: %s (built %s)', exe,
+    built > 0 ? strftime('%Y-%m-%d %H:%M', built) : 'unknown')))
+
+  # The most common failure in this suite by a distance: a plugin manager pulls
+  # new Vim files and never rebuilds the Rust binary sitting next to them, so
+  # the two halves speak different protocols and the only symptom is a feature
+  # that quietly does nothing.
+  var newest = NewestPluginSource()
+  if newest.time == 0
+    add(lines, HealthLine('INFO', 'no plugin sources next to the daemon',
+      'installed without sources; age cannot be compared'))
+  elseif built > 0 && newest.time > built
+    add(lines, HealthLine('ERROR',
+      printf('daemon is older than the plugin: %s changed %s', newest.name,
+        strftime('%Y-%m-%d %H:%M', newest.time)),
+      'run ./install.sh, then :SimpleCCRestart'))
+  else
+    add(lines, HealthLine('OK', 'daemon is newer than every plugin source'))
+  endif
+  return lines
+enddef
+
+# Where `:SimpleCCInstall` puts a managed server: not on $PATH, so a command
+# that resolves nowhere else may still be perfectly fine.
+def ManagedServerBase(): string
+  if has('mac')
+    return expand('~/Library/Application Support/simplecc/servers')
+  endif
+  var xdg = getenv('XDG_DATA_HOME')
+  var base = type(xdg) == v:t_string && xdg !=# '' ? xdg : expand('~/.local/share')
+  return base .. '/simplecc/servers'
+enddef
+
+def ResolveServerCommand(name: string, cmd: string): string
+  if cmd ==# ''
+    return ''
+  endif
+  if cmd =~# '/'
+    return executable(cmd) ? fnamemodify(expand(cmd), ':p') : ''
+  endif
+  var found = exepath(cmd)
+  if found !=# ''
+    return found
+  endif
+  for path in glob(ManagedServerBase() .. '/' .. name .. '/**/' .. cmd, true, true)
+    if executable(path)
+      return path
+    endif
+  endfor
+  return ''
+enddef
+
+def HealthServerConfig(name: string, spec: any): list<string>
+  if type(spec) != v:t_dict
+    return [HealthLine('ERROR', printf('server %s: not an object', name),
+      'each languageServers entry must be a JSON object')]
+  endif
+  var lines: list<string> = []
+  var cmd = get(spec, 'command', '')
+  if type(cmd) != v:t_string || cmd ==# ''
+    add(lines, HealthLine('ERROR', printf('server %s: no "command"', name),
+      'the entry can never start anything'))
+    return lines
+  endif
+  var filetypes = get(spec, 'filetypes', [])
+  if type(filetypes) != v:t_list || empty(filetypes)
+    add(lines, HealthLine('WARN', printf('server %s: no "filetypes"', name),
+      'no buffer will ever select it'))
+  endif
+  var resolved = ResolveServerCommand(name, cmd)
+  if resolved ==# ''
+    add(lines, HealthLine('ERROR',
+      printf('server %s: command "%s" is not executable', name, cmd),
+      printf(':SimpleCCInstall %s, or fix "command" in the config', name)))
+  else
+    add(lines, HealthLine('OK', printf('server %s: %s%s', name, resolved,
+      type(filetypes) == v:t_list && !empty(filetypes)
+        ? ' [' .. join(filetypes, ', ') .. ']' : '')))
+  endif
+  return lines
+enddef
+
+def HealthConfig(): list<string>
+  var lines = ['CONFIG']
+  var configured = get(g:, 'simplecc_config_path', '')
+  if configured !=# '' && !filereadable(fnamemodify(expand(configured), ':p'))
+    add(lines, HealthLine('ERROR',
+      'g:simplecc_config_path names a file that does not exist: ' .. configured,
+      'fix the path, or clear the option to use the search order'))
+  endif
+
+  # ActiveConfigPath() is the search the plugin actually performs; the old
+  # hard-coded ~/.simplecc.json named a file it never reads.
+  var cfg = ActiveConfigPath()
+  if cfg ==# ''
+    add(lines, HealthLine('INFO', 'user config: none, using built-in defaults',
+      ':SimpleCCConfig writes a starting point'))
+    return lines
+  endif
+  add(lines, HealthLine('OK', 'user config: ' .. cfg))
+
+  var parsed: any
+  try
+    parsed = json_decode(join(readfile(cfg), "\n"))
+  catch
+    add(lines, HealthLine('ERROR', 'config is not valid JSON: ' .. v:exception,
+      'the daemon keeps using built-in defaults until it parses'))
+    return lines
+  endtry
+  if type(parsed) != v:t_dict
+    add(lines, HealthLine('ERROR', 'config is not a JSON object',
+      'the whole file is ignored'))
+    return lines
+  endif
+
+  var servers = get(parsed, 'languageServers', {})
+  if type(servers) != v:t_dict || empty(servers)
+    add(lines, HealthLine('WARN', 'config declares no "languageServers"',
+      'only the built-in defaults can start a server'))
+    return lines
+  endif
+  for name in sort(keys(servers))
+    extend(lines, HealthServerConfig(name, servers[name]))
+  endfor
+  return lines
+enddef
+
+def HealthRuntime(): list<string>
+  var lines = ['RUNTIME']
   # Process facts come from the supervisor that owns the process: uptime,
   # crash and restart counts, and whether the crash-loop breaker has tripped.
   extend(lines, simplecc#core#HealthLines())
-  add(lines, printf('[%s] LSP session: %s',
-    s_initialized ? 'OK' : (IsRunning() ? 'WARN' : 'ERROR'),
-    !IsRunning() ? 'no daemon'
-      : (s_initialized ? 'initialized' : (s_initializing ? 'initializing…' : 'running, not initialized'))))
-  add(lines, printf('[INFO] workspace root: %s', s_root ==# '' ? '(none)' : s_root))
-  add(lines, printf('[INFO] language server: %s',
-    get(g:, 'simplecc_status', '') ==# '' ? '(none active)' : g:simplecc_status))
+  add(lines, HealthLine(s_initialized ? 'OK' : (IsRunning() ? 'WARN' : 'ERROR'),
+    'LSP session: ' .. (!IsRunning() ? 'no daemon'
+      : (s_initialized ? 'initialized'
+      : (s_initializing ? 'initializing…' : 'running, not initialized'))),
+    s_initialized ? '' : (IsRunning() ? 'give it a moment, then :SimpleCCRestart'
+      : ':SimpleCCStart')))
+  add(lines, HealthLine('INFO', 'workspace root: ' ..
+    (s_root ==# '' ? '(none)' : s_root)))
   if s_julia_environment !=# ''
-    add(lines, printf('[INFO] Julia environment: %s', s_julia_environment))
+    add(lines, HealthLine('INFO', 'Julia environment: ' .. s_julia_environment))
   endif
+
+  if empty(s_server_caps)
+    add(lines, HealthLine(g:simplecc_status ==# '' ? 'WARN' : 'INFO',
+      'language servers: ' .. (g:simplecc_status ==# ''
+        ? 'none running' : g:simplecc_status .. ' (capabilities not reported)'),
+      g:simplecc_status ==# '' ? 'open a file whose filetype a server claims' : ''))
+  endif
+  for server in sort(keys(s_server_caps))
+    var caps = s_server_caps[server]
+    var provided = sort(keys(filter(copy(caps), (_, on) => !!on)))
+    add(lines, HealthLine('OK', printf('server %s: %s', server,
+      empty(provided) ? 'no capabilities advertised' : join(provided, ', '))))
+  endfor
 
   var restarted: list<string> = []
   for [server, state] in items(s_server_restarts)
-    var count = get(state, 'count', 0)
-    if count > 0
-      add(restarted, printf('%s×%d', server, count))
+    if get(state, 'count', 0) > 0
+      add(restarted, printf('%s×%d', server, get(state, 'count', 0)))
     endif
   endfor
   if !empty(restarted)
-    add(lines, printf('[WARN] server restarts: %s', join(restarted, ', ')))
+    add(lines, HealthLine('WARN', 'server restarts: ' .. join(restarted, ', '),
+      'the server is crashing; :SimpleCCLog has its stderr'))
   endif
 
   var diag_total = 0
   var diag_servers: dict<bool> = {}
-  for [path, by_server] in items(s_diagnostics)
+  for by_server in values(s_diagnostics)
     for [server, items] in items(by_server)
       diag_total += len(items)
       diag_servers[server] = true
     endfor
   endfor
-  add(lines, printf('[INFO] diagnostics: %d across %d files', diag_total, len(s_diagnostics)))
+  add(lines, HealthLine('INFO', printf('diagnostics: %d across %d files',
+    diag_total, len(s_diagnostics))))
   # With two servers per filetype it matters which one an error came from, and
   # which one g:simplecc_diag_sources is currently hiding.
   if len(diag_servers) > 1
-    add(lines, printf('[INFO] diagnostic sources: %s',
-      join(sort(keys(diag_servers))->map((_, s) => s ==# '' ? '(unnamed)' : s), ', ')))
+    add(lines, HealthLine('INFO', 'diagnostic sources: ' ..
+      join(sort(keys(diag_servers))->map((_, name) => name ==# '' ? '(unnamed)' : name), ', ')))
   endif
   var diag_filter = get(g:, 'simplecc_diag_sources', [])
   if !empty(diag_filter)
-    add(lines, printf('[INFO] diagnostic sources shown: %s', join(diag_filter, ', ')))
+    add(lines, HealthLine('INFO', 'diagnostic sources shown: ' .. join(diag_filter, ', '),
+      'g:simplecc_diag_sources hides every other server'))
   endif
-  add(lines, printf('[INFO] open documents: %d', len(s_doc_versions)))
-  add(lines, printf('[%s] popups: %s',
-    has('popupwin') ? 'OK' : 'WARN',
-    has('popupwin') ? 'available' : 'missing +popupwin — hover/signature disabled'))
-  add(lines, printf('[%s] text properties: %s',
-    has('textprop') ? 'OK' : 'WARN',
-    has('textprop') ? 'available' : 'missing +textprop — inlay hints disabled'))
+  add(lines, HealthLine('INFO', printf('open documents: %d', len(s_doc_versions))))
+  return lines
+enddef
 
-  # ActiveConfigPath() is the search the plugin actually performs; the old
-  # hard-coded ~/.simplecc.json named a file it never reads.
-  var cfg = ActiveConfigPath()
-  add(lines, printf('[INFO] user config: %s',
-    cfg ==# '' ? '(none — :SimpleCCConfig to create one)' : cfg))
+# Why *this* buffer is or is not being served, which is the question behind
+# almost every "it does nothing in my file" report.
+def HealthContext(bnr: number): list<string>
+  var lines = ['CONTEXT (buffer ' .. bnr .. ')']
+  var name = bufname(bnr)
+  add(lines, HealthLine('INFO', 'file: ' .. (name ==# '' ? '(unnamed)' : name)))
+  var buftype = getbufvar(bnr, '&buftype', '')
+  if buftype !=# ''
+    add(lines, HealthLine('WARN', 'buftype: ' .. buftype,
+      'special buffers are never sent to a language server'))
+  endif
+  var ft = BufFt(bnr)
+  add(lines, HealthLine(ft ==# '' ? 'WARN' : 'OK',
+    'filetype: ' .. (ft ==# '' ? '(none)' : ft),
+    ft ==# '' ? 'set one, or no server can be selected' : ''))
 
-  for line in lines
-    echom line
+  var uri = BufUri(bnr)
+  if ft ==# '' || uri ==# 'file://'
+    add(lines, HealthLine('WARN', 'document: not sent to the daemon',
+      'an unnamed buffer or one with no filetype is skipped'))
+    return lines
+  endif
+  if !has_key(s_doc_versions, uri)
+    add(lines, HealthLine('ERROR', 'document: never opened on the server',
+      IsRunning() ? ':edit! to re-trigger, or :SimpleCCRestart' : ':SimpleCCStart'))
+    return lines
+  endif
+  add(lines, HealthLine('OK', printf('document: open, version %d',
+    s_doc_versions[uri])))
+  # Text the server has not seen yet is exactly how a stale completion or a
+  # diagnostic on the wrong line happens.
+  var live = getbufvar(bnr, 'changedtick', 0)
+  var sent = get(s_doc_changedticks, uri, 0)
+  add(lines, HealthLine(live == sent ? 'OK' : 'WARN',
+    printf('sync: changedtick %d, server has %d', live, sent),
+    live == sent ? '' : 'unsent edits; they flush on the next change or save'))
+  add(lines, HealthLine('INFO', printf("native options: omnifunc=%s tagfunc=%s formatexpr=%s",
+    getbufvar(bnr, '&omnifunc', '') ==# '' ? '(none)' : getbufvar(bnr, '&omnifunc', ''),
+    getbufvar(bnr, '&tagfunc', '') ==# '' ? '(none)' : getbufvar(bnr, '&tagfunc', ''),
+    getbufvar(bnr, '&formatexpr', '') ==# '' ? '(none)' : getbufvar(bnr, '&formatexpr', ''))))
+  return lines
+enddef
+
+# The whole report, as text.  Kept separate from the buffer it is rendered into
+# so a test can read it without a window.
+export def HealthReport(): list<string>
+  var lines: list<string> = ['SimpleCC health — ' .. strftime('%Y-%m-%d %H:%M:%S')]
+  for section in [HealthEnvironment(), HealthBinary(), HealthConfig(),
+                  HealthRuntime(), HealthContext(bufnr('%'))]
+    add(lines, '')
+    extend(lines, section)
   endfor
-  echom '[INFO] :SimpleCCLog shows the daemon transcript'
+  add(lines, '')
+  add(lines, HealthLine('INFO', ':SimpleCCLog shows the daemon transcript'))
+  return lines
+enddef
+
+export def Health()
+  # The report is rendered into a scratch buffer rather than echoed: it is
+  # longer than the message area, and it exists to be read, scrolled and
+  # pasted into a bug report.
+  var lines = HealthReport()
+  new
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+  silent file [SimpleCC health]
+  setline(1, lines)
+  setlocal nomodifiable nomodified
+  normal! gg
 enddef
 
 export def Status()

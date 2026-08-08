@@ -603,9 +603,36 @@ What it guarantees:
 
                                                       *:SimpleCCHealth*
 :SimpleCCHealth
-        Report daemon path, run state, uptime, crash and restart counts,
-        whether the crash-loop breaker has tripped, and in-flight requests,
-        alongside this plugin's own diagnostics.
+        Open a full report in a scratch buffer, one "[LEVEL] fact — remedy"
+        per line, so it can be read, scrolled and pasted into a bug report.
+        Five sections:
+
+        ENVIRONMENT  Vim version, the features each part of the plugin needs
+                     (+job, +channel, +timers, +textprop, +popupwin) and
+                     'encoding' — LSP columns are UTF-16 over UTF-8.
+        BINARY       Where the daemon is, when it was built, and whether it
+                     is older than the plugin sources beside it. That last
+                     one is the most common failure there is: a plugin
+                     manager updates the Vim files and never rebuilds
+                     lib/simplecc-daemon, and the only symptom is a feature
+                     that quietly does nothing. The remedy is printed with
+                     it: run ./install.sh, then |:SimpleCCRestart|.
+        CONFIG       Which configuration file is actually in use (the search
+                     in |simplecc-configuration|, not a guess), whether it
+                     parses, and for each declared server whether its command
+                     resolves — on $PATH or in the directory
+                     |:SimpleCCInstall| installs into — and which filetypes
+                     select it.
+        RUNTIME      Daemon state, uptime, crash and restart counts, whether
+                     the crash-loop breaker has tripped, in-flight requests,
+                     the LSP session, the workspace root, what each running
+                     server advertised, and the diagnostics held per server.
+        CONTEXT      Why the buffer you ran it from is or is not being
+                     served: 'buftype', 'filetype', whether the document was
+                     ever opened on the server, whether the server has seen
+                     your latest edits, and the values of 'omnifunc',
+                     'tagfunc' and 'formatexpr' — see
+                     |simplecc-native-options|.
 
 :SimpleCCRestart
         Stop the daemon and start a fresh one. Clears the crash-loop breaker,
