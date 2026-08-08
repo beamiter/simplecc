@@ -2,6 +2,17 @@
 
 ## Unreleased - 2026-08-05
 
+### 空回复现在会清除,而不是被忽略
+
+- inlay hint 与 semantic token 的空回复此前都在 `prop_remove` 之前提前 return。
+  把 `let x = compute();` 注释掉,`: i32` 会留在注释上,而且 `RestoreInlayHints()`
+  每次 `CursorHold` 都会从缓存里把它重新贴回去;全选删除后,已删除代码的
+  semantic token 高亮同样留在 buffer 里。
+- `:SimpleCCSemanticTokens` 与 1000ms 防抖后台刷新现在区分开来:只有用户主动
+  发起的请求才会往消息行写 `No semantic tokens`,后台刷新不会再制造
+  hit-enter 提示。
+- 新增 `test/stale_props.vim` 回归两种空回复与缓存恢复路径。
+
 ### 守护进程交给 simplecore 托管
 
 - 进程生命周期改由已经 vendored、sha256 锁定并有回归测试的

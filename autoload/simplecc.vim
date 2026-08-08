@@ -3640,13 +3640,18 @@ def OnInlayHints(ev: dict<any>)
     Log('inlay hints: dropped stale reply for buffer ' .. bnr)
     return
   endif
+  # An empty reply is a real answer: whatever was on screen is gone. Returning
+  # early left the stale hints in place and, worse, RestoreInlayHints() kept
+  # re-adding them from the cache on every CursorHold — comment out
+  # `let x = compute();` and its `: i32` stayed attached to the comment.
   var hints = get(ev, 'hints', [])
-  if empty(hints)
-    return
-  endif
   # Cache for later restoration
   s_inlay_cache = hints
   s_inlay_cache_bufnr = bnr
+  if empty(hints)
+    ClearInlayHints(bnr)
+    return
+  endif
   ApplyInlayHints(hints, bnr)
 enddef
 
@@ -3885,9 +3890,14 @@ enddef
 # Semantic Tokens
 # ═════════════════════════════════════════════════════════
 
-export def SemanticTokens()
+# `manual` separates :SimpleCCSemanticTokens from the 1000ms debounce: only a
+# request the user asked for may write to the message line, or a background
+# refresh over an empty buffer produces an unprompted hit-enter prompt.
+export def SemanticTokens(manual: bool = true)
   if !s_initialized
-    echom '[SimpleCC] not initialized'
+    if manual
+      echom '[SimpleCC] not initialized'
+    endif
     return
   endif
   var uri = BufUri()
@@ -3895,7 +3905,7 @@ export def SemanticTokens()
   # Record the buffer snapshot (and clearing range) this request was issued
   # for; the reply validates against it instead of the then-current buffer.
   var req = {bufnr: bufnr('%'), changedtick: b:changedtick,
-    range_mode: false, top: 0, bot: 0}
+    range_mode: false, top: 0, bot: 0, manual: manual}
   if line('$') > g:simplecc_semtok_range_threshold
     # Large file: use range request for visible area + buffer
     var top = max([0, line('w0') - 1 - 100])
@@ -4012,10 +4022,12 @@ def OnSemanticTokens(ev: dict<any>)
     Log('semantic tokens: dropped stale reply for buffer ' .. bnr)
     return
   endif
+  # An empty reply is a real answer -- select-all-and-delete produces one --
+  # so it must still run the prop_remove pass below.  Returning here left text
+  # properties describing code that no longer exists.
   var tokens = get(ev, 'tokens', [])
-  if empty(tokens)
+  if empty(tokens) && get(req, 'manual', true)
     echo 'No semantic tokens'
-    return
   endif
   var uri = BufUri(bnr)
   var prio = g:simplecc_semtok_priority
@@ -5270,7 +5282,7 @@ def RequestSemanticTokensDebounced()
     if !bufexists(bnr)
       return
     endif
-    SemanticTokens()
+    SemanticTokens(false)
   })
 enddef
 
