@@ -262,6 +262,9 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_no_default_maps</code> | 0 | Disable built-in mappings |
 | <code>g:simplecc_config_path</code> | empty | Explicit configuration path |
 | <code>g:simplecc_daemon_path</code> | empty | Explicit daemon executable |
+| <code>g:simplecc_auto_restart</code> | 1 | Restart a daemon that died unexpectedly, with backoff |
+| <code>g:simplecc_max_restarts</code> | 5 | Crashes per minute before the crash-loop breaker trips |
+| <code>g:simplecc_request_timeout</code> | 30000 | Reply timeout in ms for requests with a callback |
 | <code>g:simplecc_auto_complete</code> | 1 | Enable automatic completion |
 | <code>g:simplecc_change_delay</code> | 120 | Document-change debounce in ms |
 | <code>g:simplecc_complete_delay</code> | 80 | Completion debounce in ms |

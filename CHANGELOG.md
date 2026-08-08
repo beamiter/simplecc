@@ -2,6 +2,28 @@
 
 ## Unreleased - 2026-08-05
 
+### 守护进程交给 simplecore 托管
+
+- 进程生命周期改由已经 vendored、sha256 锁定并有回归测试的
+  `autoload/simplecc/core.vim` 负责。此前 `OnBackendExit` 只在
+  `:SimpleCCRestart` 已经排队时才重启,被 OOM kill 或 panic 掉的守护进程永远
+  不会回来:之后每个 `gd`/`K`/`<leader>ca` 都只回答 `[SimpleCC] not initialized`,
+  补全悄悄退化成 buffer 词。而 `doc/simplecc.txt` 早就在承诺指数退避重启和
+  crash-loop 断路器 —— 现在这些承诺是真的了。
+- 守护进程恢复后会自动重放 `initialize` 与所有已打开 buffer 的 `didOpen`,
+  整个 LSP 会话在用户无感知的情况下重建。
+- 带回调的请求改走 `core#Request()`,有超时:卡死的守护进程不再让回调永远悬空。
+- `:SimpleCCStop` 仍然先发 `shutdown` 并等待 ack 再终止进程,语言服务器不会被
+  遗留成孤儿进程;ack 超时 2 秒后照样终止,不会挂住命令。
+- 新增 `g:simplecc_auto_restart`、`g:simplecc_max_restarts`、
+  `g:simplecc_request_timeout`。
+- `:SimpleCCHealth` 现在直接输出 supervisor 的 uptime / crash / restart /
+  断路器状态,并改为报告 `ActiveConfigPath()`(此前报的 `~/.simplecc.json`
+  是一个插件根本不会读的路径)。
+- 新增 `test/daemon_restart.vim` 与 `test/fake_daemon_crash.sh`:守护进程在
+  会话中途非正常退出后,不做任何用户操作,`g:simplecc_status` 必须自己回到
+  `ready`;并覆盖 `g:simplecc_auto_restart = 0` 与显式重启。
+
 ### 诊断按路径与来源服务器存储
 
 - 诊断改用解析后的文件路径作 key。此前用的是语言服务器发来的 URI 原文,而

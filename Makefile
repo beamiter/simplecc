@@ -16,6 +16,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/buffer_words.vim
 	vim -Nu NONE -n -i NONE -es -S test/completion_items.vim
 	vim -Nu NONE -n -i NONE -es -S test/diagnostics_store.vim
+	vim -Nu NONE -n -i NONE -es -S test/daemon_restart.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

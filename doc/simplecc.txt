@@ -262,6 +262,23 @@ g:simplecc_config_path           string  default: ''
 g:simplecc_daemon_path           string  default: ''
         Explicit daemon executable.
 
+                                             *g:simplecc_auto_restart*
+g:simplecc_auto_restart          number  default: 1
+        Restart a daemon that exited unexpectedly, with exponential backoff
+        (see |simplecc-daemon|). Set to 0 to leave a crashed daemon down;
+        |:SimpleCCRestart| then remains the only way back.
+
+                                             *g:simplecc_max_restarts*
+g:simplecc_max_restarts          number  default: 5
+        Crashes within one minute before the supervisor gives up, reports it
+        once, and stops respawning. |:SimpleCCRestart| clears the breaker.
+
+                                          *g:simplecc_request_timeout*
+g:simplecc_request_timeout       number  default: 30000
+        Milliseconds before a request that carries a reply callback is
+        answered with an error instead of waiting on a daemon that has
+        wedged. Set to 0 to wait forever.
+
                                              *g:simplecc_auto_complete*
 g:simplecc_auto_complete         number  default: 1
         Enable automatic completion.
@@ -488,17 +505,22 @@ What it guarantees:
   replacement that already took its place.
 - Output still queued when you stop the daemon is discarded, so an explicit
   stop cannot be undone by an event that was already in flight.
-- A daemon that dies is restarted automatically with exponential backoff.
+- A daemon that dies is restarted automatically with exponential backoff,
+  and the LSP session is rebuilt on the replacement: the workspace is
+  re-initialized and every open buffer is re-opened, with no user action.
   If it keeps crashing, the supervisor reports it once and stops trying
-  rather than respawning forever; :SimpleCCRestart re-arms it.
-- Requests are correlated to replies by id and can time out, so a wedged
-  daemon never leaves a callback hanging.
+  rather than respawning forever; :SimpleCCRestart re-arms it. Turn the
+  automatic part off with |g:simplecc_auto_restart|, and set the crash-loop
+  threshold with |g:simplecc_max_restarts|.
+- Requests are correlated to replies by id and time out after
+  |g:simplecc_request_timeout|, so a wedged daemon never leaves a callback
+  hanging.
 
                                                       *:SimpleCCHealth*
 :SimpleCCHealth
-        Report daemon path, run state, negotiated protocol and capabilities,
-        uptime, crash and restart counts, and whether the crash-loop breaker
-        has tripped, alongside this plugin's own diagnostics.
+        Report daemon path, run state, uptime, crash and restart counts,
+        whether the crash-loop breaker has tripped, and in-flight requests,
+        alongside this plugin's own diagnostics.
 
 :SimpleCCRestart
         Stop the daemon and start a fresh one. Clears the crash-loop breaker,

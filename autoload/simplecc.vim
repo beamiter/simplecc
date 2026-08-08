@@ -6,20 +6,25 @@ vim9script
 
 # ═════════════════════════════════════════════════════════
 # Backend (daemon) communication
+#
+# The daemon process is owned by the vendored simplecore supervisor
+# (autoload/simplecc/core.vim): liveness via job_status, generation-guarded
+# callbacks, exponential-backoff restarts, a crash-loop breaker and per-request
+# timeouts.  This file keeps the LSP protocol and the UI.
 # ═════════════════════════════════════════════════════════
 
-var s_job: job = null_job
-var s_running: bool = false
 var s_initialized: bool = false
 var s_initializing: bool = false
 var s_stopping: bool = false
 var s_restart_pending: bool = false
 # Per-server crash-restart bookkeeping: name -> {count, last}
 var s_server_restarts: dict<any> = {}
-var s_job_generation: number = 0
 var s_initialize_id: number = 0
+# Bumped every time a daemon becomes ready.  Deferred work scheduled against
+# one daemon must not run against its replacement, which has already re-opened
+# every buffer for itself.
+var s_daemon_generation: number = 0
 var s_next_id: number = 0
-var s_cbs: dict<func> = {}
 var s_root: string = ''
 var s_julia_environment: string = ''
 var s_log: list<string> = []
@@ -75,8 +80,6 @@ var s_comp_resolved_items: dict<dict<any>> = {}
 var s_sig_popup: number = 0
 # Hover popup
 var s_hover_popup: number = 0
-# Kill timer for daemon force-kill
-var s_kill_timer: number = 0
 # Diagnostics float popup
 var s_diag_popup: number = 0
 # Progress tracking
@@ -149,23 +152,32 @@ export def ShowLog()
   normal! G
 enddef
 
+# The supervisor owns process lookup and liveness.  Configure it lazily and
+# exactly once per option read, so a g: value set after the plugin loaded still
+# takes effect on the next start.
+def SetupCore()
+  simplecc#core#Setup({
+    name: 'SimpleCC',
+    exe: 'simplecc-daemon',
+    path_var: 'simplecc_daemon_path',
+    codec: 'json',
+    auto_restart: get(g:, 'simplecc_auto_restart', 1) ? true : false,
+    max_restarts: max([1, get(g:, 'simplecc_max_restarts', 5)]),
+    request_timeout_ms: max([0, get(g:, 'simplecc_request_timeout', 30000)]),
+    OnEvent: OnBackendEvent,
+    OnStderr: (line: string) => Log('stderr: ' .. line),
+    OnReady: OnDaemonReady,
+    OnExit: OnDaemonExit,
+  })
+enddef
+
 def FindBackend(): string
-  var path = get(g:, 'simplecc_daemon_path', '')
-  if path !=# '' && executable(path)
-    return path
-  endif
-  # Search in runtimepath/lib/
-  for dir in split(&runtimepath, ',')
-    var p = dir .. '/lib/simplecc-daemon'
-    if executable(p)
-      return p
-    endif
-  endfor
-  return ''
+  SetupCore()
+  return simplecc#core#FindExe()
 enddef
 
 def IsRunning(): bool
-  return s_running && s_job != null_job && job_status(s_job) ==# 'run'
+  return simplecc#core#IsRunning()
 enddef
 
 # Stop debounce/UI timers so no straggling callback fires against a dead
@@ -203,111 +215,72 @@ def StopFeatureTimers(closing_bufnr: number = -1)
   endif
 enddef
 
-def OnBackendExit(generation: number, code: number)
-  # A stopped daemon may exit after a replacement has already started.  Never
-  # let that stale callback reset the replacement job's state.
-  if generation != s_job_generation
-    Log(printf('stale daemon generation %d exited with code %d', generation, code))
-    return
-  endif
-  var restart = s_restart_pending
+# The supervisor calls this for every daemon exit, expected or not, and tells
+# us whether it has already scheduled a backoff restart.  Everything derived
+# from the dead daemon has to go: an in-flight reply context now refers to a
+# request nobody will ever answer.
+def OnDaemonExit(code: number, restarting: bool)
+  var manual_restart = s_restart_pending
   s_restart_pending = false
-  s_running = false
   s_initialized = false
   s_initializing = false
   s_stopping = false
   s_initialize_id = 0
-  s_job = null_job
-  s_cbs = {}
   s_navigation_contexts = {}
   s_inlay_requests = {}
   s_semtok_requests = {}
   s_codelens_requests = {}
   s_dochl_requests = {}
+  # The replacement daemon has no open documents; the replay in the
+  # `initialized` handler is what re-opens them, and a stale pending delta is
+  # expressed against a version no server ever saw.
+  s_doc_versions = {}
+  s_doc_changedticks = {}
+  s_pending_changes = {}
+  s_semtok_has_full = {}
   StopFeatureTimers()
-  if s_kill_timer > 0
-    timer_stop(s_kill_timer)
-    s_kill_timer = 0
-  endif
   Log('daemon exited with code ' .. string(code))
-  g:simplecc_status = ''
-  if restart
+  g:simplecc_status = restarting || manual_restart ? 'restarting' : ''
+  if manual_restart
+    # An explicit :SimpleCCRestart is the user saying "try again", so forgive
+    # whatever the crash breaker has accumulated.
+    simplecc#core#ClearBreaker()
     timer_start(0, (_) => Start())
   endif
 enddef
 
+# The daemon accepted the connection.  This runs on the first start *and* on
+# every automatic restart, which is what makes crash recovery invisible: the
+# LSP session is rebuilt from here without the user doing anything.
+def OnDaemonReady(protocol: number, capabilities: dict<any>)
+  s_daemon_generation += 1
+  s_initialized = false
+  s_initializing = false
+  s_initialize_id = 0
+  SendInitialize()
+enddef
+
 def EnsureBackend(): bool
-  if IsRunning()
+  SetupCore()
+  if simplecc#core#IsRunning()
     return true
   endif
-  var exe = FindBackend()
-  if exe ==# '' || !executable(exe)
-    echohl ErrorMsg
-    echom '[SimpleCC] daemon not found. Run install.sh or set g:simplecc_daemon_path.'
-    echohl None
-    return false
-  endif
-
-  s_job_generation += 1
-  var generation = s_job_generation
-  try
-    s_job = job_start([exe], {
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, line) => {
-        if generation == s_job_generation
-          OnBackendEvent(line)
-        endif
-      },
-      err_mode: 'nl',
-      err_cb: (ch, line) => {
-        if generation == s_job_generation
-          Log('stderr: ' .. line)
-        endif
-      },
-      exit_cb: (ch, code) => {
-        OnBackendExit(generation, code)
-      },
-      stoponexit: 'term'
-    })
-  catch
-    s_job = null_job
-    s_running = false
-    echohl ErrorMsg
-    echom '[SimpleCC] job_start failed: ' .. v:exception
-    echohl None
-    return false
-  endtry
-
-  if job_status(s_job) !=# 'run'
-    s_running = false
-    return false
-  endif
-
-  s_running = true
-  s_stopping = false
-  Log('daemon started')
-  return true
+  return simplecc#core#Ensure()
 enddef
 
 def Send(req: dict<any>)
-  if !IsRunning()
-    return
-  endif
-  try
-    var json = json_encode(req) .. "\n"
-    ch_sendraw(s_job, json)
-  catch
-    Log('Send error: ' .. v:exception)
-  endtry
+  simplecc#core#Send(req)
 enddef
 
+# Send a request whose reply also has to reach one specific caller.  The
+# supervisor correlates by id and expires the entry on timeout, so a wedged
+# daemon can no longer strand the callback forever; the normal type dispatch
+# still runs first, exactly as it does for an unsolicited event.
 def SendWithCb(req: dict<any>, Cb: func)
-  var id = get(req, 'id', 0)
-  if id > 0
-    s_cbs[id] = Cb
-  endif
-  Send(req)
+  simplecc#core#Request(req, (ev: dict<any>) => {
+    OnBackendEvent(ev)
+    Cb(ev)
+  })
 enddef
 
 def OnJuliaEnvironmentActivation(ev: dict<any>)
@@ -337,19 +310,9 @@ def OnConfigurationReload(ev: dict<any>)
   echohl None
 enddef
 
-def OnBackendEvent(line: string)
-  if line ==# ''
-    return
-  endif
-  var ev: any
-  try
-    ev = json_decode(line)
-  catch
-    Log('JSON decode error: ' .. v:exception)
-    return
-  endtry
-
-  if type(ev) != v:t_dict || !has_key(ev, 'type')
+# Decoded by the supervisor; this is the plugin's own event router.
+def OnBackendEvent(ev: dict<any>)
+  if !has_key(ev, 'type') || type(ev.type) != v:t_string
     return
   endif
 
@@ -526,15 +489,6 @@ def OnBackendEvent(line: string)
 
   elseif ev.type ==# 'shutdown'
     Log('shutdown ack')
-  endif
-
-  # Fire callback if registered
-  if id > 0 && has_key(s_cbs, id)
-    try
-      s_cbs[id](ev)
-    catch
-    endtry
-    remove(s_cbs, id)
   endif
 enddef
 
@@ -2689,13 +2643,13 @@ def ScheduleServerRestart(server: string, filetypes: list<any>)
   var delay = [500, 2000, 5000][state.count - 1]
   Log(printf('scheduling %s restart attempt %d in %dms', server, state.count, delay))
   echom printf('[SimpleCC] %s stopped; restarting (attempt %d/3)', server, state.count)
-  var generation = s_job_generation
+  var generation = s_daemon_generation
   timer_start(delay, (_) => ReopenBuffersForFiletypes(filetypes, generation))
 enddef
 
 def ReopenBuffersForFiletypes(filetypes: list<any>, generation: number)
   # A daemon restarted in the meantime has already re-opened every buffer.
-  if !s_initialized || generation != s_job_generation
+  if !s_initialized || generation != s_daemon_generation
     return
   endif
   for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
@@ -3087,19 +3041,10 @@ enddef
 # Public API
 # ═════════════════════════════════════════════════════════
 
-export def Start()
-  if s_initialized || s_initializing
-    Log('Start: already initialized or initializing')
-    return
-  endif
-  if s_stopping
-    Log('Start: daemon is stopping')
-    return
-  endif
-  if !EnsureBackend()
-    return
-  endif
-  # Detect project root
+# Hand the daemon the project root and the config path.  Called once per live
+# daemon, from OnDaemonReady — including after an automatic crash restart, so
+# the whole LSP session is rebuilt without the user asking.
+def SendInitialize()
   s_root = FindProjectRoot()
   s_julia_environment = ''
   if filereadable(s_root .. '/JuliaProject.toml') || filereadable(s_root .. '/Project.toml')
@@ -3120,11 +3065,33 @@ export def Start()
   })
 enddef
 
+export def Start()
+  if s_initialized || s_initializing
+    Log('Start: already initialized or initializing')
+    return
+  endif
+  if s_stopping
+    Log('Start: daemon is stopping')
+    return
+  endif
+  if IsRunning()
+    # The process survived a failed initialize; re-run just that step.
+    SendInitialize()
+    return
+  endif
+  # Ensure() drives OnDaemonReady, which is what sends `initialize`.
+  EnsureBackend()
+enddef
+
 export def Stop(restarting: bool = false)
   # A manual stop cancels a queued restart; Restart() keeps the intent until
-  # the exact daemon generation has really exited.
+  # the daemon has really exited.
   s_restart_pending = restarting
   if !IsRunning() || s_stopping
+    if !IsRunning() && restarting
+      s_restart_pending = false
+      Start()
+    endif
     return
   endif
   s_stopping = true
@@ -3133,33 +3100,16 @@ export def Stop(restarting: bool = false)
   s_initialize_id = 0
   StopFeatureTimers()
   g:simplecc_status = 'stopping'
-  var generation = s_job_generation
-  var job_to_stop = s_job
-  Send({type: 'shutdown', id: NextId()})
-  timer_start(500, (_) => {
-    if generation != s_job_generation
-      return
-    endif
-    if job_to_stop != null_job && job_status(job_to_stop) ==# 'run'
-      job_stop(job_to_stop)
-      # Force kill if still running after 3 seconds
-      s_kill_timer = timer_start(3000, (timer) => {
-        if s_kill_timer == timer
-          s_kill_timer = 0
-        endif
-        if generation != s_job_generation
-          return
-        endif
-        if job_to_stop != null_job && job_status(job_to_stop) ==# 'run'
-          job_stop(job_to_stop, 'kill')
-          Log('daemon force-killed')
-        endif
-      })
-    endif
-  })
+  # `shutdown` is what tears the language servers down; killing the daemon
+  # before it acknowledges orphans every rust-analyzer and gopls it started.
+  # A timeout answers with an error event and stops the daemon just the same,
+  # so a wedged daemon cannot make :SimpleCCStop hang.
+  simplecc#core#Request({type: 'shutdown', id: NextId()},
+    (_) => simplecc#core#Stop(), 2000)
 enddef
 
 export def Restart()
+  simplecc#core#ClearBreaker()
   if IsRunning() || s_stopping
     Stop(true)
   else
@@ -3174,12 +3124,15 @@ export def Health()
   echohl Title | echom '[SimpleCC] health check' | echohl None
 
   var lines: list<string> = []
-  add(lines, printf('[%s] daemon: %s',
-    exe ==# '' ? 'ERROR' : 'OK',
-    exe ==# '' ? 'not found — run ./install.sh or set g:simplecc_daemon_path' : exe))
-  add(lines, printf('[%s] state: %s',
-    IsRunning() ? 'OK' : 'ERROR',
-    !IsRunning() ? 'not running'
+  if exe ==# ''
+    add(lines, '[ERROR] daemon: not found — run ./install.sh or set g:simplecc_daemon_path')
+  endif
+  # Process facts come from the supervisor that owns the process: uptime,
+  # crash and restart counts, and whether the crash-loop breaker has tripped.
+  extend(lines, simplecc#core#HealthLines())
+  add(lines, printf('[%s] LSP session: %s',
+    s_initialized ? 'OK' : (IsRunning() ? 'WARN' : 'ERROR'),
+    !IsRunning() ? 'no daemon'
       : (s_initialized ? 'initialized' : (s_initializing ? 'initializing…' : 'running, not initialized'))))
   add(lines, printf('[INFO] workspace root: %s', s_root ==# '' ? '(none)' : s_root))
   add(lines, printf('[INFO] language server: %s',
@@ -3199,7 +3152,6 @@ export def Health()
     add(lines, printf('[WARN] server restarts: %s', join(restarted, ', ')))
   endif
 
-  add(lines, printf('[INFO] in-flight requests: %d', len(s_cbs)))
   var diag_total = 0
   var diag_servers: dict<bool> = {}
   for [path, by_server] in items(s_diagnostics)
@@ -3227,9 +3179,11 @@ export def Health()
     has('textprop') ? 'OK' : 'WARN',
     has('textprop') ? 'available' : 'missing +textprop — inlay hints disabled'))
 
-  var cfg = expand('~/.simplecc.json')
+  # ActiveConfigPath() is the search the plugin actually performs; the old
+  # hard-coded ~/.simplecc.json named a file it never reads.
+  var cfg = ActiveConfigPath()
   add(lines, printf('[INFO] user config: %s',
-    filereadable(cfg) ? cfg : '(none — :SimpleCCConfig to create one)'))
+    cfg ==# '' ? '(none — :SimpleCCConfig to create one)' : cfg))
 
   for line in lines
     echom line
