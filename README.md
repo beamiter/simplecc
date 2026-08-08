@@ -253,6 +253,24 @@ disable all default mappings.
 | <code>[d</code> / <code>]d</code> | Previous / next diagnostic |
 | Insert-mode Tab, Shift-Tab, arrows, Enter | Navigate and accept completion |
 
+### Vim's own extension points
+
+In every buffer the daemon serves, SimpleCC also points three Vim options at the
+language server, so the keys that work everywhere else in Vim keep working here:
+
+| Option | Key | What it does |
+| --- | --- | --- |
+| <code>omnifunc</code> | <code>&lt;C-x&gt;&lt;C-o&gt;</code> | Completion from the server |
+| <code>tagfunc</code> | <code>&lt;C-]&gt;</code>, <code>:tag</code>, <code>&lt;C-w&gt;}</code> | Jump to the definition and push the tag stack, so <code>&lt;C-t&gt;</code> comes back |
+| <code>formatexpr</code> | <code>gq</code>, <code>gw</code> | Format the range through the server |
+
+Each one falls back to what Vim would have done on its own -- keyword
+completion, the tags file, internal formatting -- whenever it cannot do better:
+no daemon, no server for the buffer, no such capability advertised, or a tag
+request that is not the identifier under the cursor. Auto-formatting while
+typing is always Vim's. Set <code>g:simplecc_native_options</code> to 0 to
+leave the three options alone, or 2 to override a filetype plugin's choice.
+
 ## Options
 
 Set options before <code>plugin/simplecc.vim</code> is loaded.
@@ -267,6 +285,8 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | <code>g:simplecc_max_restarts</code> | 5 | Crashes per minute before the crash-loop breaker trips |
 | <code>g:simplecc_request_timeout</code> | 30000 | Reply timeout in ms for requests with a callback |
 | <code>g:simplecc_resource_operations</code> | 1 | Apply the create/rename/delete steps of a workspace edit, not only its text edits |
+| <code>g:simplecc_native_options</code> | 1 | Point <code>omnifunc</code>/<code>tagfunc</code>/<code>formatexpr</code> at the server: 0 never, 1 where unset, 2 always |
+| <code>g:simplecc_tagfunc_timeout</code> | 1000 | Milliseconds <code>tagfunc</code> waits before falling back to the tags file |
 | <code>g:simplecc_auto_complete</code> | 1 | Enable automatic completion |
 | <code>g:simplecc_change_delay</code> | 120 | Document-change debounce in ms |
 | <code>g:simplecc_complete_delay</code> | 80 | Completion debounce in ms |

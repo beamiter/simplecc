@@ -2,6 +2,36 @@
 
 ## Unreleased - 2026-08-05
 
+### omnifunc / tagfunc / formatexpr 接到语言服务器上
+
+- 这个插件的能力此前只能通过它自己的命令和映射触达。`<C-x><C-o>`、`<C-]>`、
+  `gq` —— Vim 用户不看 README 也会按的三个键,也是 tag stack、`completeopt`、
+  `formatoptions` 和一堆第三方插件赖以工作的接口 —— 表现得就像根本没装 LSP
+  客户端。现在 `didOpen` 发出的那一刻(即"这个 buffer 确实有服务端"的时刻)
+  会把 `omnifunc` / `tagfunc` / `formatexpr` 指过去。
+- 每个钩子在做不到更好时都把键还给 Vim:守护进程没跑、buffer 没有服务端、
+  服务端没声明对应能力、或者 `tagfunc` 拿到的不是光标下的标识符。因此守护
+  进程挂掉时退化成关键字补全、tags 文件和内建格式化,而不是一个死键。
+  插入模式下由 `formatoptions` 的 a/t 触发的自动折行永远走 Vim 自己的实现,
+  不会每敲一个字符就往服务端跑一次。
+- `tagfunc` 必须同步返回列表,这是插件里唯一一处等待:走
+  `core#Request()`(而不是 `SendWithCb()`,后者会让 `OnDefinition()` 也跳一次,
+  而在 tagfunc 里跳窗口是 E1299),`sleep` 让 channel 回调得以运行,超时由
+  `g:simplecc_tagfunc_timeout`(默认 1000ms)封顶,超时即回落到 tags 文件。
+  返回行号而不是搜索模式:服务端给的位置本来就是精确的,再搜一次名字会在
+  同名多处的文件里找错地方。
+- 为此 `serverStatus running` 事件带上服务端能力(守护进程新增
+  `LspClient::editor_capabilities()`)。Vim 无法同步询问一个运行中的服务端,
+  而 `formatexpr` 必须在发请求*之前*就知道对方是否支持 rangeFormatting ——
+  否则 rust-analyzer 这类不支持的服务端会让 `gq` 从"重排注释"变成"报错"。
+  能力表为空(旧守护进程)一律按"支持"处理,行为与此前一致。
+- 新增 `g:simplecc_native_options`(0 不设 / 1 仅在 buffer 自己没设时设 /
+  2 总是覆盖,默认 1)与 `g:simplecc_tagfunc_timeout`。
+- `test/native_options.vim`:三个选项在附着时被设上、`<C-x><C-o>` 确实发出了
+  completion 请求、`<C-]>` 从服务端拿到 tag 条目而手打的 `:tag` 与插入模式
+  补全回落到 tags 文件、服务端不支持 rangeFormatting 时 `gq` 必须还给 Vim、
+  旧守护进程不上报能力时不能一刀切关掉、以及守护进程停掉后三个钩子都还给 Vim。
+
 ### inlay hint 按视口请求,语义高亮批量落属性
 
 - `textDocument/inlayHint` 本来就是范围请求,而这里每次都填 `0 .. line('$')`。

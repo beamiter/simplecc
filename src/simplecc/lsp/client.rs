@@ -1087,6 +1087,42 @@ impl LspClient {
             .collect())
     }
 
+    /// The advertised capabilities the editor itself has to branch on.
+    ///
+    /// Vim cannot ask a running server anything synchronously, and its native
+    /// extension points have to decide *before* issuing a request whether the
+    /// server can answer at all: 'formatexpr' must hand `gq` back to Vim's own
+    /// formatter rather than report an error at a server that never offered
+    /// range formatting, and 'tagfunc' must fall back to the tags file rather
+    /// than swallow a CTRL-] the server cannot resolve. `:SimpleCCHealth`
+    /// reports the same set, which is otherwise invisible from the editor.
+    pub async fn editor_capabilities(&self) -> Value {
+        let caps = self.capabilities.lock().await;
+        let Some(caps) = caps.as_ref() else {
+            return json!({});
+        };
+        json!({
+            "completion": caps.completion_provider.is_some(),
+            "definition": provides(&caps.definition_provider),
+            "references": provides(&caps.references_provider),
+            "hover": match caps.hover_provider {
+                Some(lsp_types::HoverProviderCapability::Simple(on)) => on,
+                Some(lsp_types::HoverProviderCapability::Options(_)) => true,
+                None => false,
+            },
+            "rename": provides(&caps.rename_provider),
+            "code_action": match caps.code_action_provider {
+                Some(lsp_types::CodeActionProviderCapability::Simple(on)) => on,
+                Some(lsp_types::CodeActionProviderCapability::Options(_)) => true,
+                None => false,
+            },
+            "formatting": provides(&caps.document_formatting_provider),
+            "range_formatting": provides(&caps.document_range_formatting_provider),
+            "inlay_hint": provides(&caps.inlay_hint_provider),
+            "semantic_tokens": caps.semantic_tokens_provider.is_some(),
+        })
+    }
+
     /// Format one range instead of the whole document.
     ///
     /// Gated on the advertised capability rather than left to fail as a
@@ -2814,6 +2850,12 @@ async fn handle_server_request(
             let _ = t.send(&resp).await;
         }
     }
+}
+
+/// `OneOf<bool, Options>`: a server may answer a capability with a plain `true`
+/// or with an options object, and `Some(Left(false))` is a real "no".
+fn provides<T>(value: &Option<OneOf<bool, T>>) -> bool {
+    matches!(value, Some(OneOf::Left(true)) | Some(OneOf::Right(_)))
 }
 
 #[cfg(test)]

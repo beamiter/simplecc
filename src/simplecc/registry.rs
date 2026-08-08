@@ -147,11 +147,16 @@ impl Registry {
                         .await;
                 });
 
-                // Notify running
+                // Notify running.  The capabilities travel with it because the
+                // editor has to know, before it issues a request, whether this
+                // server can answer at all: 'formatexpr' hands `gq` back to
+                // Vim when there is no range formatting, and :SimpleCCHealth
+                // reports what the server actually provides.
                 let status_event = serde_json::json!({
                     "type": "serverStatus",
                     "server": &name,
                     "status": "running",
+                    "capabilities": client.editor_capabilities().await,
                 });
                 let _ = event_tx
                     .send(serde_json::to_string(&status_event).unwrap())

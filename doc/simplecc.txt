@@ -263,6 +263,28 @@ Disable all defaults before loading the plugin: >
 
   let g:simplecc_no_default_maps = 1
 <
+                                                     *simplecc-native-options*
+Vim's own extension points ~
+
+In every buffer the daemon serves, SimpleCC also points three Vim options at
+the language server, so the keys that work everywhere else in Vim keep working
+here:
+
+  'omnifunc'      CTRL-X CTRL-O completes from the server.
+  'tagfunc'       CTRL-], :tag and CTRL-W } jump to the definition and push
+                  the tag stack, so CTRL-T comes back.
+  'formatexpr'    gq and gw format through textDocument/rangeFormatting.
+
+Each of them falls back to what Vim would have done on its own — keyword
+completion, the tags file, internal formatting — whenever it cannot do better:
+the daemon is not running, the buffer has no server, the server never
+advertised the capability, or 'tagfunc' was asked for something that is not
+the identifier under the cursor. Auto-formatting while typing ('formatoptions'
+"a" and "t") is always Vim's, never a round-trip.
+
+|g:simplecc_native_options| controls whether the options are set at all, and
+whether a value the buffer already has is replaced.
+
 ==============================================================================
 OPTIONS                                                     *simplecc-options*
 
@@ -300,6 +322,21 @@ g:simplecc_request_timeout       number  default: 30000
         Milliseconds before a request that carries a reply callback is
         answered with an error instead of waiting on a daemon that has
         wedged. Set to 0 to wait forever.
+
+                                          *g:simplecc_native_options*
+g:simplecc_native_options        number  default: 1
+        Point Vim's own extension points at the language server in buffers the
+        daemon serves — see |simplecc-native-options|.
+            0   never; 'omnifunc', 'tagfunc' and 'formatexpr' are left alone.
+            1   set each one only where the buffer has no value of its own, so
+                a filetype plugin that configured 'omnifunc' keeps it.
+            2   always, replacing whatever the filetype plugin chose.
+
+                                         *g:simplecc_tagfunc_timeout*
+g:simplecc_tagfunc_timeout       number  default: 1000
+        Milliseconds 'tagfunc' waits for the server. CTRL-] has to be answered
+        with a list, so this is the only place SimpleCC waits on the daemon;
+        running out of time falls back to the tags file rather than failing.
 
                                      *g:simplecc_resource_operations*
 g:simplecc_resource_operations   number  default: 1

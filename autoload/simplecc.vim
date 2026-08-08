@@ -30,6 +30,13 @@ var s_julia_environment: string = ''
 var s_log: list<string> = []
 # Servers the user declined to install this session (avoids re-prompting)
 var s_declined_installs: dict<bool> = {}
+# What each running server advertised:  server -> feature -> bool.  Populated
+# from the `serverStatus running` event; a daemon too old to send it leaves
+# this empty, which ServerSupports() reads as "assume yes" so nothing that
+# worked before starts refusing to run.
+var s_server_caps: dict<dict<any>> = {}
+# Re-entrancy guard for the one synchronous wait in the plugin ('tagfunc').
+var s_tagfunc_busy: bool = false
 
 # Diagnostics, keyed by resolved filesystem path and then by the server that
 # published them:  path -> server -> items.
@@ -771,6 +778,9 @@ def SendDidOpen(bufnr: number)
   # Register listener for incremental sync
   RegisterListener(bufnr)
   s_doc_changedticks[uri] = getbufvar(bufnr, 'changedtick')
+  # didOpen is the exact moment this buffer became one the daemon serves, so
+  # it is where <C-x><C-o>, <C-]> and gq start going through the server.
+  SetNativeOptions(bufnr)
 enddef
 
 def EnsureDocumentOpened(bufnr: number = 0)
@@ -2630,6 +2640,10 @@ def OnServerStatus(ev: dict<any>)
 
   if status ==# 'running'
     g:simplecc_status = server
+    # What this server actually offers.  The editor cannot ask a running
+    # server anything synchronously, so 'formatexpr' and 'tagfunc' decide from
+    # this whether to answer at all or hand the key back to Vim.
+    s_server_caps[server] = get(ev, 'capabilities', {})
   elseif status ==# 'notFound' && get(ev, 'installable', false)
     if g:simplecc_auto_install
       DoInstall(server)
@@ -2652,6 +2666,9 @@ def OnServerStatus(ev: dict<any>)
     echohl None
   elseif status ==# 'stopped'
     g:simplecc_status = ''
+    if has_key(s_server_caps, server)
+      remove(s_server_caps, server)
+    endif
     ScheduleServerRestart(server, get(ev, 'filetypes', []))
   endif
 enddef
@@ -5608,6 +5625,168 @@ export def OnWinScrolled()
   if g:simplecc_semantic_tokens && line('$') > g:simplecc_semtok_range_threshold
     RequestSemanticTokensDebounced()
   endif
+enddef
+
+# ═════════════════════════════════════════════════════════
+# Native extension points: 'omnifunc', 'tagfunc', 'formatexpr'
+# ═════════════════════════════════════════════════════════
+#
+# Everything here is already reachable through this plugin's own commands and
+# mappings, but <C-x><C-o>, <C-]> and gq are what a Vim user reaches for
+# without having read a README, and they are what the rest of Vim is built on:
+# the tag stack, 'completeopt', 'formatoptions', and every plugin that drives
+# completion through 'omnifunc'.
+#
+# Each hook falls back to what Vim would have done whenever it cannot do
+# better — daemon down, no server for the filetype, capability not advertised —
+# so a stopped daemon degrades to keyword completion, the tags file and
+# internal formatting rather than to a dead key.
+
+# Whether any running server advertised a feature. An empty capability table
+# means either no server has reported yet or the daemon predates the
+# capabilities field, and in both cases the honest answer is "try it".
+def ServerSupports(feature: string): bool
+  if empty(s_server_caps)
+    return true
+  endif
+  for caps in values(s_server_caps)
+    if empty(caps) || get(caps, feature, true)
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+# Point a buffer the daemon has just been told about at the hooks above.
+#   0  never
+#   1  only where the buffer has no value of its own (the default)
+#   2  always, replacing whatever a filetype plugin chose
+def SetNativeOptions(bnr: number)
+  var mode = g:simplecc_native_options
+  if mode <= 0
+    return
+  endif
+  for [option, value] in items({
+      omnifunc: 'simplecc#OmniFunc',
+      tagfunc: 'simplecc#TagFunc',
+      formatexpr: 'simplecc#FormatExpr()',
+      })
+    if mode >= 2 || getbufvar(bnr, '&' .. option, '') ==# ''
+      setbufvar(bnr, '&' .. option, value)
+    endif
+  endfor
+enddef
+
+# 'omnifunc': CTRL-X CTRL-O.
+export def OmniFunc(findstart: number, base: string): any
+  if findstart != 0
+    # Byte offset of the keyword run before the cursor — what Vim will replace.
+    # matchstr() rather than an index walk so a multi-byte identifier is not
+    # cut in half.
+    var before = strpart(getline('.'), 0, col('.') - 1)
+    return strlen(before) - strlen(matchstr(before, '\k*$'))
+  endif
+  if !s_initialized || BufFt() ==# '' || !ServerSupports('completion')
+    # An empty list leaves Vim's own fallbacks alone.
+    return []
+  endif
+  # The reply is asynchronous, so there is nothing to return yet: the request
+  # goes out here and OnCompletion() pops the menu through complete(), the
+  # same path the automatic trigger uses.
+  TriggerCompletionManual()
+  return []
+enddef
+
+# 'tagfunc': CTRL-], :tag, CTRL-W }.
+#
+# This is the one place the plugin waits on the daemon, because 'tagfunc' has
+# to return the list. The wait is bounded by g:simplecc_tagfunc_timeout and
+# every way out of it falls back to the tags file, so a wedged server costs a
+# second rather than the key.
+export def TagFunc(pattern: string, flags: string, info: dict<any>): any
+  # v:null means "do what you would have done without me".
+  if !s_initialized || BufFt() ==# '' || s_tagfunc_busy
+    return v:null
+  endif
+  if !ServerSupports('definition')
+    return v:null
+  endif
+  # A definition is a position, not a name. Only a tag command that started
+  # from the cursor ('c') describes one; `:tag Foo` typed by hand, a regexp
+  # pattern ('r') and insert-mode tag completion ('i') belong to the tags file.
+  if flags !~# 'c' || flags =~# '[ir]' || pattern !=# expand('<cword>')
+    return v:null
+  endif
+
+  var locations: list<any> = []
+  var pending = true
+  s_tagfunc_busy = true
+  try
+    # core#Request() and not SendWithCb(): the latter also runs the normal type
+    # dispatch, which for a definition reply means OnDefinition() jumping —
+    # and jumping out of 'tagfunc' is E1299 as well as wrong.
+    simplecc#core#Request({
+      type: 'textDocument/definition',
+      id: NextId(),
+      uri: BufUri(),
+      languageId: BufFt(),
+      line: line('.') - 1,
+      character: CursorUtf16(),
+      symbol: pattern,
+    }, (ev: dict<any>) => {
+      pending = false
+      locations = get(ev, 'locations', [])
+    }, max([50, g:simplecc_tagfunc_timeout]))
+
+    # sleep is what lets the channel callback run; :sleep and not a busy loop
+    # so the wait costs nothing.
+    var started = reltime()
+    while pending && reltimefloat(reltime(started)) * 1000 < g:simplecc_tagfunc_timeout
+      sleep 10m
+    endwhile
+  finally
+    s_tagfunc_busy = false
+  endtry
+  if pending
+    Log('tagfunc: no answer within the timeout, falling back to the tags file')
+    return v:null
+  endif
+
+  var entries: list<dict<string>> = []
+  for loc in locations
+    var fpath = UriToPath(get(loc, 'uri', ''))
+    if fpath ==# ''
+      continue
+    endif
+    add(entries, {
+      name: pattern,
+      filename: fpath,
+      # A line number rather than a search pattern: the server's answer is
+      # already exact, and re-searching for the name would find the wrong
+      # occurrence in a file that defines it more than once.
+      cmd: string(get(loc, 'line', 0) + 1),
+    })
+  endfor
+  # No definition is not the same as no answer: let the tags file try.
+  return empty(entries) ? v:null : entries
+enddef
+
+# 'formatexpr': gq, gw and the 'formatoptions' auto-format.
+export def FormatExpr(): number
+  # A non-zero return means "Vim, do it yourself".
+  if !s_initialized || BufFt() ==# '' || !ServerSupports('range_formatting')
+    return 1
+  endif
+  # Auto-formatting while typing — 'formatoptions' a/t, and the insert-mode
+  # wrap that passes the pending character in v:char — must never take a
+  # round-trip through a language server; it would reformat the paragraph
+  # under the cursor on every keystroke.
+  if v:char !=# '' || mode() =~# '^[iR]'
+    return 1
+  endif
+  var last = min([line('$'), v:lnum + max([1, v:count]) - 1])
+  Format(true, v:lnum, last)
+  return 0
 enddef
 
 # ═════════════════════════════════════════════════════════

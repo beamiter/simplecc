@@ -31,6 +31,15 @@ g:simplecc_request_timeout = get(g:, 'simplecc_request_timeout', 30000)
 # only the text half; the server is then told the whole edit was rejected, so a
 # refactor that moves files reports failure instead of half-applying.
 g:simplecc_resource_operations = get(g:, 'simplecc_resource_operations', 1)
+# Point Vim's own extension points at the language server in every buffer the
+# daemon serves: 'omnifunc' (<C-x><C-o>), 'tagfunc' (<C-]>, :tag) and
+# 'formatexpr' (gq). 0 never, 1 only where the buffer set none of its own
+# (the default), 2 always — replacing whatever a filetype plugin chose.
+g:simplecc_native_options  = get(g:, 'simplecc_native_options', 1)
+# Milliseconds 'tagfunc' waits for the server. It is the only synchronous wait
+# in the plugin, because CTRL-] has to be answered with a list; running out
+# falls back to the tags file.
+g:simplecc_tagfunc_timeout = get(g:, 'simplecc_tagfunc_timeout', 1000)
 g:simplecc_auto_complete   = get(g:, 'simplecc_auto_complete', 1)
 g:simplecc_change_delay    = get(g:, 'simplecc_change_delay', 120)
 g:simplecc_complete_delay  = get(g:, 'simplecc_complete_delay', 80)
