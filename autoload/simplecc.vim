@@ -3142,9 +3142,19 @@ export def Stop(restarting: bool = false)
   # the daemon has really exited.
   s_restart_pending = restarting
   if !IsRunning() || s_stopping
-    if !IsRunning() && restarting
-      s_restart_pending = false
-      Start()
+    if !IsRunning()
+      # The daemon is already gone, but the supervisor may have an automatic
+      # restart queued behind its backoff timer — which is exactly the state a
+      # user reaches for :SimpleCCStop in.  core#Stop() is the only thing that
+      # cancels that timer, and it no-ops safely with no job, so call it
+      # unconditionally or a manual stop is a no-op the daemon undoes.
+      simplecc#core#Stop()
+      if restarting
+        s_restart_pending = false
+        Start()
+      else
+        g:simplecc_status = ''
+      endif
     endif
     return
   endif

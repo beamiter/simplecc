@@ -16,6 +16,16 @@
 - 新增三个单元测试,直接喂入 `RangeDiagnostics()` 产生的那串 JSON,
   跨越 Vim 与守护进程的边界锁死这一类 bug。
 
+### `:SimpleCCStop` 会取消已排队的自动重启
+
+- 守护进程意外死亡后 core 会排一个退避重启定时器;此时 `:SimpleCCStop` 因为
+  `!IsRunning()` 提前返回,永远走不到唯一能取消该定时器的 `core#Stop()`,
+  于是守护进程照常复活。崩溃循环里退避会涨到 5000ms 上限,而那正是用户最
+  可能去按 `:SimpleCCStop` 的时刻。现在无论进程是否在跑都会调用
+  `core#Stop()`(无 job 时它本就安全空转),并把状态清空。
+- `test/daemon_restart.vim` 增加一段:连续崩溃把退避拉宽到 800ms,在窗口内
+  调用 `simplecc#Stop()`,断言两秒后守护进程仍然是停的。
+
 ### code action 与格式化支持范围
 
 - `:SimpleCCAction` 与 `:SimpleCCFormat` 加上 `-range`。选中若干行再调用时,

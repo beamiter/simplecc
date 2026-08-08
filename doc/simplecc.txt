@@ -129,7 +129,9 @@ Lifecycle and configuration ~
         Start and initialize the daemon.
 
 *:SimpleCCStop*
-        Shut down the daemon and language servers.
+        Shut down the daemon and language servers. Also cancels an automatic
+        restart that is already queued, so the daemon stays down when the
+        command is issued inside a crash-backoff window.
 
 *:SimpleCCRestart*
         Restart SimpleCC.

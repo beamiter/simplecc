@@ -79,6 +79,41 @@ call assert_equal(1, s:Wait("g:simplecc_status ==# 'ready'", 3000),
 
 call simplecc#Stop()
 call assert_equal(1, s:Wait("g:simplecc_status ==# ''", 3000))
+
+" ------------------------------------------- a manual stop cancels the restart ---
+
+" :SimpleCCStop used to return early whenever the daemon was not running, so it
+" never reached core#Stop() -- the only thing that cancels a queued backoff
+" restart. Typed during a crash loop, which is exactly when a user reaches for
+" it, the daemon came straight back and there was no way to hold it down short
+" of also setting g:simplecc_auto_restart = 0.
+"
+" The expected exit above reset the backoff, so crash repeatedly to widen the
+" window this test has to type into: 100ms, 200ms, 400ms, then 800ms.
+call simplecc#Start()
+for s:attempt in range(3)
+  call assert_equal(1, s:Wait("g:simplecc_status ==# 'ready'", 3000),
+        \ 'the daemon must be up before crash ' .. s:attempt)
+  SimpleCCReloadConfig
+  call assert_equal(1, s:Wait("g:simplecc_status !=# 'ready'", 2000))
+endfor
+call assert_equal(1, s:Wait("g:simplecc_status ==# 'ready'", 3000))
+SimpleCCReloadConfig
+call assert_equal(1, s:Wait("!simplecc#core#IsRunning()", 2000),
+      \ 'the daemon must be dead when the manual stop is issued')
+
+" Still inside the backoff window: the restart is queued but has not fired.
+call assert_false(simplecc#core#IsRunning(),
+      \ 'the queued restart fired before the stop -- window too narrow to test')
+call simplecc#Stop()
+
+" Longer than the 800ms backoff that was queued, with margin.
+sleep 2
+call assert_false(simplecc#core#IsRunning(),
+      \ ':SimpleCCStop must cancel a queued restart, not be undone by it')
+call assert_equal('', g:simplecc_status,
+      \ 'a stopped daemon must not keep reporting itself as restarting')
+
 call delete(s:daemon)
 
 if len(v:errors)
