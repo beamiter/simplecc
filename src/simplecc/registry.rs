@@ -152,10 +152,19 @@ impl Registry {
                 // server can answer at all: 'formatexpr' hands `gq` back to
                 // Vim when there is no range formatting, and :SimpleCCHealth
                 // reports what the server actually provides.
+                //
+                // The filetypes travel with it for the same reason one level
+                // up.  "Can this server answer" is only half the question, and
+                // the half the editor cannot work out for itself is "does any
+                // server serve *this buffer* at all": without it the editor
+                // claimed `gq` in a markdown buffer on the strength of a
+                // running rust-analyzer, and then had nowhere to send the
+                // range.  'stopped' has carried this list all along.
                 let status_event = serde_json::json!({
                     "type": "serverStatus",
                     "server": &name,
                     "status": "running",
+                    "filetypes": &cfg.filetypes,
                     "capabilities": client.editor_capabilities().await,
                 });
                 let _ = event_tx

@@ -301,6 +301,17 @@ advertised the capability, or 'tagfunc' was asked for something that is not
 the identifier under the cursor. Auto-formatting while typing ('formatoptions'
 "a" and "t") is always Vim's, never a round-trip.
 
+"The buffer has no server" is decided per filetype, from the filetype list the
+daemon reports with each running server — not from whether any server anywhere
+in the session happens to be up. A Rust session leaves gq alone in a Markdown
+buffer.
+
+A server usually finishes starting after the buffer that triggered it was
+opened, so the options are set when it reports running rather than when the
+buffer was read. If its server later stops, the options stay where they are and
+the hooks hand every key straight back to Vim, which is the same outcome as
+never having set them.
+
 |g:simplecc_native_options| controls whether the options are set at all, and
 whether a value the buffer already has is replaced.
 

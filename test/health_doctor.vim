@@ -114,6 +114,23 @@ call assert_equal(0, &modifiable, 'and is not editable')
 call assert_equal(1, getline(1) =~# '^SimpleCC health',
       \ 'with the report in it: ' .. getline(1))
 call assert_equal(1, line('$') > 15, 'the whole report, not a summary')
+
+" Re-running is the normal way to use a health check: you change something and
+" ask again. The second run used to abort with E95 on the buffer name, leaving
+" the freshly split, empty window behind and the report unwritten.
+let s:windows = winnr('$')
+let s:first = bufnr('%')
+let v:errmsg = ''
+call simplecc#Health()
+call assert_equal('', v:errmsg, ':SimpleCCHealth twice must not raise')
+call assert_equal(s:windows, winnr('$'),
+      \ 're-running must reuse the report window, not stack another one')
+call assert_equal(s:first, bufnr('%'), 'and reuse its buffer')
+call assert_equal(1, getline(1) =~# '^SimpleCC health',
+      \ 'the reused buffer holds the new report, not an empty scratch: '
+      \ .. getline(1))
+call assert_equal(1, line('$') > 15, 'the whole report again, not a remnant')
+call assert_equal(0, &modifiable, 'and is locked again afterwards')
 bwipeout!
 
 call delete(s:daemon)

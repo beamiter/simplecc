@@ -125,11 +125,27 @@ let g:simplecc_inlay_margin = 0
 call writefile([], s:trace)
 call s:Call('RequestInlayHints')
 let s:msg = s:Traced('textDocument/inlayHint')
+" endLine is exclusive -- the daemon turns it into an LSP range ending at
+" {line: endLine, character: 0}, which stops before that line's first character
+" -- so it has to be one past the last line wanted, the way the whole-document
+" request passed line('$'). Sending the index *of* the last visible line asked
+" for one line less than the viewport and lost every hint on its bottom line.
+"
 " `vim -es` has no window on a screen, so line('w$') can come out just below
 " line('w0'); the range is clamped so it never inverts.
-call assert_equal([line('w0') - 1, max([line('w0'), line('w$')]) - 1],
+call assert_equal([line('w0') - 1, max([line('w0'), min([line('$'), line('w$')])])],
       \ [s:msg.startLine, s:msg.endLine],
       \ 'g:simplecc_inlay_margin = 0 requests the viewport and nothing else')
+
+" The line that pays for an off-by-one here is the last one in the file, which
+" every file has and most files end on.
+normal! G
+redraw
+call writefile([], s:trace)
+call s:Call('RequestInlayHints')
+let s:msg = s:Traced('textDocument/inlayHint')
+call assert_equal(line('$'), s:msg.endLine,
+      \ 'the request must reach past the final line, not stop before it')
 let g:simplecc_inlay_margin = 100
 
 " Scrolling is what fetches the part that just became visible.

@@ -54,6 +54,11 @@ call writefile([
       \ '    *''"type":"initialize"''*)',
       \ '      printf ''{"type":"initialized","id":%s}\n'' "$id"',
       \ '      ;;',
+      \ '    *''"type":"textDocument/didOpen"''*)',
+      \ '      printf ''%s\n'' "$line" >> ' .. shellescape(s:trace),
+      \ '      printf ''{"type":"serverStatus","server":"rust-analyzer",' ..
+      \        '"status":"running","filetypes":["rust"],"capabilities":{}}\n''',
+      \ '      ;;',
       \ '    *''"type":"shutdown"''*)',
       \ '      printf ''{"type":"shutdown","id":%s}\n'' "$id"',
       \ '      exit 0',
@@ -167,6 +172,43 @@ call assert_equal('SomeoneElse', &l:omnifunc,
 call assert_equal('simplecc#TagFunc', &l:tagfunc,
       \ 'the options it did not set are still taken')
 
+" ------------------------------------------------- a filetype with no server ---
+
+" The hooks are per-buffer, and "is there a server" is a different question
+" from "can that server format a range". Consulting every running server made a
+" Rust session claim gq in a markdown buffer -- rust-analyzer advertises range
+" formatting, no server had ever heard of markdown -- and gq then reformatted
+" nothing at all, because there was nowhere to send the range.
+let s:prose = tempname() .. '.md'
+call writefile(['aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp'],
+      \ s:prose)
+execute 'edit! ' .. fnameescape(s:prose)
+setfiletype markdown
+call s:Wait('0', 100)
+
+call assert_equal('', &l:formatexpr,
+      \ 'a buffer no server serves must keep the formatexpr its ftplugin chose')
+call assert_equal('', &l:omnifunc, 'and its omnifunc')
+call assert_equal('', &l:tagfunc, 'and its tagfunc')
+
+let v:lnum = 1
+call assert_equal(1, s:Call('ServerSupports', 'range_formatting', 'markdown') ? 0 : 1,
+      \ 'no server serves markdown, whatever rust-analyzer advertises')
+call assert_equal(1, simplecc#FormatExpr(),
+      \ 'gq in an unserved buffer must hand the key back to Vim')
+
+" The observable consequence, not just the return value: gq has to wrap.
+setlocal textwidth=20
+normal! gqq
+call assert_equal(
+      \ ['aaa bbb ccc ddd eee', 'fff ggg hhh iii jjj', 'kkk lll mmm nnn ooo', 'ppp'],
+      \ getline(1, '$'),
+      \ 'gq must still reformat a paragraph in a filetype with no server')
+
+" A served filetype in the same session is unaffected by the above.
+call assert_equal(1, s:Call('ServerSupports', 'definition', 'rust') ? 1 : 0,
+      \ 'the rust buffers in this same session still reach their server')
+
 " With a dead daemon every hook has to hand the key straight back.
 call simplecc#Stop()
 call s:Wait("g:simplecc_status ==# ''", 2000)
@@ -196,6 +238,7 @@ call delete(s:daemon)
 call delete(s:trace)
 call delete(s:file)
 call delete(s:other)
+call delete(s:prose)
 call delete(s:target)
 
 if len(v:errors)

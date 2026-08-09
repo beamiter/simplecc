@@ -2,6 +2,28 @@
 
 ## Unreleased - 2026-08-05
 
+### 原生扩展点只接管真正有 server 的 buffer
+
+- `gq` 在没有 language server 的 filetype 里什么都不做了。`SendDidOpen()` 会给
+  每个有 filetype 的 buffer 装上 `'formatexpr'`,而 `ServerSupports()` 问的是
+  "session 里有没有任何 server 支持这个能力"——于是一个跑着 rust-analyzer 的
+  会话让 markdown buffer 里的 `gq` 也交给了 SimpleCC,`FormatExpr()` 返回 0
+  (告诉 Vim "我处理了"),请求却发给了一个从没听说过 markdown 的 daemon。
+  Vim 跳过了自己的换行,段落原样不动。`'tagfunc'` 同理,还会白等一个
+  `g:simplecc_tagfunc_timeout`。
+- daemon 的 `serverStatus running` 事件现在带上该 server 配置的 `filetypes`
+  (`stopped` 一直都带),Vim 侧据此按 filetype 判断"这个 buffer 到底有没有
+  server":`ServersFor(ft)` 决定要不要装这三个选项,`ServerSupports(feature, ft)`
+  只看服务该 filetype 的 server。doc 里"the buffer has no server"这句承诺
+  终于是真的了。
+- server 通常在触发它的 buffer 打开之后才就绪,所以 `running` 到达时会回头给
+  已加载的 buffer 补上选项。老 daemon 不发 `filetypes` 时行为不变。
+- inlay hint 的视口范围少要一行:`endLine` 是开区间(daemon 转成
+  `{line: endLine, character: 0}` 的 LSP range),传"最后一行的下标"会把该行
+  上的 hint 全部丢掉——包括每个文件的最后一行。
+- `:SimpleCCHealth` 连开两次会抛 E95 并留下一个空窗口:第二次的 `:file` 撞上
+  还开着的同名 buffer。现在复用那个窗口。
+
 ### 每个值得绑键的命令都有 `<Plug>` 目标
 
 - 44 个命令里只有 17 个有 `<Plug>` 目标。选区展开/收缩、文档高亮、签名帮助、

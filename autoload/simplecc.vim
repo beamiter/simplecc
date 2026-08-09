@@ -35,6 +35,12 @@ var s_declined_installs: dict<bool> = {}
 # this empty, which ServerSupports() reads as "assume yes" so nothing that
 # worked before starts refusing to run.
 var s_server_caps: dict<dict<any>> = {}
+# Which filetypes each running server was configured for:  server -> [ft].
+# Populated from the same `serverStatus running` event.  This is what decides
+# whether the buffer under the cursor has a server at all, which is a different
+# question from what that server can do, and the one the native 'omnifunc' /
+# 'tagfunc' / 'formatexpr' hooks have to answer before they claim a key.
+var s_server_filetypes: dict<list<string>> = {}
 # Re-entrancy guard for the one synchronous wait in the plugin ('tagfunc').
 var s_tagfunc_busy: bool = false
 # This plugin's own directory, resolved while the script is sourced because
@@ -2692,6 +2698,12 @@ def OnServerStatus(ev: dict<any>)
     # server anything synchronously, so 'formatexpr' and 'tagfunc' decide from
     # this whether to answer at all or hand the key back to Vim.
     s_server_caps[server] = get(ev, 'capabilities', {})
+    s_server_filetypes[server] = get(ev, 'filetypes', [])
+    # A buffer is usually opened before its server finishes starting, so the
+    # didOpen that ran first could not know whether this filetype had a server
+    # and left the native hooks alone.  Now that the answer exists, apply them
+    # to what is already loaded.
+    ApplyNativeOptionsForServed()
   elseif status ==# 'notFound' && get(ev, 'installable', false)
     if g:simplecc_auto_install
       DoInstall(server)
@@ -2717,6 +2729,13 @@ def OnServerStatus(ev: dict<any>)
     if has_key(s_server_caps, server)
       remove(s_server_caps, server)
     endif
+    if has_key(s_server_filetypes, server)
+      remove(s_server_filetypes, server)
+    endif
+    # The options themselves are left in place: with no server serving the
+    # filetype the hooks now hand every key straight back to Vim, which is the
+    # same outcome as never having set them, and re-deriving 'formatexpr' from
+    # the ftplugin after the fact is not something Vim offers.
     ScheduleServerRestart(server, get(ev, 'filetypes', []))
   endif
 enddef
@@ -3788,9 +3807,35 @@ export def Health()
   # longer than the message area, and it exists to be read, scrolled and
   # pasted into a bug report.
   var lines = HealthReport()
-  new
-  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
-  silent file [SimpleCC health]
+  # Running :SimpleCCHealth twice used to abort with E95 on the second run and
+  # leave the new, empty window behind, because the name was still taken by the
+  # report already on screen.  Reuse that window instead: a health report is a
+  # thing you re-run after changing something, and comparing it against the
+  # previous one is not worth a second window.
+  # Located by exact name rather than through bufnr(): that takes a regexp, and
+  # the brackets this name is made of are a character class.
+  const NAME = '[SimpleCC health]'
+  var existing = 0
+  for info in getbufinfo()
+    if fnamemodify(info.name, ':t') ==# NAME
+      existing = info.bufnr
+      break
+    endif
+  endfor
+  var winid = existing > 0 ? get(win_findbuf(existing), 0, 0) : 0
+  if winid > 0
+    win_gotoid(winid)
+  else
+    new
+    if existing > 0
+      # Hidden or listed elsewhere: the name is taken but nothing shows it.
+      execute 'silent! bwipeout' existing
+    endif
+    setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+    execute 'silent file' fnameescape(NAME)
+  endif
+  setlocal modifiable
+  silent deletebufline('%', 1, '$')
   setline(1, lines)
   setlocal nomodifiable nomodified
   normal! gg
@@ -4213,10 +4258,17 @@ def RequestInlayHints()
   # scrolling fetch the rest (OnWinScrolled re-requests).
   var margin = max([0, g:simplecc_inlay_margin])
   var top = max([0, line('w0') - 1 - margin])
+  # endLine is exclusive: the daemon turns it into an LSP range ending at
+  # {line: endLine, character: 0}, which stops before that line's first
+  # character.  It therefore has to be one past the last line wanted, the way
+  # the whole-document request used to pass line('$').  Passing the index *of*
+  # the last visible line silently dropped every hint on it, including the
+  # final line of every file.
+  #
   # A window that is not really on screen (`vim -es`, or a buffer loaded but
   # never displayed) can report line('w$') below line('w0'); an inverted range
   # is not something a language server should be asked to make sense of.
-  var bot = max([top, min([line('$') - 1, line('w$') - 1 + margin])])
+  var bot = max([top + 1, min([line('$'), line('w$') + margin])])
   # Record which buffer snapshot this request was issued for so the async
   # reply is never rendered into whatever buffer is current at reply time.
   s_inlay_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
@@ -5956,14 +6008,40 @@ enddef
 # so a stopped daemon degrades to keyword completion, the tags file and
 # internal formatting rather than to a dead key.
 
-# Whether any running server advertised a feature. An empty capability table
-# means either no server has reported yet or the daemon predates the
-# capabilities field, and in both cases the honest answer is "try it".
-def ServerSupports(feature: string): bool
-  if empty(s_server_caps)
-    return true
+# Which running servers were configured for a filetype.  A daemon too old to
+# send `filetypes` reports nothing here, and the honest answer then is "all of
+# them" — the same "assume yes" this file has always used for an absent
+# capability table, so an old daemon keeps working exactly as it did.
+def ServersFor(ft: string): list<string>
+  if ft ==# ''
+    return []
   endif
-  for caps in values(s_server_caps)
+  var known = filter(keys(s_server_filetypes),
+    (_, name) => !empty(s_server_filetypes[name]))
+  if empty(known)
+    return keys(s_server_caps)
+  endif
+  return filter(known, (_, name) => index(s_server_filetypes[name], ft) >= 0)
+enddef
+
+# Whether a server serving this filetype advertised a feature.
+#
+# The filetype is not a detail: `gq` used to consult every running server, so a
+# Rust session made 'formatexpr' claim the key in a markdown buffer and then
+# drop the range on the floor, because rust-analyzer advertised
+# range_formatting and no server had ever heard of markdown.  A feature is only
+# available here if some server actually serving *this* filetype offers it.
+#
+# An empty capability table for a server that does serve the filetype means the
+# daemon predates the capabilities field, and there the honest answer is still
+# "try it".
+def ServerSupports(feature: string, ft: string): bool
+  var servers = ServersFor(ft)
+  if empty(servers)
+    return false
+  endif
+  for name in servers
+    var caps = get(s_server_caps, name, {})
     if empty(caps) || get(caps, feature, true)
       return true
     endif
@@ -5975,9 +6053,17 @@ enddef
 #   0  never
 #   1  only where the buffer has no value of its own (the default)
 #   2  always, replacing whatever a filetype plugin chose
+#
+# Only buffers a server actually serves are touched.  Taking every buffer with
+# a filetype was how markdown, gitcommit and conf buffers ended up pointing
+# 'formatexpr' at a language server that had never heard of them, and mode 2
+# would additionally have thrown away the formatexpr their own ftplugin set.
 def SetNativeOptions(bnr: number)
   var mode = g:simplecc_native_options
   if mode <= 0
+    return
+  endif
+  if empty(ServersFor(getbufvar(bnr, '&filetype', '')))
     return
   endif
   for [option, value] in items({
@@ -5991,6 +6077,19 @@ def SetNativeOptions(bnr: number)
   endfor
 enddef
 
+# A server reports `running` after the buffers it serves were opened, so the
+# didOpen that ran first had no filetype map to consult.  Re-offer the options
+# to every loaded buffer; SetNativeOptions() is idempotent and skips filetypes
+# this server does not serve.
+def ApplyNativeOptionsForServed()
+  if g:simplecc_native_options <= 0
+    return
+  endif
+  for info in getbufinfo({bufloaded: 1})
+    SetNativeOptions(info.bufnr)
+  endfor
+enddef
+
 # 'omnifunc': CTRL-X CTRL-O.
 export def OmniFunc(findstart: number, base: string): any
   if findstart != 0
@@ -6000,7 +6099,7 @@ export def OmniFunc(findstart: number, base: string): any
     var before = strpart(getline('.'), 0, col('.') - 1)
     return strlen(before) - strlen(matchstr(before, '\k*$'))
   endif
-  if !s_initialized || BufFt() ==# '' || !ServerSupports('completion')
+  if !s_initialized || BufFt() ==# '' || !ServerSupports('completion', BufFt())
     # An empty list leaves Vim's own fallbacks alone.
     return []
   endif
@@ -6022,7 +6121,7 @@ export def TagFunc(pattern: string, flags: string, info: dict<any>): any
   if !s_initialized || BufFt() ==# '' || s_tagfunc_busy
     return v:null
   endif
-  if !ServerSupports('definition')
+  if !ServerSupports('definition', BufFt())
     return v:null
   endif
   # A definition is a position, not a name. Only a tag command that started
@@ -6088,7 +6187,7 @@ enddef
 # 'formatexpr': gq, gw and the 'formatoptions' auto-format.
 export def FormatExpr(): number
   # A non-zero return means "Vim, do it yourself".
-  if !s_initialized || BufFt() ==# '' || !ServerSupports('range_formatting')
+  if !s_initialized || BufFt() ==# '' || !ServerSupports('range_formatting', BufFt())
     return 1
   endif
   # Auto-formatting while typing — 'formatoptions' a/t, and the insert-mode
