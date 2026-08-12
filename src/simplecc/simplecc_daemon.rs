@@ -43,6 +43,10 @@ enum Request {
         root: String,
         #[serde(default)]
         config_path: Option<String>,
+        #[serde(default)]
+        remote: Option<config::RemoteConfig>,
+        #[serde(default)]
+        remote_config: Option<String>,
     },
     #[serde(rename = "shutdown")]
     Shutdown { id: u64 },
@@ -740,13 +744,18 @@ async fn handle_request(
             id,
             root,
             config_path,
+            remote,
+            remote_config,
         } => {
             // Configuration discovery walks the filesystem; keep it off the
             // async workers.
             let load_result = tokio::task::spawn_blocking({
                 let root = root.clone();
                 let config_path = config_path.clone();
-                move || config::Config::load_selected(&root, config_path.as_deref())
+                move || match remote_config.as_deref() {
+                    Some(content) => config::Config::parse(content),
+                    None => config::Config::load_selected(&root, config_path.as_deref()),
+                }
             })
             .await
             .unwrap_or_else(|error| {
@@ -776,17 +785,21 @@ async fn handle_request(
             }
             uri_ft.lock().await.clear();
 
-            let reg = Registry::new(cfg, root.clone(), out.clone());
+            let reg = Registry::new(cfg, root.clone(), remote.clone(), out.clone());
             *registry.write().await = Some(reg);
 
-            match WorkspaceWatcher::start(&root, registry.clone()) {
-                Ok(watcher) => {
-                    *workspace_watcher.lock().await = Some(watcher);
-                    eprintln!("[simplecc] watching workspace: {root}");
+            if remote.is_none() {
+                match WorkspaceWatcher::start(&root, registry.clone()) {
+                    Ok(watcher) => {
+                        *workspace_watcher.lock().await = Some(watcher);
+                        eprintln!("[simplecc] watching workspace: {root}");
+                    }
+                    Err(err) => {
+                        eprintln!("[simplecc] workspace watcher unavailable: {err}");
+                    }
                 }
-                Err(err) => {
-                    eprintln!("[simplecc] workspace watcher unavailable: {err}");
-                }
+            } else {
+                eprintln!("[simplecc] remote workspace: {root}");
             }
 
             send_event(&out, json!({"type": "initialized", "id": id}));
@@ -2059,6 +2072,8 @@ mod request_tests {
             id: 1,
             root: "/tmp/project".to_string(),
             config_path: None,
+            remote: None,
+            remote_config: None,
         };
         let shutdown = Request::Shutdown { id: 2 };
 

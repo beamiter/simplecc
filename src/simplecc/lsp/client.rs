@@ -140,10 +140,11 @@ impl LspClient {
         args: &[String],
         root_uri: &str,
         root_path: &str,
+        process_cwd: Option<&str>,
         init_options: Option<Value>,
         settings: Option<Value>,
     ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
-        let (transport, mut incoming) = LspTransport::spawn(cmd, args, Some(root_path))?;
+        let (transport, mut incoming) = LspTransport::spawn(cmd, args, process_cwd)?;
 
         let transport = Arc::new(Mutex::new(transport));
         let pending: Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>> =
@@ -2397,6 +2398,7 @@ mod lifecycle_tests {
                 &args,
                 "file:///tmp/",
                 "/tmp",
+                Some("/tmp"),
                 None,
                 None,
             ),

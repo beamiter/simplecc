@@ -5,6 +5,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct RemoteConfig {
+    pub kind: String,
+    pub target: String,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(rename = "languageServers", default)]
     pub language_servers: HashMap<String, ServerConfig>,
@@ -123,10 +130,14 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration {}", path.display()))?;
-        let config: Config = serde_json::from_str(&content)
+        let config = Self::parse(&content)
             .with_context(|| format!("invalid JSON in configuration {}", path.display()))?;
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn parse(content: &str) -> Result<Self> {
+        serde_json::from_str(content).context("invalid SimpleCC JSON")
     }
 
     fn validate(&self) -> Result<()> {

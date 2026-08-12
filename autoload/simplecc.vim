@@ -681,6 +681,10 @@ export def PathToUri(path: string): string
   if path ==# ''
     return 'file://'
   endif
+  var remote = get(g:, 'vimrc_remote_workspace', {})
+  if path =~# '^remote://' && type(remote) == v:t_dict && !empty(remote)
+    return 'file://' .. PercentEncodePath(substitute(path, '^remote://', '', ''))
+  endif
   var absolute = fnamemodify(path, ':p')
   if has('win32') || has('win64')
     absolute = substitute(absolute, '\\', '/', 'g')
@@ -707,6 +711,12 @@ export def UriToPath(uri: string): string
     encoded = '//' .. encoded
   endif
   var path = PercentDecodePath(encoded)
+  var remote = get(g:, 'vimrc_remote_workspace', {})
+  if type(remote) == v:t_dict && !empty(remote)
+        && (path ==# get(remote, 'root', '')
+          || stridx(path, get(remote, 'root', '') .. '/') == 0)
+    return 'remote://' .. path
+  endif
   if (has('win32') || has('win64')) && path =~# '^/\a:/'
     path = strpart(path, 1)
   endif
@@ -3404,12 +3414,18 @@ def SendInitialize()
   s_initialize_id = id
   s_initializing = true
   var configured = get(g:, 'simplecc_config_path', '')
-  var config_path = configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
+  # The SimpleCC daemon runs locally, but in remote mode its language servers
+  # and project config live remotely.  A local absolute config path would be
+  # meaningless to the remote side, so let it discover remote simplecc.json.
+  var config_path = !empty(get(g:, 'vimrc_remote_workspace', {})) ? ''
+        : configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
   Send({
     type: 'initialize',
     id: id,
     root: s_root,
     config_path: config_path,
+    remote: get(g:, 'vimrc_remote_workspace', v:null),
+    remote_config: get(g:, 'vimrc_remote_simplecc_config', v:null),
   })
 enddef
 
@@ -6207,6 +6223,10 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 def FindProjectRoot(): string
+  var remote = get(g:, 'vimrc_remote_workspace', {})
+  if bufname() =~# '^remote://' && type(remote) == v:t_dict && !empty(remote)
+    return get(remote, 'root', '')
+  endif
   var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'pyproject.toml',
                  'Project.toml', 'JuliaProject.toml',
                  'Makefile', 'CMakeLists.txt', '.hg', '.svn']

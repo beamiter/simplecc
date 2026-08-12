@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::config::Config;
+use super::config::{Config, RemoteConfig};
 use super::lsp::client::{LspClient, ServerEvent};
 
 /// EventTx sends events to the stdout writer for Vim.
@@ -18,16 +18,23 @@ pub struct Registry {
     /// filetype -> list of server_names (supports multi-server per filetype)
     ft_map: HashMap<String, Vec<String>>,
     root_dir: String,
+    remote: Option<RemoteConfig>,
     event_tx: EventTx,
 }
 
 impl Registry {
-    pub fn new(config: Config, root_dir: String, event_tx: EventTx) -> Self {
+    pub fn new(
+        config: Config,
+        root_dir: String,
+        remote: Option<RemoteConfig>,
+        event_tx: EventTx,
+    ) -> Self {
         Self {
             config,
             clients: HashMap::new(),
             ft_map: HashMap::new(),
             root_dir,
+            remote,
             event_tx,
         }
     }
@@ -64,30 +71,36 @@ impl Registry {
         }
 
         // Resolve command: PATH -> absolute path -> managed install
-        let resolved_cmd = match resolve_command(&name, &cfg.command).await {
-            Some(cmd) => cmd,
-            None => {
-                eprintln!("[simplecc] command not found: {}", cfg.command);
-                let installable = super::installer::is_known_server(&name);
-                let event = serde_json::json!({
-                    "type": "serverStatus",
-                    "server": name,
-                    "status": "notFound",
-                    "message": format!("command not found: {}", cfg.command),
-                    "installable": installable,
-                });
-                let _ = self
-                    .event_tx
-                    .send(serde_json::to_string(&event).unwrap())
-                    .await;
-                return Ok(None);
-            }
+        let resolved_cmd = match &self.remote {
+            Some(_) => cfg.command.clone(),
+            None => match resolve_command(&name, &cfg.command).await {
+                Some(cmd) => cmd,
+                None => {
+                    eprintln!("[simplecc] command not found: {}", cfg.command);
+                    let installable = super::installer::is_known_server(&name);
+                    let event = serde_json::json!({
+                        "type": "serverStatus",
+                        "server": name,
+                        "status": "notFound",
+                        "message": format!("command not found: {}", cfg.command),
+                        "installable": installable,
+                    });
+                    let _ = self
+                        .event_tx
+                        .send(serde_json::to_string(&event).unwrap())
+                        .await;
+                    return Ok(None);
+                }
+            },
         };
 
         // Server-specific readiness check: julia-lsp needs LanguageServer.jl in
         // the dedicated @simplecc environment. The `julia` binary resolves fine,
         // so without this check we'd spawn a process that immediately dies.
-        if name == "julia-lsp" && !super::installer::is_julia_lsp_installed() {
+        if self.remote.is_none()
+            && name == "julia-lsp"
+            && !super::installer::is_julia_lsp_installed()
+        {
             eprintln!("[simplecc] julia-lsp: LanguageServer.jl not found in @simplecc environment");
             let event = serde_json::json!({
                 "type": "serverStatus",
@@ -104,9 +117,17 @@ impl Registry {
         }
 
         // Start server
-        let server_root = server_root_path(&self.root_dir, document_uri, &cfg.root_patterns);
+        let server_root = if self.remote.is_some() {
+            PathBuf::from(&self.root_dir)
+        } else {
+            server_root_path(&self.root_dir, document_uri, &cfg.root_patterns)
+        };
         let root_uri = directory_uri(&server_root)?;
         let root_path = server_root.to_string_lossy().into_owned();
+        let (launch_cmd, launch_args, launch_cwd) = match &self.remote {
+            Some(remote) => remote_command(remote, &resolved_cmd, &cfg.args)?,
+            None => (resolved_cmd, cfg.args.clone(), Some(root_path.as_str())),
+        };
         let event_tx = self.event_tx.clone();
 
         // Notify starting
@@ -121,10 +142,11 @@ impl Registry {
 
         match LspClient::start(
             &name,
-            &resolved_cmd,
-            &cfg.args,
+            &launch_cmd,
+            &launch_args,
             &root_uri,
             &root_path,
+            launch_cwd,
             cfg.effective_initialization_options(&name),
             cfg.effective_settings(&name),
         )
@@ -302,6 +324,49 @@ impl Registry {
             names.retain(|name| live_names.contains(name));
             !names.is_empty()
         });
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_command<'a>(
+    remote: &RemoteConfig,
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>, Option<&'a str>)> {
+    let server = std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!("cd {} && exec {server}", shell_quote(&remote.root));
+    match remote.kind.as_str() {
+        "ssh" => Ok((
+            "ssh".to_string(),
+            vec![
+                "-T".to_string(),
+                remote.target.clone(),
+                "sh".to_string(),
+                "-lc".to_string(),
+                script,
+            ],
+            None,
+        )),
+        "docker" => Ok((
+            "docker".to_string(),
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                remote.target.clone(),
+                "sh".to_string(),
+                "-lc".to_string(),
+                script,
+            ],
+            None,
+        )),
+        kind => anyhow::bail!("unsupported remote transport: {kind}"),
     }
 }
 
