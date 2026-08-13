@@ -134,6 +134,7 @@ impl LspClient {
     /// Start a new LSP server and perform the initialize handshake.
     /// Returns (client, server_events_receiver) — the receiver is separate
     /// to avoid holding the client lock while waiting for server events.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         server_name: &str,
         cmd: &str,

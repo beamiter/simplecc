@@ -125,10 +125,11 @@ buffers and SSHFS projections are mapped to the same remote file URI, so
 completion, diagnostics, navigation, rename, and import resolution all use
 the server-side Python environment.
 
-The built-in Python configuration expects "pyright-langserver" on the remote
-PATH.  A simplecc.json in the remote project root can select another command
-or provide pyright settings.  Connection and disconnection restart SimpleCC
-automatically; disable that behavior with
+The built-in Python configuration looks for "pyright-langserver" in the
+remote project .venv/bin first, then on the remote PATH.  A simplecc.json in
+the remote project root can select another command or provide pyright
+settings.  Connection and disconnection restart SimpleCC automatically;
+disable that behavior with
 |g:simplecc_remote_auto_restart|.
 
 ==============================================================================

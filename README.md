@@ -159,8 +159,9 @@ references, rename, and imports therefore use the server's Python environment
 instead of the local machine.
 
 For the built-in Python configuration, `pyright-langserver` must be available
-on the remote `PATH`. Put `simplecc.json` in the remote project root when a
-different command or pyright settings are needed. Set
+in the remote project `.venv/bin` or on the remote `PATH`. Put `simplecc.json`
+in the remote project root when a different command or pyright settings are
+needed. Set
 `g:simplecc_remote_auto_restart = 0` to disable lifecycle synchronization.
 
 ## Commands

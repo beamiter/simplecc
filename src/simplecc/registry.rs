@@ -341,7 +341,10 @@ fn remote_command<'a>(
         .map(shell_quote)
         .collect::<Vec<_>>()
         .join(" ");
-    let script = format!("cd {} && exec {server}", shell_quote(&remote.root));
+    let script = format!(
+        "cd {} && if [ -d .venv/bin ]; then PATH=\"$PWD/.venv/bin:$PATH\"; export PATH; fi; exec {server}",
+        shell_quote(&remote.root)
+    );
     match remote.kind.as_str() {
         "ssh" => Ok((
             "ssh".to_string(),
@@ -349,8 +352,8 @@ fn remote_command<'a>(
                 "-T".to_string(),
                 remote.target.clone(),
                 "sh".to_string(),
-                "-lc".to_string(),
-                script,
+                "-c".to_string(),
+                shell_quote(&script),
             ],
             None,
         )),
@@ -361,7 +364,7 @@ fn remote_command<'a>(
                 "-i".to_string(),
                 remote.target.clone(),
                 "sh".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 script,
             ],
             None,
