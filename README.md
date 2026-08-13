@@ -163,6 +163,10 @@ server through `simpleremote-daemon exec`. Filesystem RPC and LSP processes
 then reuse the same OpenSSH ControlMaster connection. Direct SSH/Docker remains
 the compatibility fallback.
 
+Remote LSP initialization sends a null `processId`, as required when the
+editor daemon and language server run on different hosts. This prevents
+Pyright from monitoring an unrelated remote PID and exiting after startup.
+
 For the built-in Python configuration, `pyright-langserver` must be available
 in the remote project `.venv/bin` or on the remote `PATH`. Put `simplecc.json`
 in the remote project root when a different command or pyright settings are

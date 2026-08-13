@@ -144,6 +144,7 @@ impl LspClient {
         process_cwd: Option<&str>,
         init_options: Option<Value>,
         settings: Option<Value>,
+        client_process_id: Option<u32>,
     ) -> Result<(Self, mpsc::Receiver<ServerEvent>)> {
         let (transport, mut incoming) = LspTransport::spawn(cmd, args, process_cwd)?;
 
@@ -239,7 +240,10 @@ impl LspClient {
         };
 
         // Initialize
-        if let Err(error) = client.initialize(root_uri, root_path, init_options).await {
+        if let Err(error) = client
+            .initialize(root_uri, root_path, init_options, client_process_id)
+            .await
+        {
             client.mark_dead().await;
             if let Err(terminate_error) = client.terminate_transport().await {
                 eprintln!(
@@ -475,9 +479,12 @@ impl LspClient {
         root_uri: &str,
         root_path: &str,
         init_options: Option<Value>,
+        client_process_id: Option<u32>,
     ) -> Result<()> {
         let params = json!({
-            "processId": std::process::id(),
+            // A remote server must not monitor the local daemon PID.  LSP
+            // requires null when the client process is not on the same host.
+            "processId": client_process_id,
             "clientInfo": {
                 "name": "SimpleCC",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -2402,6 +2409,7 @@ mod lifecycle_tests {
                 Some("/tmp"),
                 None,
                 None,
+                Some(std::process::id()),
             ),
         )
         .await

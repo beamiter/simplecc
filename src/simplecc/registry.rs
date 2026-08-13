@@ -149,6 +149,7 @@ impl Registry {
             launch_cwd,
             cfg.effective_initialization_options(&name),
             cfg.effective_settings(&name),
+            self.remote.is_none().then_some(std::process::id()),
         )
         .await
         {
