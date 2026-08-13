@@ -148,6 +148,21 @@ List managed servers with <code>:SimpleCCServers</code>. Install one with
 <code>:SimpleCCInstall {name}</code>. Managed installs may contact GitHub,
 npm, the Go module proxy, or Julia package registries.
 
+## SimpleRemote Python workspaces
+
+SimpleCC automatically follows the active
+[SimpleRemote](https://github.com/beamiter/simpleremote) workspace. Connecting
+or disconnecting rebuilds the LSP workspace, starts the configured language
+server through SSH or Docker, and maps both virtual buffers and SSHFS paths to
+their real remote `file://` URIs. Completion, diagnostics, definitions,
+references, rename, and imports therefore use the server's Python environment
+instead of the local machine.
+
+For the built-in Python configuration, `pyright-langserver` must be available
+on the remote `PATH`. Put `simplecc.json` in the remote project root when a
+different command or pyright settings are needed. Set
+`g:simplecc_remote_auto_restart = 0` to disable lifecycle synchronization.
+
 ## Commands
 
 ### Lifecycle and configuration
@@ -282,6 +297,7 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | Option | Default | Purpose |
 | --- | ---: | --- |
 | <code>g:simplecc_auto_start</code> | 1 | Start on VimEnter |
+| <code>g:simplecc_remote_auto_restart</code> | 1 | Follow SimpleRemote connect/disconnect lifecycle |
 | <code>g:simplecc_no_default_maps</code> | 0 | Disable built-in mappings |
 | <code>g:simplecc_config_path</code> | empty | Explicit configuration path |
 | <code>g:simplecc_daemon_path</code> | empty | Explicit daemon executable |

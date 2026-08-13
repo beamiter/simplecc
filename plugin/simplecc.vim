@@ -17,6 +17,7 @@ endif
 
 # ─── Options ──────────────────────────────────────────────
 g:simplecc_auto_start      = get(g:, 'simplecc_auto_start', 1)
+g:simplecc_remote_auto_restart = get(g:, 'simplecc_remote_auto_restart', 1)
 g:simplecc_no_default_maps = get(g:, 'simplecc_no_default_maps', 0)
 g:simplecc_config_path     = get(g:, 'simplecc_config_path', '')
 g:simplecc_daemon_path     = get(g:, 'simplecc_daemon_path', '')
@@ -297,4 +298,5 @@ augroup simplecc
   autocmd CursorHold * simplecc#OnCursorHold()
   autocmd WinScrolled * simplecc#OnWinScrolled()
   autocmd InsertCharPre * simplecc#OnInsertCharPre()
+  autocmd User SimpleRemoteConnected,SimpleRemoteDisconnected if g:simplecc_remote_auto_restart | simplecc#OnRemoteWorkspace() | endif
 augroup END

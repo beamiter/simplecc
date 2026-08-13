@@ -117,6 +117,20 @@ without replacing the running configuration.
 
 See simplecc.json.example in the repository for complete examples.
 
+SimpleRemote Python workspaces ~
+
+When SimpleRemote is connected, SimpleCC starts language servers through its
+SSH or Docker transport and uses the remote project root.  Virtual remote
+buffers and SSHFS projections are mapped to the same remote file URI, so
+completion, diagnostics, navigation, rename, and import resolution all use
+the server-side Python environment.
+
+The built-in Python configuration expects "pyright-langserver" on the remote
+PATH.  A simplecc.json in the remote project root can select another command
+or provide pyright settings.  Connection and disconnection restart SimpleCC
+automatically; disable that behavior with
+|g:simplecc_remote_auto_restart|.
+
 ==============================================================================
 COMMANDS                                                   *simplecc-commands*
 
@@ -323,6 +337,12 @@ All options must be set before plugin/simplecc.vim is loaded.
                                                 *g:simplecc_auto_start*
 g:simplecc_auto_start            number  default: 1
         Start SimpleCC on VimEnter.
+
+                                 *g:simplecc_remote_auto_restart*
+g:simplecc_remote_auto_restart   number  default: 1
+        Restart the SimpleCC workspace when SimpleRemote connects or
+        disconnects, so language servers and URI mapping follow the active
+        remote Python workspace.
 
                                         *g:simplecc_no_default_maps*
 g:simplecc_no_default_maps       number  default: 0

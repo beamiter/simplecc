@@ -17,6 +17,7 @@ var s_initialized: bool = false
 var s_initializing: bool = false
 var s_stopping: bool = false
 var s_restart_pending: bool = false
+var s_remote_restart_timer: number = 0
 # Per-server crash-restart bookkeeping: name -> {count, last}
 var s_server_restarts: dict<any> = {}
 var s_initialize_id: number = 0
@@ -354,7 +355,7 @@ def OnBackendEvent(ev: dict<any>)
     Log('initialized')
     # Open all current buffers
     for b in getbufinfo({'buflisted': 1, 'bufloaded': 1})
-      if b.name !=# '' && filereadable(b.name)
+      if b.name !=# '' && (filereadable(b.name) || IsRemoteWorkspacePath(b.name))
         SendDidOpen(b.bufnr)
       endif
     endfor
@@ -677,13 +678,70 @@ def PercentDecodePath(encoded: string): string
   return DecodeUtf8Bytes(bytes)
 enddef
 
+def RemoteWorkspace(): dict<any>
+  var workspace = get(g:, 'simpleremote_workspace', {})
+  if type(workspace) != v:t_dict || empty(workspace)
+    workspace = get(g:, 'vimrc_remote_workspace', {})
+  endif
+  if type(workspace) != v:t_dict
+        || index(['ssh', 'docker'], get(workspace, 'kind', '')) < 0
+        || empty(get(workspace, 'target', ''))
+        || get(workspace, 'root', '') !~# '^/'
+    return {}
+  endif
+  return workspace
+enddef
+
+def UnderPath(path: string, root: string): bool
+  var normalized = substitute(root, '/\+$', '', '')
+  return path ==# normalized || stridx(path, normalized .. '/') == 0
+enddef
+
+def RemotePath(path: string, workspace: dict<any> = {}): string
+  var remote = empty(workspace) ? RemoteWorkspace() : workspace
+  if empty(remote) || empty(path)
+    return ''
+  endif
+  if path =~# '^remote://'
+    return substitute(path, '^remote://', '', '')
+  endif
+  var local_root = substitute(get(remote, 'local_root', ''), '/\+$', '', '')
+  if empty(local_root)
+    return ''
+  endif
+  var absolute = substitute(fnamemodify(path, ':p'), '/\+$', '', '')
+  if !UnderPath(absolute, local_root)
+    return ''
+  endif
+  var suffix = strpart(absolute, strlen(local_root))
+  var root = substitute(get(remote, 'root', ''), '/\+$', '', '')
+  return empty(root) ? (empty(suffix) ? '/' : suffix) : root .. suffix
+enddef
+
+def IsRemoteWorkspacePath(path: string): bool
+  return !empty(RemotePath(path))
+enddef
+
+def LocalPath(path: string, workspace: dict<any>): string
+  var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
+  if !UnderPath(path, empty(root) ? '/' : root)
+    return path
+  endif
+  var local_root = substitute(get(workspace, 'local_root', ''), '/\+$', '', '')
+  if empty(local_root)
+    return 'remote://' .. path
+  endif
+  var suffix = strpart(path, strlen(root))
+  return local_root .. suffix
+enddef
+
 export def PathToUri(path: string): string
   if path ==# ''
     return 'file://'
   endif
-  var remote = get(g:, 'vimrc_remote_workspace', {})
-  if path =~# '^remote://' && type(remote) == v:t_dict && !empty(remote)
-    return 'file://' .. PercentEncodePath(substitute(path, '^remote://', '', ''))
+  var remote_path = RemotePath(path)
+  if !empty(remote_path)
+    return 'file://' .. PercentEncodePath(remote_path)
   endif
   var absolute = fnamemodify(path, ':p')
   if has('win32') || has('win64')
@@ -711,11 +769,9 @@ export def UriToPath(uri: string): string
     encoded = '//' .. encoded
   endif
   var path = PercentDecodePath(encoded)
-  var remote = get(g:, 'vimrc_remote_workspace', {})
-  if type(remote) == v:t_dict && !empty(remote)
-        && (path ==# get(remote, 'root', '')
-          || stridx(path, get(remote, 'root', '') .. '/') == 0)
-    return 'remote://' .. path
+  var remote = RemoteWorkspace()
+  if !empty(remote) && UnderPath(path, get(remote, 'root', ''))
+    return LocalPath(path, remote)
   endif
   if (has('win32') || has('win64')) && path =~# '^/\a:/'
     path = strpart(path, 1)
@@ -3414,17 +3470,22 @@ def SendInitialize()
   s_initialize_id = id
   s_initializing = true
   var configured = get(g:, 'simplecc_config_path', '')
+  var remote = RemoteWorkspace()
   # The SimpleCC daemon runs locally, but in remote mode its language servers
   # and project config live remotely.  A local absolute config path would be
   # meaningless to the remote side, so let it discover remote simplecc.json.
-  var config_path = !empty(get(g:, 'vimrc_remote_workspace', {})) ? ''
+  var config_path = !empty(remote) ? ''
         : configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
   Send({
     type: 'initialize',
     id: id,
     root: s_root,
     config_path: config_path,
-    remote: get(g:, 'vimrc_remote_workspace', v:null),
+    remote: empty(remote) ? v:null : {
+      kind: remote.kind,
+      target: remote.target,
+      root: remote.root,
+    },
     remote_config: get(g:, 'vimrc_remote_simplecc_config', v:null),
   })
 enddef
@@ -3489,6 +3550,18 @@ export def Restart()
   else
     Start()
   endif
+enddef
+
+export def OnRemoteWorkspace()
+  if s_remote_restart_timer > 0
+    timer_stop(s_remote_restart_timer)
+  endif
+  s_remote_restart_timer = timer_start(0, (_) => {
+    s_remote_restart_timer = 0
+    if IsRunning() || s_initialized || s_initializing || g:simplecc_auto_start
+      Restart()
+    endif
+  })
 enddef
 
 # A one-shot readout of everything that has to be right for SimpleCC to work,
@@ -6223,8 +6296,8 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 def FindProjectRoot(): string
-  var remote = get(g:, 'vimrc_remote_workspace', {})
-  if bufname() =~# '^remote://' && type(remote) == v:t_dict && !empty(remote)
+  var remote = RemoteWorkspace()
+  if !empty(remote)
     return get(remote, 'root', '')
   endif
   var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'pyproject.toml',
