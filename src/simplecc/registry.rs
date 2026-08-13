@@ -336,6 +336,21 @@ fn remote_command<'a>(
     command: &str,
     args: &[String],
 ) -> Result<(String, Vec<String>, Option<&'a str>)> {
+    if let Some(runtime) = remote.runtime.as_deref().filter(|path| !path.is_empty()) {
+        let mut runtime_args = vec![
+            "exec".to_string(),
+            "--kind".to_string(),
+            remote.kind.clone(),
+            "--target".to_string(),
+            remote.target.clone(),
+            "--root".to_string(),
+            remote.root.clone(),
+            "--".to_string(),
+            command.to_string(),
+        ];
+        runtime_args.extend(args.iter().cloned());
+        return Ok((runtime.to_string(), runtime_args, None));
+    }
     let server = std::iter::once(command)
         .chain(args.iter().map(String::as_str))
         .map(shell_quote)

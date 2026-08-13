@@ -9,6 +9,8 @@ pub struct RemoteConfig {
     pub kind: String,
     pub target: String,
     pub root: String,
+    #[serde(default)]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

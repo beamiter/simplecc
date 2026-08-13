@@ -158,6 +158,11 @@ their real remote `file://` URIs. Completion, diagnostics, definitions,
 references, rename, and imports therefore use the server's Python environment
 instead of the local machine.
 
+When SimpleRemote's Rust runtime is installed, SimpleCC launches the language
+server through `simpleremote-daemon exec`. Filesystem RPC and LSP processes
+then reuse the same OpenSSH ControlMaster connection. Direct SSH/Docker remains
+the compatibility fallback.
+
 For the built-in Python configuration, `pyright-langserver` must be available
 in the remote project `.venv/bin` or on the remote `PATH`. Put `simplecc.json`
 in the remote project root when a different command or pyright settings are

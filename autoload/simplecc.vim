@@ -3683,6 +3683,7 @@ def SendInitialize()
       kind: remote.kind,
       target: remote.target,
       root: remote.root,
+      runtime: get(remote, 'runtime', ''),
     },
     remote_config: get(g:, 'vimrc_remote_simplecc_config', v:null),
     python_path: get(python, 'python', ''),

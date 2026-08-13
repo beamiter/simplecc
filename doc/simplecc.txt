@@ -125,6 +125,11 @@ buffers and SSHFS projections are mapped to the same remote file URI, so
 completion, diagnostics, navigation, rename, and import resolution all use
 the server-side Python environment.
 
+If SimpleRemote publishes its Rust runtime, SimpleCC launches the language
+server through simpleremote-daemon and shares the OpenSSH ControlMaster used
+by remote filesystem RPC.  Direct SSH/Docker remains the compatibility
+fallback when the runtime is not installed.
+
 The built-in Python configuration looks for "pyright-langserver" in the
 remote project .venv/bin first, then on the remote PATH.  A simplecc.json in
 the remote project root can select another command or provide pyright
