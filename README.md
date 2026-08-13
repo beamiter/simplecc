@@ -164,6 +164,14 @@ in the remote project root when a different command or pyright settings are
 needed. Set
 `g:simplecc_remote_auto_restart = 0` to disable lifecycle synchronization.
 
+Run `:SimpleCCPython` to discover project virtual environments, the active
+venv or conda environment, every environment reported by conda, and system
+Python. The picker shows the matching `pyright-langserver` or
+`basedpyright-langserver` and marks the current selection. Choices are stored
+per local project or per remote transport/target/root and immediately restart
+SimpleCC. Use `:SimpleCCPython auto` to restore automatic project/PATH
+behavior, or pass explicit interpreter and LSP paths for a custom setup.
+
 ## Commands
 
 ### Lifecycle and configuration
@@ -176,6 +184,7 @@ needed. Set
 | <code>:SimpleCCRestart</code> | Restart the daemon |
 | <code>:SimpleCCConfig</code> | Open or create the active configuration |
 | <code>:SimpleCCReloadConfig</code> | Validate configuration and hot-reload server settings |
+| <code>:SimpleCCPython [python] [lsp]</code> | Select and persist the project Python interpreter and LSP executable |
 | <code>:SimpleCCLog</code> | Open the in-memory SimpleCC log |
 | <code>:SimpleCCHealth</code> | Full report in a scratch buffer: environment, daemon age vs. plugin sources, config and server-command resolution, runtime, and why this buffer is or is not served |
 | <code>:SimpleCCInstall [server]</code> | Install a managed language server |
@@ -299,6 +308,9 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | --- | ---: | --- |
 | <code>g:simplecc_auto_start</code> | 1 | Start on VimEnter |
 | <code>g:simplecc_remote_auto_restart</code> | 1 | Follow SimpleRemote connect/disconnect lifecycle |
+| <code>g:simplecc_python_path</code> | empty | Default Python interpreter without a saved project selection |
+| <code>g:simplecc_python_lsp_path</code> | empty | Default Python LSP executable without a saved project selection |
+| <code>g:simplecc_python_state_file</code> | automatic | Per-project Python environment selection store |
 | <code>g:simplecc_no_default_maps</code> | 0 | Disable built-in mappings |
 | <code>g:simplecc_config_path</code> | empty | Explicit configuration path |
 | <code>g:simplecc_daemon_path</code> | empty | Explicit daemon executable |

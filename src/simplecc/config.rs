@@ -126,6 +126,31 @@ const JULIA_LSP_SCRIPT: &str = concat!(
 );
 
 impl Config {
+    pub fn apply_python_environment(&mut self, python_path: &str, lsp_path: &str) {
+        for server in self
+            .language_servers
+            .values_mut()
+            .filter(|server| server.filetypes.iter().any(|filetype| filetype == "python"))
+        {
+            if !lsp_path.is_empty() {
+                server.command = lsp_path.to_string();
+            }
+            if !python_path.is_empty() {
+                let mut settings = server.settings.take().unwrap_or_else(|| json!({}));
+                merge_json_value(
+                    &mut settings,
+                    json!({
+                        "python": {
+                            "pythonPath": python_path,
+                            "defaultInterpreterPath": python_path
+                        }
+                    }),
+                );
+                server.settings = Some(settings);
+            }
+        }
+    }
+
     /// Load config from a path.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)

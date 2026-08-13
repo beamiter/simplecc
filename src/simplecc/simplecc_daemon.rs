@@ -47,6 +47,10 @@ enum Request {
         remote: Option<config::RemoteConfig>,
         #[serde(default)]
         remote_config: Option<String>,
+        #[serde(default)]
+        python_path: String,
+        #[serde(default)]
+        python_lsp_path: String,
     },
     #[serde(rename = "shutdown")]
     Shutdown { id: u64 },
@@ -746,6 +750,8 @@ async fn handle_request(
             config_path,
             remote,
             remote_config,
+            python_path,
+            python_lsp_path,
         } => {
             // Configuration discovery walks the filesystem; keep it off the
             // async workers.
@@ -761,7 +767,7 @@ async fn handle_request(
             .unwrap_or_else(|error| {
                 Err(anyhow::anyhow!("configuration loader task failed: {error}"))
             });
-            let cfg = match load_result {
+            let mut cfg = match load_result {
                 Ok(config) => config,
                 Err(error) => {
                     send_event(
@@ -775,6 +781,8 @@ async fn handle_request(
                     return;
                 }
             };
+
+            cfg.apply_python_environment(&python_path, &python_lsp_path);
 
             // A successful reinitialization replaces one complete workspace;
             // stop its watcher and servers before publishing the new registry.
@@ -2074,6 +2082,8 @@ mod request_tests {
             config_path: None,
             remote: None,
             remote_config: None,
+            python_path: String::new(),
+            python_lsp_path: String::new(),
         };
         let shutdown = Request::Shutdown { id: 2 };
 

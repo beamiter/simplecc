@@ -132,6 +132,13 @@ settings.  Connection and disconnection restart SimpleCC automatically;
 disable that behavior with
 |g:simplecc_remote_auto_restart|.
 
+Use |:SimpleCCPython| to discover project .venv/venv environments, the active
+venv or conda environment, every environment reported by conda, and system
+Python.  Each row shows the interpreter and matching pyright or basedpyright
+executable.  The selection is stored per local project or per remote
+transport, target, and root.  It is applied to pyright configuration and
+restarts SimpleCC immediately.  Use ":SimpleCCPython auto" to clear it.
+
 ==============================================================================
 COMMANDS                                                   *simplecc-commands*
 
@@ -156,6 +163,11 @@ Lifecycle and configuration ~
 
 *:SimpleCCReloadConfig*
         Validate configuration and hot-reload settings on running servers.
+
+*:SimpleCCPython* [python] [lsp]
+        With no arguments, asynchronously discover and select a Python
+        interpreter and LSP executable for this project.  Explicit paths set
+        the pair directly; "auto" clears the saved project selection.
 
 *:SimpleCCLog*
         Open the in-memory SimpleCC log.
@@ -344,6 +356,20 @@ g:simplecc_remote_auto_restart   number  default: 1
         Restart the SimpleCC workspace when SimpleRemote connects or
         disconnects, so language servers and URI mapping follow the active
         remote Python workspace.
+
+                                      *g:simplecc_python_path*
+g:simplecc_python_path          string  default: empty
+        Default Python interpreter when the project has no saved selection.
+
+                                  *g:simplecc_python_lsp_path*
+g:simplecc_python_lsp_path      string  default: empty
+        Default pyright or basedpyright executable when the project has no
+        saved selection.
+
+                                *g:simplecc_python_state_file*
+g:simplecc_python_state_file    string  default: automatic
+        JSON file used for per-project Python selections.  The default is
+        Vim's state directory under simplecc/python-environments.json.
 
                                         *g:simplecc_no_default_maps*
 g:simplecc_no_default_maps       number  default: 0

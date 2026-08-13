@@ -18,6 +18,9 @@ var s_initializing: bool = false
 var s_stopping: bool = false
 var s_restart_pending: bool = false
 var s_remote_restart_timer: number = 0
+var s_python_discovery_job: any = v:null
+var s_python_discovery_lines: list<string> = []
+var s_python_choices: list<dict<any>> = []
 # Per-server crash-restart bookkeeping: name -> {count, last}
 var s_server_restarts: dict<any> = {}
 var s_initialize_id: number = 0
@@ -782,6 +785,200 @@ enddef
 def BufUri(buffer: number = 0): string
   var nr = buffer == 0 ? bufnr('%') : buffer
   return PathToUri(bufname(nr))
+enddef
+
+def PythonStateFile(): string
+  var configured = get(g:, 'simplecc_python_state_file', '')
+  if !empty(configured)
+    return fnamemodify(expand(configured), ':p')
+  endif
+  var context = get(g:, 'vimrc_context', {})
+  var state = type(context) == v:t_dict
+    ? get(context, 'vim_state', expand('~/.local/state/vim'))
+    : expand('~/.local/state/vim')
+  return state .. '/simplecc/python-environments.json'
+enddef
+
+def PythonWorkspaceKey(): string
+  var remote = RemoteWorkspace()
+  if !empty(remote)
+    return printf('%s:%s:%s', remote.kind, remote.target, remote.root)
+  endif
+  return 'local:' .. fnamemodify(FindProjectRoot(), ':p')
+enddef
+
+def PythonSelections(): dict<any>
+  var file = PythonStateFile()
+  if !filereadable(file)
+    return {}
+  endif
+  try
+    var decoded = json_decode(join(readfile(file), "\n"))
+    return type(decoded) == v:t_dict ? decoded : {}
+  catch
+    Log('invalid Python environment state: ' .. v:exception)
+    return {}
+  endtry
+enddef
+
+def PythonSelection(): dict<any>
+  var selected = get(PythonSelections(), PythonWorkspaceKey(), {})
+  if type(selected) == v:t_dict && !empty(selected)
+    return {
+      python: get(selected, 'python', ''),
+      lsp: get(selected, 'lsp', ''),
+    }
+  endif
+  return {
+    python: get(g:, 'simplecc_python_path', ''),
+    lsp: get(g:, 'simplecc_python_lsp_path', ''),
+  }
+enddef
+
+def SavePythonSelection(selection: dict<any>)
+  var selections = PythonSelections()
+  var key = PythonWorkspaceKey()
+  if empty(get(selection, 'python', '')) && empty(get(selection, 'lsp', ''))
+    if has_key(selections, key)
+      remove(selections, key)
+    endif
+  else
+    selections[key] = {
+      python: get(selection, 'python', ''),
+      lsp: get(selection, 'lsp', ''),
+    }
+  endif
+  var file = PythonStateFile()
+  var dir = fnamemodify(file, ':h')
+  try
+    mkdir(dir, 'p', 0o700)
+    setfperm(dir, 'rwx------')
+    writefile([json_encode(selections)], file)
+    setfperm(file, 'rw-------')
+  catch
+    echohl ErrorMsg
+    echom '[SimpleCC] cannot save Python environment: ' .. v:exception
+    echohl None
+    return
+  endtry
+  var label = empty(get(selection, 'python', ''))
+    ? 'automatic environment detection'
+    : get(selection, 'python', '')
+  echom '[SimpleCC] Python environment: ' .. label
+  Restart()
+enddef
+
+def PythonDiscoveryScript(root: string): string
+  return 'cd ' .. shellescape(root) .. ' 2>/dev/null || exit 1; '
+    .. 'global_lsp=""; '
+    .. 'for n in pyright-langserver basedpyright-langserver; do '
+    .. 'p=$(command -v "$n" 2>/dev/null); [ -n "$p" ] && global_lsp="$p" && break; done; '
+    .. 'emit() { p="$1"; tag="$2"; [ -x "$p" ] || return; d=${p%/*}; l=""; '
+    .. 'for n in pyright-langserver basedpyright-langserver; do '
+    .. '[ -x "$d/$n" ] && l="$d/$n" && break; done; '
+    .. '[ -z "$l" ] && l="$global_lsp"; '
+    .. 'printf "%s\t%s\t%s\n" "$tag" "$p" "$l"; }; '
+    .. 'emit "$PWD/.venv/bin/python" "project .venv"; '
+    .. 'emit "$PWD/venv/bin/python" "project venv"; '
+    .. 'emit "$PWD/.conda/bin/python" "project .conda"; '
+    .. 'emit "$PWD/env/bin/python" "project env"; '
+    .. '[ -n "$VIRTUAL_ENV" ] && emit "$VIRTUAL_ENV/bin/python" "active venv"; '
+    .. '[ -n "$CONDA_PREFIX" ] && emit "$CONDA_PREFIX/bin/python" "active conda"; '
+    .. 'if command -v conda >/dev/null 2>&1; then '
+    .. 'conda env list 2>/dev/null | awk ''NF && $1 !~ /^#/ {print $NF}'' | '
+    .. 'while IFS= read -r e; do emit "$e/bin/python" "conda:${e##*/}"; done; fi; '
+    .. 'for n in python3 python; do p=$(command -v "$n" 2>/dev/null); '
+    .. '[ -n "$p" ] && emit "$p" "system"; done'
+enddef
+
+def PythonDiscoveryOutput(_channel: any, message: string)
+  if !empty(message)
+    add(s_python_discovery_lines, message)
+  endif
+enddef
+
+def ChoosePythonEnvironment(_popup: number, result: number)
+  if result <= 0 || result > len(s_python_choices)
+    return
+  endif
+  SavePythonSelection(s_python_choices[result - 1])
+enddef
+
+def ShowPythonEnvironments(status: number)
+  var selected = PythonSelection()
+  var seen: dict<bool> = {}
+  s_python_choices = [{python: '', lsp: ''}]
+  var labels = [empty(selected.python) && empty(selected.lsp)
+    ? '* automatic (project/PATH)'
+    : '  automatic (project/PATH)']
+  for line in s_python_discovery_lines
+    var fields = split(line, "\t", 1)
+    if len(fields) < 2 || empty(fields[1]) || has_key(seen, fields[1])
+      continue
+    endif
+    seen[fields[1]] = true
+    var choice = {
+      python: fields[1],
+      lsp: len(fields) > 2 ? fields[2] : '',
+    }
+    add(s_python_choices, choice)
+    var active = choice.python ==# selected.python && choice.lsp ==# selected.lsp
+    var lsp = empty(choice.lsp) ? 'LSP: configured PATH' : fnamemodify(choice.lsp, ':t')
+    add(labels, printf('%s %-16s %s  [%s]', active ? '*' : ' ',
+      fields[0], choice.python, lsp))
+  endfor
+  if len(labels) == 1 && status != 0
+    add(labels, '  discovery failed; use :SimpleCCPython {python} [{lsp}]')
+    add(s_python_choices, {python: '', lsp: ''})
+  endif
+  popup_menu(labels, {
+    title: ' SimpleCC Python environment ',
+    callback: ChoosePythonEnvironment,
+    padding: [0, 1, 0, 1],
+    maxheight: 18,
+    minwidth: 72,
+  })
+enddef
+
+def PythonDiscoveryExit(_job: any, status: number)
+  s_python_discovery_job = v:null
+  ShowPythonEnvironments(status)
+enddef
+
+def DiscoverPythonEnvironments()
+  if type(s_python_discovery_job) == v:t_job
+        && job_status(s_python_discovery_job) ==# 'run'
+    echom '[SimpleCC] Python environment discovery is already running'
+    return
+  endif
+  var root = FindProjectRoot()
+  var script = PythonDiscoveryScript(root)
+  var argv: any = [&shell, &shellcmdflag, script]
+  if !empty(RemoteWorkspace()) && exists('*g:SimpleRemoteShellCommand') == 1
+    var Wrapper = function('g:SimpleRemoteShellCommand')
+    argv = call(Wrapper, [script])
+  endif
+  if type(argv) != v:t_list || empty(argv)
+    echohl ErrorMsg
+    echom '[SimpleCC] cannot build Python discovery command'
+    echohl None
+    return
+  endif
+  s_python_discovery_lines = []
+  s_python_discovery_job = job_start(argv, {
+    out_mode: 'nl',
+    err_mode: 'nl',
+    out_cb: PythonDiscoveryOutput,
+    exit_cb: PythonDiscoveryExit,
+  })
+  if job_status(s_python_discovery_job) ==# 'fail'
+    s_python_discovery_job = v:null
+    echohl ErrorMsg
+    echom '[SimpleCC] cannot start Python environment discovery'
+    echohl None
+  else
+    echom '[SimpleCC] discovering Python environments...'
+  endif
 enddef
 
 def CursorUtf16(): number
@@ -3471,6 +3668,7 @@ def SendInitialize()
   s_initializing = true
   var configured = get(g:, 'simplecc_config_path', '')
   var remote = RemoteWorkspace()
+  var python = PythonSelection()
   # The SimpleCC daemon runs locally, but in remote mode its language servers
   # and project config live remotely.  A local absolute config path would be
   # meaningless to the remote side, so let it discover remote simplecc.json.
@@ -3487,6 +3685,8 @@ def SendInitialize()
       root: remote.root,
     },
     remote_config: get(g:, 'vimrc_remote_simplecc_config', v:null),
+    python_path: get(python, 'python', ''),
+    python_lsp_path: get(python, 'lsp', ''),
   })
 enddef
 
@@ -3562,6 +3762,16 @@ export def OnRemoteWorkspace()
       Restart()
     endif
   })
+enddef
+
+export def PythonEnvironment(python: string = '', lsp: string = '')
+  if empty(python)
+    DiscoverPythonEnvironments()
+  elseif python ==# 'auto'
+    SavePythonSelection({python: '', lsp: ''})
+  else
+    SavePythonSelection({python: fnamemodify(python, ':p'), lsp: lsp})
+  endif
 enddef
 
 # A one-shot readout of everything that has to be right for SimpleCC to work,
