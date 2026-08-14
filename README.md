@@ -3,7 +3,8 @@
 SimpleCC is a Vim 9 Language Server Protocol client with a small Rust daemon
 and a native Vim9 UI. The daemon owns language-server processes and JSON-RPC
 traffic; Vim handles completion, diagnostics, navigation, edits, snippets,
-inlay hints, semantic tokens, code lenses, and hierarchy views.
+composable Tab expansion, inlay hints, semantic tokens, code lenses, and
+hierarchy views.
 
 ## Requirements
 

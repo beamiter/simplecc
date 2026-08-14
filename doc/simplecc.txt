@@ -307,8 +307,9 @@ with |g:simplecc_no_default_maps| does not mean typing command names in full:
 
 Insert-mode Tab, Shift-Tab, Up, Down, and Enter navigate or accept completion.
 Tab is context-aware and acts on the first of these that applies: advance the
-completion menu, jump to the next snippet placeholder, request completion when
-the cursor follows a word, or insert a literal tab. Shift-Tab moves backward the
+completion menu, jump to the next snippet placeholder, apply an optional
+|g:SimpleCCTabExpansionProvider| (or SimpleEdit Unicode expansion), request
+completion when the cursor follows a word, or insert a literal tab. Shift-Tab moves backward the
 same way. Because the menu takes priority, a popup that appears while editing a
 snippet placeholder is still selectable with Tab. An active snippet finishes
 automatically once the cursor leaves its line or moves before its start, so Tab
@@ -444,6 +445,14 @@ g:simplecc_resource_operations   number  default: 1
                                              *g:simplecc_auto_complete*
 g:simplecc_auto_complete         number  default: 1
         Enable automatic completion.
+
+                              *g:SimpleCCTabExpansionProvider*
+g:SimpleCCTabExpansionProvider  Funcref default: none
+        Optional zero-argument callback evaluated by the smart Insert-mode
+        Tab mapping after menu/snippet handling and before LSP completion. A
+        non-empty returned key sequence wins. When this callback is absent and
+        SimpleEdit is loaded, |simpleedit#UnicodeTab()| is discovered
+        automatically. The capitalized name is required by Vim9 Funcrefs.
 
                                               *g:simplecc_change_delay*
 g:simplecc_change_delay          number  default: 120

@@ -77,6 +77,19 @@ call assert_equal(s:zero_counts, simplecc#DiagCounts(99999))
 " Signature help auto-trigger is enabled by default and user-overridable.
 call assert_equal(1, g:simplecc_signature_help)
 
+" A composable Tab expansion runs before LSP completion.  SimpleEdit uses
+" this path for Julia LaTeX/emoji input without either plugin owning the map.
+def SimpleCCTestTabExpansion(): string
+  return repeat("\<BS>", 6) .. 'α'
+enddef
+let g:SimpleCCTabExpansionProvider = function('SimpleCCTestTabExpansion')
+enew!
+call setline(1, 'x = \alpha')
+call cursor(1, strlen(getline(1)) + 1)
+call assert_equal(repeat("\<BS>", 6) .. 'α', simplecc#SelectTabKey(),
+      \ 'insert expansion did not run before completion')
+unlet g:SimpleCCTabExpansionProvider
+
 " Restart is generation-aware: the replacement starts only after the old
 " daemon exits, and an old exit callback cannot reset the replacement state.
 let s:fake_daemon = tempname()

@@ -1540,8 +1540,9 @@ enddef
 # Smart <Tab>. Priority order, most specific first:
 #   1. Completion menu open  -> advance/select the next candidate.
 #   2. Active snippet         -> jump to the next placeholder.
-#   3. Completion context     -> request completion.
-#   4. Otherwise              -> insert a literal <Tab> (indentation).
+#   3. Insert expansion        -> let SimpleEdit expand Julia Unicode input.
+#   4. Completion context     -> request completion.
+#   5. Otherwise              -> insert a literal <Tab> (indentation).
 # Keeping the menu ahead of snippets means a popup that appears while editing a
 # placeholder is still selectable with <Tab>.
 export def SelectTabKey(): string
@@ -1552,6 +1553,19 @@ export def SelectTabKey(): string
     # Defer via <Cmd>: SnippetJump selects the placeholder with :normal, which
     # is forbidden under the textlock active while an <expr> mapping evaluates.
     return "\<Cmd>call simplecc#SnippetNext()\<CR>"
+  endif
+  # Keep this provider generic so SimpleCC remains independently installable.
+  # SimpleEdit is auto-discovered when present; tests and other simple* tools
+  # can provide the same zero-argument callback explicitly.
+  var Provider = get(g:, 'SimpleCCTabExpansionProvider', null_function)
+  var expansion = ''
+  if exists('g:SimpleCCTabExpansionProvider') && type(Provider) == v:t_func
+    expansion = Provider()
+  elseif exists('g:loaded_simpleedit')
+    expansion = simpleedit#UnicodeTab()
+  endif
+  if expansion !=# ''
+    return expansion
   endif
   var byte_col = col('.') - 1
   var before = strpart(getline('.'), 0, byte_col)
