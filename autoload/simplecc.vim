@@ -18,6 +18,23 @@ var s_initializing: bool = false
 var s_stopping: bool = false
 var s_restart_pending: bool = false
 var s_remote_restart_timer: number = 0
+# The SimpleRemote workspace generation (g:simpleremote_workspace.id) the last
+# `initialize` was sent for, or -1 for a local workspace.  SimpleRemote fires
+# Connected/Disconnected around every workspace switch; this is what turns
+# "an event arrived" into "the daemon is serving the wrong workspace" so the
+# language servers are only restarted when that is actually the case.
+var s_initialize_remote_id: number = -1
+# The Python interpreter/LSP pair the last remote `initialize` was sent with.
+# The runtime probe can finish after the daemon started; SimpleRemoteRuntimeReady
+# only restarts anything when it would change this.
+var s_initialize_python: dict<string> = {python: '', lsp: ''}
+# Callbacks waiting for a remote:// buffer to be filled by SimpleRemote's
+# asynchronous BufReadCmd:  bufnr (as string) -> [{Cb, timer}].  Dispatched by
+# OnRemoteBufferRead() when User SimpleRemoteBufferRead names that buffer;
+# the timer answers `false` when the read never completes, so a workspace edit
+# waiting on it still replies to its server.
+var s_remote_read_waiters: dict<list<dict<any>>> = {}
+const REMOTE_READ_TIMEOUT_MS = 30000
 var s_python_discovery_job: any = v:null
 var s_python_discovery_lines: list<string> = []
 var s_python_choices: list<dict<any>> = []
@@ -700,13 +717,23 @@ def UnderPath(path: string, root: string): bool
   return path ==# normalized || stridx(path, normalized .. '/') == 0
 enddef
 
+# The remote absolute path a Vim path stands for, or '' for a local file.
+#
+# A remote:// buffer name is a remote path whether or not a workspace is
+# connected: the buffer keeps existing after a disconnect, and every URI the
+# plugin derives from it (didClose, the diagnostics store) has to keep matching
+# what was sent while it was connected.  Whether such a buffer may be *sent*
+# anywhere is BufferServable()'s question, not this one's.
 def RemotePath(path: string, workspace: dict<any> = {}): string
-  var remote = empty(workspace) ? RemoteWorkspace() : workspace
-  if empty(remote) || empty(path)
+  if empty(path)
     return ''
   endif
   if path =~# '^remote://'
     return substitute(path, '^remote://', '', '')
+  endif
+  var remote = empty(workspace) ? RemoteWorkspace() : workspace
+  if empty(remote)
+    return ''
   endif
   var local_root = substitute(get(remote, 'local_root', ''), '/\+$', '', '')
   if empty(local_root)
@@ -725,10 +752,27 @@ def IsRemoteWorkspacePath(path: string): bool
   return !empty(RemotePath(path))
 enddef
 
+# The Vim path to open for a remote absolute path.
+#
+# Inside the workspace root a projection (sshfs, docker-bind, local-map) maps
+# it onto local_root; virtual mode opens it as a remote:// buffer.  Outside the
+# root — the stdlib, site-packages, ~/.cargo/registry, wherever a definition
+# lands — nothing is mounted even in projected modes, so the path is opened as
+# a remote:// buffer too: SimpleRemote's BufReadCmd reads any absolute path the
+# agent can read (only g:SimpleRemoteReadFile confines itself to the root),
+# which is what turns "go to definition" into a readable file instead of a
+# same-named local path that is empty or, worse, a different file.
 def LocalPath(path: string, workspace: dict<any>): string
+  if path !~# '^/'
+    # Not an absolute remote path — 'file://' with nothing after it, or a
+    # payload that already carried a plain path.  Callers tell an
+    # unresolvable URI from a resolvable one by the empty string, so this
+    # must not become 'remote://'.
+    return path
+  endif
   var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
   if !UnderPath(path, empty(root) ? '/' : root)
-    return path
+    return 'remote://' .. path
   endif
   var local_root = substitute(get(workspace, 'local_root', ''), '/\+$', '', '')
   if empty(local_root)
@@ -736,6 +780,30 @@ def LocalPath(path: string, workspace: dict<any>): string
   endif
   var suffix = strpart(path, strlen(root))
   return local_root .. suffix
+enddef
+
+# <root>/simplecc.json on the remote side, which is what SimpleRemote fetches
+# into g:vimrc_remote_simplecc_config.
+def RemoteConfigPath(workspace: dict<any>): string
+  var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
+  return root .. '/simplecc.json'
+enddef
+
+# Whether the buffer under the cursor is that remote configuration file: the
+# remote:// buffer for it in virtual mode, or the projected local file
+# (SimpleRemote stamps b:simpleremote_path on those on BufEnter).
+def IsRemoteConfigBuffer(): bool
+  var remote = RemoteWorkspace()
+  if empty(remote)
+    return false
+  endif
+  var info = get(b:, 'vimrc_remote', {})
+  var path = type(info) == v:t_dict ? get(info, 'path', '') : ''
+  if path ==# ''
+    path = get(b:, 'simpleremote_path', '')
+  endif
+  return type(path) == v:t_string && path !=# ''
+    && path ==# RemoteConfigPath(remote)
 enddef
 
 export def PathToUri(path: string): string
@@ -773,7 +841,9 @@ export def UriToPath(uri: string): string
   endif
   var path = PercentDecodePath(encoded)
   var remote = RemoteWorkspace()
-  if !empty(remote) && UnderPath(path, get(remote, 'root', ''))
+  if !empty(remote)
+    # Every file:// URI a remote server sends names a file on the remote
+    # host, inside the workspace or not.
     return LocalPath(path, remote)
   endif
   if (has('win32') || has('win64')) && path =~# '^/\a:/'
@@ -784,7 +854,132 @@ enddef
 
 def BufUri(buffer: number = 0): string
   var nr = buffer == 0 ? bufnr('%') : buffer
+  # SimpleRemote records the remote path a virtual buffer was read from in
+  # b:vimrc_remote; it is the truth even while the buffer name lags behind a
+  # rename made in the remote tree.
+  var info = getbufvar(nr, 'vimrc_remote', {})
+  if type(info) == v:t_dict && get(info, 'path', '') =~# '^/'
+    return 'file://' .. PercentEncodePath(info.path)
+  endif
   return PathToUri(bufname(nr))
+enddef
+
+# Whether the daemon may hear about this buffer at all.
+#
+# Special buffers (quickfix, terminals, prompts, help) never had a file behind
+# them; 'acwrite' is allowed because that is what SimpleRemote's remote://
+# buffers are.  A remote:// buffer is only sent while a workspace is connected
+# and while the buffer belongs to *that* connection: after a disconnect its
+# URI would reach the local servers, and after a reconnect to another host a
+# buffer still holding the previous host's file would be replayed to the new
+# one.  SimpleRemote stamps b:vimrc_remote.generation with the connection id
+# when it fills the buffer, so a buffer whose read has not completed yet is
+# skipped as well and picked up by OnRemoteBufferRead() when it has.
+def BufferServable(buffer: number = 0): bool
+  var nr = buffer == 0 ? bufnr('%') : buffer
+  var buftype = getbufvar(nr, '&buftype', '')
+  if buftype !=# '' && buftype !=# 'acwrite'
+    return false
+  endif
+  if bufname(nr) !~# '^remote://'
+    return true
+  endif
+  var remote = RemoteWorkspace()
+  if empty(remote)
+    return false
+  endif
+  var info = getbufvar(nr, 'vimrc_remote', {})
+  return type(info) == v:t_dict
+    && get(info, 'generation', -1) == get(remote, 'id', -2)
+enddef
+
+# A remote:// buffer whose contents SimpleRemote has not delivered yet: the
+# read is in flight (b:vimrc_remote_read names the pending request), or the
+# buffer was never filled at all.
+def RemoteBufferUnread(bnr: number): bool
+  if bufname(bnr) !~# '^remote://'
+    return false
+  endif
+  var pending = getbufvar(bnr, 'vimrc_remote_read', {})
+  if type(pending) == v:t_dict && !empty(pending)
+    return true
+  endif
+  var info = getbufvar(bnr, 'vimrc_remote', {})
+  return type(info) != v:t_dict || empty(info)
+enddef
+
+# A remote:// buffer whose read is in flight right now.
+def RemoteReadPending(bnr: number): bool
+  if bufname(bnr) !~# '^remote://'
+    return false
+  endif
+  var pending = getbufvar(bnr, 'vimrc_remote_read', {})
+  return type(pending) == v:t_dict && !empty(pending)
+enddef
+
+# Run Cb(true) once SimpleRemote reports the buffer filled (User
+# SimpleRemoteBufferRead with this bufnr), or Cb(false) when that never comes.
+def WaitRemoteBufferRead(bnr: number, Cb: func(bool))
+  var key = string(bnr)
+  if !has_key(s_remote_read_waiters, key)
+    s_remote_read_waiters[key] = []
+  endif
+  var waiter = {Cb: Cb, timer: 0}
+  waiter.timer = timer_start(REMOTE_READ_TIMEOUT_MS, (_) => {
+    if has_key(s_remote_read_waiters, key)
+      filter(s_remote_read_waiters[key], (_, w) => w isnot waiter)
+      if empty(s_remote_read_waiters[key])
+        remove(s_remote_read_waiters, key)
+      endif
+    endif
+    Cb(false)
+  })
+  add(s_remote_read_waiters[key], waiter)
+enddef
+
+def DispatchRemoteBufferRead(bnr: number)
+  var key = string(bnr)
+  if !has_key(s_remote_read_waiters, key)
+    return
+  endif
+  var waiters = remove(s_remote_read_waiters, key)
+  for waiter in waiters
+    if waiter.timer > 0
+      timer_stop(waiter.timer)
+    endif
+    var Cb: func(bool) = waiter.Cb
+    Cb(true)
+  endfor
+enddef
+
+# Put the cursor at an LSP position in a remote:// buffer once its contents
+# have arrived.  Returns false when the buffer is already readable (or is not
+# a remote buffer), in which case the caller positions the cursor itself.
+#
+# Right after `:edit remote:///…` the buffer holds one empty line while
+# SimpleRemote's BufReadCmd fetches the file, so cursor() would clamp every
+# definition, reference and showDocument jump to 1:1.
+def DeferRemoteCursor(bnr: number, lnum: number, character: number): bool
+  if !RemoteBufferUnread(bnr)
+    return false
+  endif
+  var winid = win_getid()
+  WaitRemoteBufferRead(bnr, (ok: bool) => {
+    if ok
+      PlaceDeferredCursor(winid, bnr, lnum, character)
+    endif
+  })
+  return true
+enddef
+
+def PlaceDeferredCursor(winid: number, bnr: number, lnum: number,
+    character: number)
+  var target = winid > 0 && winbufnr(winid) == bnr ? winid : bufwinid(bnr)
+  if target <= 0
+    return
+  endif
+  var col = Utf16LineColumn(get(getbufline(bnr, lnum), 0, ''), character)
+  win_execute(target, printf('call cursor(%d, %d) | normal! zz', lnum, col))
 enddef
 
 def PythonStateFile(): string
@@ -833,6 +1028,32 @@ def PythonSelection(): dict<any>
     python: get(g:, 'simplecc_python_path', ''),
     lsp: get(g:, 'simplecc_python_lsp_path', ''),
   }
+enddef
+
+# What `initialize` sends as the Python interpreter and language server: the
+# user's :SimpleCCPython choice, or, in a remote workspace that has none, what
+# SimpleRemote's runtime probe found on the host — the interpreter and
+# pyright/basedpyright that the same PATH prelude the language servers are
+# launched with resolves to.  {} probe (not run yet) leaves both empty, and
+# OnRemoteRuntimeReady() revisits the choice when the probe lands.
+def EffectivePythonSelection(remote: dict<any>): dict<string>
+  var selected = PythonSelection()
+  var python: string = get(selected, 'python', '')
+  var lsp: string = get(selected, 'lsp', '')
+  if !empty(remote) && python ==# '' && lsp ==# ''
+    var probe = get(remote, 'probe', {})
+    if type(probe) == v:t_dict
+      python = get(probe, 'python', '')
+      lsp = get(probe, 'python_lsp', '')
+      if type(python) != v:t_string
+        python = ''
+      endif
+      if type(lsp) != v:t_string
+        lsp = ''
+      endif
+    endif
+  endif
+  return {python: python, lsp: lsp}
 enddef
 
 def SavePythonSelection(selection: dict<any>)
@@ -1014,8 +1235,15 @@ def PathLine(path: string, lnum: number): string
 enddef
 
 def UriUtf16Column(uri: string, lnum: number, utf16_offset: number): number
-  var path = UriToPath(uri)
-  return Utf16LineColumn(PathLine(path, lnum), utf16_offset)
+  var line_text = PathLine(UriToPath(uri), lnum)
+  # A remote:// file that SimpleRemote has not delivered yet has no line to
+  # measure the UTF-16 offset against, so the offset itself is the estimate
+  # (the same fallback DiagnosticQfItem uses).  The offset also travels in
+  # the quickfix item's user_data, and QfEnter() replaces the estimate with
+  # the real byte column once the contents arrive.
+  return line_text ==# ''
+    ? utf16_offset + 1
+    : Utf16LineColumn(line_text, utf16_offset)
 enddef
 
 def BufFt(bufnr: number = 0): string
@@ -1042,6 +1270,11 @@ def SendDidOpen(bufnr: number)
   Log(printf('SendDidOpen: uri=%s, ft=%s', uri, ft))
   if ft ==# '' || uri ==# 'file://'
     Log(printf('SendDidOpen: empty ft or uri, ft=%s, uri=%s', ft, uri))
+    return
+  endif
+  if !BufferServable(bufnr)
+    Log(printf('SendDidOpen: buffer %d is not servable (buftype=%s, name=%s)',
+      bufnr, getbufvar(bufnr, '&buftype', ''), bufname(bufnr)))
     return
   endif
   var text = join(getbufline(bufnr, 1, '$'), "\n") .. "\n"
@@ -1191,6 +1424,10 @@ export def OnBufOpen()
     Log(printf('OnBufOpen: empty ft or bufname, ft=%s, name=%s', ft, bufname('%')))
     return
   endif
+  if !BufferServable()
+    Log(printf('OnBufOpen: not servable, name=%s', bufname('%')))
+    return
+  endif
   var uri = BufUri()
   # Avoid sending duplicate didOpen for the same document
   if has_key(s_doc_versions, uri)
@@ -1205,6 +1442,7 @@ enddef
 
 export def OnBufEnter()
   if !s_initialized || BufFt() ==# '' || BufUri() ==# 'file://'
+        || !BufferServable()
     return
   endif
   # Inlay hints are pull-based. Re-requesting on buffer entry also makes live
@@ -1218,7 +1456,7 @@ export def OnBufSave()
     return
   endif
   var uri = BufUri()
-  if uri ==# 'file://'
+  if uri ==# 'file://' || !BufferServable()
     return
   endif
   # didChange has to reach the server before the didSave that claims to be the
@@ -1226,7 +1464,15 @@ export def OnBufSave()
   FlushDidChange(bufnr('%'))
   var text = join(getline(1, '$'), "\n") .. "\n"
   Send({type: 'textDocument/didSave', id: NextId(), uri: uri, text: text})
-  if IsActiveConfigBuffer()
+  if IsRemoteConfigBuffer()
+    # The remote simplecc.json was just written back.  SimpleRemote owns the
+    # copy in g:vimrc_remote_simplecc_config: ask it to fetch the file again,
+    # and it answers with User SimpleRemoteConfigChanged, which is where the
+    # daemon gets the new configuration (OnRemoteConfigChanged).
+    if exists('*g:VimrcRemoteReloadConfig') == 1
+      call('g:VimrcRemoteReloadConfig', [])
+    endif
+  elseif IsActiveConfigBuffer()
     ReloadConfiguration()
   endif
   RequestInlayHintsDebounced()
@@ -2706,6 +2952,7 @@ def DiagnosticQfItem(fpath: string, item: dict<any>): dict<any>
         : Utf16LineColumn(line_text, get(item, 'character', 0)),
     text: DiagnosticText(item),
     type: DiagnosticType(get(item, 'severity', 3)),
+    user_data: {character: get(item, 'character', 0)},
   }
 enddef
 
@@ -3148,8 +3395,10 @@ def OnShowDocument(ev: dict<any>)
   var selection = get(ev, 'selection', v:null)
   if type(selection) == v:t_dict
     var lnum = get(selection, 'line', 0) + 1
-    var col = Utf16ToByteOffset(getline(lnum), get(selection, 'character', 0)) + 1
-    cursor(lnum, col)
+    var character = get(selection, 'character', 0)
+    if !DeferRemoteCursor(bufnr('%'), lnum, character)
+      cursor(lnum, Utf16ToByteOffset(getline(lnum), character) + 1)
+    endif
   endif
 enddef
 
@@ -3191,95 +3440,155 @@ def WorkspaceOperations(edit: dict<any>): list<dict<any>>
     (_, file_edit) => extend({kind: 'edit'}, file_edit))
 enddef
 
+# A workspace edit is applied as a continuation loop rather than a plain
+# for-loop because two of its steps can be asynchronous in a remote workspace:
+# a text edit for a remote:// file that has no buffer yet has to wait for
+# SimpleRemote to fill the buffer (its BufReadCmd is asynchronous, so the
+# edits would otherwise land in a one-line empty buffer and be discarded when
+# the real contents arrive), and create/rename/delete run on the remote host
+# through g:SimpleRemoteExecute().  The server that asked is answered exactly
+# once, in FinishApplyEdit(), whichever path the loop took.
 def OnApplyEdit(ev: dict<any>)
-  var applied = true
-  var failure = ''
-  var total_edits = 0
-  var file_count = 0
-  var resource_count = 0
-
+  var state = {ev: ev, operations: [], index: 0, applied: true, failure: '',
+    total_edits: 0, file_count: 0, resource_count: 0}
   var edit = get(ev, 'edit', {})
   if type(edit) != v:t_dict
-    applied = false
-    failure = 'invalid workspace edit payload'
-  else
-    for operation in WorkspaceOperations(edit)
-      var kind = get(operation, 'kind', 'edit')
-      var uri = get(operation, 'uri', '')
-      var fpath = UriToPath(uri)
-      if fpath ==# ''
-        # bufnr('') would resolve to the current buffer and silently apply
-        # the server's edits to whatever the user is looking at.
-        applied = false
-        failure = 'workspace edit for an unresolvable URI: ' .. uri
-        break
-      endif
+    state.applied = false
+    state.failure = 'invalid workspace edit payload'
+    FinishApplyEdit(state)
+    return
+  endif
+  state.operations = WorkspaceOperations(edit)
+  ApplyNextOperation(state)
+enddef
 
-      if kind !=# 'edit'
-        if !g:simplecc_resource_operations
-          applied = false
-          failure = printf('%s of %s refused: g:simplecc_resource_operations is 0', kind, fpath)
-          break
-        endif
-        var problem = ApplyResourceOperation(kind, fpath, operation)
-        if problem !=# ''
-          applied = false
-          failure = problem
-          break
-        endif
-        resource_count += 1
-        continue
-      endif
+def FailApplyEdit(state: dict<any>, failure: string)
+  state.applied = false
+  state.failure = failure
+enddef
 
-      var edits = get(operation, 'edits', [])
-      var bnr = BufnrForPath(fpath)
-
-      # Loading can still abort (unreadable file, swap prompts, autocmd
-      # errors); the try block guarantees the server receives its applyEdit
-      # answer below either way.
-      try
-        if bnr <= 0
-          # bufadd()+bufload() and not :edit — :edit drags the user's window to
-          # whichever file the refactor touched last, and fails outright with
-          # E37 when the current buffer already carries edits from this very
-          # workspace edit.
-          bnr = bufadd(fpath)
-          bufload(bnr)
-        endif
-
-        if bnr > 0
-          ApplyTextEdits(bnr, edits)
-          total_edits += len(edits)
-          file_count += 1
-        else
-          applied = false
-          failure = 'could not open a buffer for ' .. fpath
-        endif
-      catch
-        applied = false
-        failure = printf('failed to apply edits to %s: %s', fpath, v:exception)
-      endtry
-      # The remaining operations are ordered against this one, so stop rather
-      # than move a file whose contents were never rewritten.
-      if !applied
-        break
-      endif
-    endfor
-
-    if applied && (file_count > 0 || resource_count > 0)
-      var resources = resource_count == 0
-        ? ''
-        : printf(' and %d file operation%s', resource_count, resource_count == 1 ? '' : 's')
-      echo printf('Applied %d edits across %d files%s', total_edits, file_count, resources)
-    elseif !applied
-      echohl ErrorMsg
-      echom '[SimpleCC] ' .. failure
-      echohl None
+def ApplyNextOperation(state: dict<any>)
+  while state.applied && state.index < len(state.operations)
+    var operation = state.operations[state.index]
+    state.index += 1
+    var kind = get(operation, 'kind', 'edit')
+    var uri = get(operation, 'uri', '')
+    var fpath = UriToPath(uri)
+    if fpath ==# ''
+      # bufnr('') would resolve to the current buffer and silently apply
+      # the server's edits to whatever the user is looking at.
+      FailApplyEdit(state, 'workspace edit for an unresolvable URI: ' .. uri)
+      break
     endif
+
+    if kind !=# 'edit'
+      if !g:simplecc_resource_operations
+        FailApplyEdit(state, printf('%s of %s refused: g:simplecc_resource_operations is 0', kind, fpath))
+        break
+      endif
+      if fpath =~# '^remote://'
+        # Runs on the remote host; the loop resumes from the callback.
+        ApplyRemoteResourceOperation(kind, fpath, operation, (problem: string) => {
+          if problem !=# ''
+            FailApplyEdit(state, problem)
+          else
+            state.resource_count += 1
+          endif
+          ApplyNextOperation(state)
+        })
+        return
+      endif
+      var problem = ApplyResourceOperation(kind, fpath, operation)
+      if problem !=# ''
+        FailApplyEdit(state, problem)
+        break
+      endif
+      state.resource_count += 1
+      continue
+    endif
+
+    var edits = get(operation, 'edits', [])
+    var bnr = BufnrForPath(fpath)
+
+    # Loading can still abort (unreadable file, swap prompts, autocmd
+    # errors); the try block guarantees the server receives its applyEdit
+    # answer either way.
+    try
+      if bnr <= 0
+        # bufadd()+bufload() and not :edit — :edit drags the user's window to
+        # whichever file the refactor touched last, and fails outright with
+        # E37 when the current buffer already carries edits from this very
+        # workspace edit.
+        bnr = bufadd(fpath)
+        bufload(bnr)
+      endif
+    catch
+      FailApplyEdit(state, printf('failed to load %s: %s', fpath, v:exception))
+      break
+    endtry
+    if bnr <= 0
+      FailApplyEdit(state, 'could not open a buffer for ' .. fpath)
+      break
+    endif
+
+    if RemoteReadPending(bnr)
+      # SimpleRemote is still fetching the file; edit it once it is here.
+      var target = bnr
+      var pending_edits = edits
+      WaitRemoteBufferRead(bnr, (ok: bool) => {
+        if ok
+          ApplyEditsToBuffer(state, target, fpath, pending_edits)
+        else
+          FailApplyEdit(state, 'timed out waiting for the contents of ' .. fpath)
+        endif
+        ApplyNextOperation(state)
+      })
+      return
+    endif
+    if RemoteBufferUnread(bnr)
+      # No read in flight and nothing was ever read: not connected, or the
+      # read failed.  Editing the empty placeholder would corrupt the file
+      # the moment it is written.
+      FailApplyEdit(state, 'remote file could not be read: ' .. fpath)
+      break
+    endif
+    ApplyEditsToBuffer(state, bnr, fpath, edits)
+    # The remaining operations are ordered against this one, so stop rather
+    # than move a file whose contents were never rewritten.
+  endwhile
+  FinishApplyEdit(state)
+enddef
+
+def ApplyEditsToBuffer(state: dict<any>, bnr: number, fpath: string,
+    edits: list<dict<any>>)
+  try
+    ApplyTextEdits(bnr, edits)
+    state.total_edits += len(edits)
+    state.file_count += 1
+  catch
+    FailApplyEdit(state, printf('failed to apply edits to %s: %s', fpath, v:exception))
+  endtry
+enddef
+
+def FinishApplyEdit(state: dict<any>)
+  var applied: bool = state.applied
+  var failure: string = state.failure
+  if applied && (state.file_count > 0 || state.resource_count > 0)
+    var resources = state.resource_count == 0
+      ? ''
+      : printf(' and %d file operation%s', state.resource_count,
+          state.resource_count == 1 ? '' : 's')
+    echo printf('Applied %d edits across %d files%s', state.total_edits,
+      state.file_count, resources)
+  elseif !applied
+    echohl ErrorMsg
+    echom '[SimpleCC] ' .. failure
+    echohl None
   endif
 
   # A server-initiated workspace/applyEdit is still waiting on its actual
   # outcome; requestId is absent for editor-initiated edits (rename, actions).
+  var ev: dict<any> = state.ev
   var server = get(ev, 'server', '')
   if server !=# '' && has_key(ev, 'requestId')
     var result: dict<any> = {applied: applied}
@@ -3452,6 +3761,161 @@ def ApplyResourceOperation(kind: string, fpath: string, operation: dict<any>): s
   return 'unknown workspace edit operation: ' .. kind
 enddef
 
+# The remote-host counterpart of ApplyResourceOperation() for a remote://
+# path: the same create/rename/delete semantics, run as a shell command in
+# the workspace through g:SimpleRemoteExecute() (SimpleRemote's persistent
+# agent connection).  Done(problem) is called once with '' on success.
+#
+# The scripts print a one-word reason and exit non-zero for every refusal, so
+# a real failure of mkdir/mv/rm — its stderr comes back as the output — is
+# told apart from "the target already exists".
+def ApplyRemoteResourceOperation(kind: string, fpath: string,
+    operation: dict<any>, Done: func(string))
+  if exists('*g:SimpleRemoteExecute') != 1
+    Done(printf('%s of %s needs SimpleRemote''s g:SimpleRemoteExecute()', kind, fpath))
+    return
+  endif
+  var path = RemotePath(fpath)
+  var overwrite = get(operation, 'overwrite', false) ? true : false
+  var quoted = shellescape(path)
+  var parent = shellescape(fnamemodify(path, ':h'))
+
+  if kind ==# 'create'
+    var script = printf('if [ -d %s ]; then echo directory; exit 3; fi; '
+      .. 'if [ -e %s ] && [ %d -eq 0 ]; then echo exists; exit 0; fi; '
+      .. 'mkdir -p %s && : > %s',
+      quoted, quoted, overwrite ? 1 : 0, parent, quoted)
+    RemoteExecute(script, (ok: bool, output: string) => {
+      var reason = trim(output)
+      if !ok
+        Done(reason ==# 'directory'
+          ? 'create refused, a directory is in the way: ' .. fpath
+          : printf('could not create %s: %s', fpath, reason))
+        return
+      endif
+      if reason !=# 'exists'
+        # A buffer already holding the old contents would write them straight
+        # back; :edit! re-runs SimpleRemote's read.
+        var stale = BufnrForPath(fpath)
+        if stale > 0 && !getbufvar(stale, '&modified')
+          for win in win_findbuf(stale)
+            win_execute(win, 'silent! edit!')
+          endfor
+        endif
+      endif
+      Done('')
+    })
+    return
+  endif
+
+  if kind ==# 'rename'
+    var new_path = UriToPath(get(operation, 'new_uri', ''))
+    if new_path ==# ''
+      Done('rename of ' .. fpath .. ' has an unresolvable target URI')
+      return
+    endif
+    if new_path !~# '^remote://'
+      Done(printf('rename of %s to a non-remote target %s refused', fpath, new_path))
+      return
+    endif
+    var new_remote = RemotePath(new_path)
+    var ignore_if_exists = get(operation, 'ignore_if_exists', false) ? true : false
+    var script = printf('if [ ! -e %s ]; then echo missing; exit 3; fi; '
+      .. 'if [ -e %s ] && [ %d -eq 0 ]; then echo exists; exit 4; fi; '
+      .. 'mkdir -p %s && mv -f %s %s',
+      quoted, shellescape(new_remote), overwrite ? 1 : 0,
+      shellescape(fnamemodify(new_remote, ':h')), quoted, shellescape(new_remote))
+    var bnr = BufnrForPath(fpath)
+    var Move = () => RemoteExecute(script, (ok: bool, output: string) => {
+      var reason = trim(output)
+      if !ok
+        if reason ==# 'exists' && ignore_if_exists
+          Done('')
+        elseif reason ==# 'exists'
+          Done('rename refused, target exists: ' .. new_path)
+        elseif reason ==# 'missing'
+          Done('rename source does not exist: ' .. fpath)
+        else
+          Done(printf('could not rename %s to %s: %s', fpath, new_path, reason))
+        endif
+        return
+      endif
+      RetargetBuffer(bnr, new_path)
+      Done('')
+    })
+    if bnr > 0 && getbufvar(bnr, '&modified')
+      # A rename moves what is on the host, so unsaved changes would be left
+      # behind in a buffer pointing at a path that no longer exists.  A
+      # remote:// buffer cannot be written with :write from here (its
+      # BufWriteCmd is asynchronous), so the text goes through the API.
+      if exists('*g:SimpleRemoteWriteFile') != 1
+        Done('could not save unsaved changes before renaming ' .. fpath)
+        return
+      endif
+      var text = join(getbufline(bnr, 1, '$'), "\n") .. "\n"
+      call('g:SimpleRemoteWriteFile', [path, text, (ok: any, result: any) => {
+        if !ok
+          Done(printf('could not save unsaved changes before renaming %s: %s',
+            fpath, string(result)))
+          return
+        endif
+        setbufvar(bnr, '&modified', 0)
+        Move()
+      }])
+      return
+    endif
+    Move()
+    return
+  endif
+
+  if kind ==# 'delete'
+    var recursive = get(operation, 'recursive', false) ? true : false
+    var ignore_if_not_exists = get(operation, 'ignore_if_not_exists', false) ? true : false
+    var script = printf('if [ ! -e %s ]; then echo missing; exit 3; fi; '
+      .. 'if [ -d %s ]; then '
+      .. 'if [ %d -eq 1 ]; then rm -rf %s; '
+      .. 'elif [ -n "$(ls -A %s)" ]; then echo notempty; exit 5; '
+      .. 'else rmdir %s; fi; '
+      .. 'else rm -f %s; fi',
+      quoted, quoted, recursive ? 1 : 0, quoted, quoted, quoted, quoted)
+    RemoteExecute(script, (ok: bool, output: string) => {
+      var reason = trim(output)
+      if !ok
+        if reason ==# 'missing' && ignore_if_not_exists
+          Done('')
+        elseif reason ==# 'missing'
+          Done('delete target does not exist: ' .. fpath)
+        elseif reason ==# 'notempty'
+          Done('delete refused, directory is not empty: ' .. fpath)
+        else
+          Done(printf('could not delete %s: %s', fpath, reason))
+        endif
+        return
+      endif
+      var bnr = BufnrForPath(fpath)
+      if bnr > 0
+        # BufUnload runs OnBufClose, so the server hears about the didClose.
+        try
+          execute 'bwipeout! ' .. bnr
+        catch
+        endtry
+      endif
+      Done('')
+    })
+    return
+  endif
+
+  Done('unknown workspace edit operation: ' .. kind)
+enddef
+
+# g:SimpleRemoteExecute() with its (ok, output) callback, through call() so
+# the plugin compiles and loads without SimpleRemote on the runtimepath.
+def RemoteExecute(script: string, Cb: func(bool, string))
+  call('g:SimpleRemoteExecute', [script, (ok: any, output: any) => {
+    Cb(ok ? true : false, type(output) == v:t_string ? output : string(output))
+  }])
+enddef
+
 export def ApplyTextEdits(bufnr: number, edits: list<dict<any>>)
   # Sort edits in reverse order to avoid offset issues
   var sorted = sort(copy(edits), (a, b) => {
@@ -3523,10 +3987,18 @@ def PushNavigationOrigin()
   endtry
 enddef
 
-def JumpToFilePosition(fpath: string, lnum: number, col: number)
+# `character` is the LSP UTF-16 column, kept next to the byte column so a
+# jump into a remote:// buffer that is still being read can place the cursor
+# properly once the text is there (the byte column was computed against a
+# line that did not exist yet).  -1 means "unknown; derive it from col".
+def JumpToFilePosition(fpath: string, lnum: number, col: number,
+    character: number = -1)
   PushNavigationOrigin()
   if fpath !=# expand('%:p')
     execute 'edit ' .. fnameescape(fpath)
+  endif
+  if DeferRemoteCursor(bufnr('%'), lnum, character >= 0 ? character : max([0, col - 1]))
+    return
   endif
   cursor(lnum, col > 0 ? col : 1)
   normal! zz
@@ -3542,13 +4014,27 @@ def JumpToLocation(loc: dict<any>, context: dict<any> = {})
 
   var uri = get(loc, 'uri', '')
   var lnum = get(loc, 'line', 0) + 1
+  var character = get(loc, 'character', 0)
   var fpath = UriToPath(uri)
   PushNavigationOrigin()
   if fpath !=# expand('%:p')
     execute 'edit ' .. fnameescape(fpath)
   endif
-  cursor(lnum, Utf16LineColumn(getline(lnum), get(loc, 'character', 0)))
+  if DeferRemoteCursor(bufnr('%'), lnum, character)
+    return
+  endif
+  cursor(lnum, Utf16LineColumn(getline(lnum), character))
   normal! zz
+enddef
+
+# The LSP column travels in the quickfix item's user_data so QfEnter() can
+# hand it to JumpToFilePosition() for a deferred remote jump.
+def QfCharacter(item: dict<any>): number
+  var data = get(item, 'user_data', {})
+  if type(data) == v:t_dict && type(get(data, 'character', '')) == v:t_number
+    return data.character
+  endif
+  return -1
 enddef
 
 def LocationsToQuickfix(locs: list<dict<any>>, title: string,
@@ -3563,6 +4049,7 @@ def LocationsToQuickfix(locs: list<dict<any>>, title: string,
       col: UriUtf16Column(uri, get(loc, 'line', 0) + 1,
           get(loc, 'character', 0)),
       text: title,
+      user_data: {character: get(loc, 'character', 0)},
     })
   endfor
 
@@ -3619,7 +4106,7 @@ export def QfEnter()
     return
   endif
   JumpToFilePosition(fnamemodify(fname, ':p'), get(item, 'lnum', 1),
-      get(item, 'col', 1))
+      get(item, 'col', 1), QfCharacter(item))
 enddef
 
 export def QfEnterMulti()
@@ -3652,12 +4139,16 @@ export def QfEnterMulti()
     var fname = bufname(it.bufnr)
     if first
       JumpToFilePosition(fnamemodify(fname, ':p'), it.lnum,
-          it.col > 0 ? it.col : 1)
+          it.col > 0 ? it.col : 1, QfCharacter(it))
       first = false
     else
       execute 'split ' .. fnameescape(fname)
-      cursor(it.lnum, it.col > 0 ? it.col : 1)
-      normal! zz
+      var character = QfCharacter(it)
+      if !DeferRemoteCursor(bufnr('%'), it.lnum,
+          character >= 0 ? character : max([0, it.col - 1]))
+        cursor(it.lnum, it.col > 0 ? it.col : 1)
+        normal! zz
+      endif
     endif
   endfor
 enddef
@@ -3672,7 +4163,11 @@ enddef
 def SendInitialize()
   s_root = FindProjectRoot()
   s_julia_environment = ''
-  if filereadable(s_root .. '/JuliaProject.toml') || filereadable(s_root .. '/Project.toml')
+  var remote = RemoteWorkspace()
+  # A remote root is a path on the other host; testing it locally would at
+  # best find an unrelated project of the same name.
+  if empty(remote) && (filereadable(s_root .. '/JuliaProject.toml')
+      || filereadable(s_root .. '/Project.toml'))
     s_julia_environment = s_root
   endif
   Log('project root: ' .. s_root)
@@ -3680,9 +4175,10 @@ def SendInitialize()
   var id = NextId()
   s_initialize_id = id
   s_initializing = true
+  s_initialize_remote_id = get(remote, 'id', -1)
   var configured = get(g:, 'simplecc_config_path', '')
-  var remote = RemoteWorkspace()
-  var python = PythonSelection()
+  var python = EffectivePythonSelection(remote)
+  s_initialize_python = python
   # The SimpleCC daemon runs locally, but in remote mode its language servers
   # and project config live remotely.  A local absolute config path would be
   # meaningless to the remote side, so let it discover remote simplecc.json.
@@ -3699,7 +4195,8 @@ def SendInitialize()
       root: remote.root,
       runtime: get(remote, 'runtime', ''),
     },
-    remote_config: get(g:, 'vimrc_remote_simplecc_config', v:null),
+    remote_config: empty(remote) ? v:null
+      : get(g:, 'vimrc_remote_simplecc_config', v:null),
     python_path: get(python, 'python', ''),
     python_lsp_path: get(python, 'lsp', ''),
   })
@@ -3767,7 +4264,44 @@ export def Restart()
   endif
 enddef
 
+# ═════════════════════════════════════════════════════════
+# SimpleRemote workspaces
+# ═════════════════════════════════════════════════════════
+#
+# SimpleCC is the single owner of its lifecycle in a remote workspace:
+# SimpleRemote only publishes g:simpleremote_workspace and fires events, and
+# the handlers below decide what, if anything, to do.  Every one of them is
+# registered unconditionally in plugin/simplecc.vim and reads its payload from
+# g:simpleremote_event, so the plugin behaves identically without SimpleRemote.
+
+# User SimpleRemoteConnected / SimpleRemoteDisconnected: point the daemon at
+# the workspace that is now active — a full restart, since every language
+# server has to be launched on the other side of the connection (or back
+# here).  Two things keep that from happening more often than needed:
+#
+# - Disconnected with reason 'reconnect' is the first half of a workspace
+#   switch; Connected follows.  Restarting the local servers in between only
+#   to restart the remote ones a moment later is skipped, and the daemon keeps
+#   serving the previous workspace until the new one is announced.
+# - Connected for the workspace generation the daemon was already initialized
+#   for (a manual :SimpleCCRestart raced the event, or the event fires twice)
+#   is a no-op.
 export def OnRemoteWorkspace()
+  var event = get(g:, 'simpleremote_event', {})
+  if type(event) != v:t_dict
+    event = {}
+  endif
+  var name = get(event, 'event', '')
+  if name ==# 'SimpleRemoteDisconnected' && get(event, 'reason', '') ==# 'reconnect'
+    Log('remote workspace is being replaced; waiting for the next connection')
+    return
+  endif
+  var target = get(RemoteWorkspace(), 'id', -1)
+  if target == s_initialize_remote_id && (s_initialized || s_initializing)
+        && IsRunning()
+    Log(printf('remote workspace %d is already being served', target))
+    return
+  endif
   if s_remote_restart_timer > 0
     timer_stop(s_remote_restart_timer)
   endif
@@ -3777,6 +4311,125 @@ export def OnRemoteWorkspace()
       Restart()
     endif
   })
+enddef
+
+# User SimpleRemoteBufferRead: SimpleRemote just filled a remote:// buffer
+# (its BufReadCmd is asynchronous, so BufReadPost never fires for these and
+# FileType only does when the filetype was still unset).  Attach the buffer
+# if its filetype is known and it is not open on the server yet, then wake
+# whatever was waiting for its contents: a deferred jump, or a workspace edit
+# that must not touch the buffer before the real text is in it.
+export def OnRemoteBufferRead()
+  var event = get(g:, 'simpleremote_event', {})
+  var bnr = type(event) == v:t_dict ? get(event, 'bufnr', 0) : 0
+  if type(bnr) != v:t_number || bnr <= 0 || !bufexists(bnr)
+    return
+  endif
+  if s_initialized && BufFt(bnr) !=# '' && !has_key(s_doc_versions, BufUri(bnr))
+    if bnr == bufnr('%')
+      OnBufOpen()
+    else
+      var winid = bufwinid(bnr)
+      if winid > 0
+        win_execute(winid, 'call simplecc#OnBufOpen()')
+      else
+        # Hidden (bufload()ed by a workspace edit, or re-read after a
+        # reconnect while another buffer is on screen): the server still
+        # needs the document.
+        SendDidOpen(bnr)
+      endif
+    endif
+  endif
+  DispatchRemoteBufferRead(bnr)
+enddef
+
+# User SimpleRemoteConfigChanged: the remote simplecc.json was fetched again
+# on a live connection (after :SimpleCCConfig was saved, or
+# :SimpleRemoteReloadConfig).  Hot-reload it; a restart is only needed when
+# commands or filetypes change, and that is the user's call as it is locally.
+export def OnRemoteConfigChanged()
+  if !s_initialized
+    return
+  endif
+  if empty(RemoteWorkspace())
+    return
+  endif
+  Log('remote configuration changed; reloading')
+  ReloadConfiguration()
+enddef
+
+# User SimpleRemoteFilesChanged: files created, changed or deleted on the
+# remote host outside a buffer write (the remote tree, uploads, API writes).
+# The daemon runs no filesystem watcher for a remote workspace, so this is
+# the only way the language servers learn that a module appeared or went.
+export def OnRemoteFilesChanged()
+  if !s_initialized
+    return
+  endif
+  var event = get(g:, 'simpleremote_event', {})
+  if type(event) != v:t_dict
+    return
+  endif
+  var changes: list<dict<any>> = []
+  for change in get(event, 'changes', [])
+    if type(change) != v:t_dict
+      continue
+    endif
+    var path = get(change, 'path', '')
+    if type(path) != v:t_string || path !~# '^/'
+      continue
+    endif
+    add(changes, {
+      uri: PathToUri('remote://' .. path),
+      type: WatchedFileChangeType(get(change, 'type', 'changed')),
+    })
+  endfor
+  if empty(changes)
+    return
+  endif
+  Log(printf('forwarding %d watched-file change(s)', len(changes)))
+  Send({type: 'workspace/didChangeWatchedFiles', id: NextId(), changes: changes})
+enddef
+
+# LSP FileChangeType: Created = 1, Changed = 2, Deleted = 3.  Anything else
+# an event carries — including nothing at all — is a plain change, which is
+# what a server has to re-read either way.
+def WatchedFileChangeType(kind: any): number
+  var name = type(kind) == v:t_string ? kind : ''
+  if name ==# 'created'
+    return 1
+  elseif name ==# 'deleted'
+    return 3
+  endif
+  return 2
+enddef
+
+# User SimpleRemoteRuntimeReady: the runtime probe finished, possibly after
+# the daemon was already initialized without it.  Only when that changes what
+# `initialize` would send as the Python interpreter and language server —
+# i.e. the user has no :SimpleCCPython selection and the probe found
+# something — is a restart worth its cost.
+export def OnRemoteRuntimeReady()
+  if !g:simplecc_remote_auto_restart
+    return
+  endif
+  var remote = RemoteWorkspace()
+  if empty(remote) || get(remote, 'id', -1) != s_initialize_remote_id
+    # Not initialized for this workspace (yet): the pending restart reads
+    # the probe when it sends `initialize`.
+    return
+  endif
+  if !(s_initialized || s_initializing)
+    return
+  endif
+  var python = EffectivePythonSelection(remote)
+  if python.python ==# s_initialize_python.python
+        && python.lsp ==# s_initialize_python.lsp
+    return
+  endif
+  Log(printf('runtime probe changed the Python selection to %s / %s; restarting',
+    python.python, python.lsp))
+  Restart()
 enddef
 
 export def PythonEnvironment(python: string = '', lsp: string = '')
@@ -3918,7 +4571,11 @@ def ResolveServerCommand(name: string, cmd: string): string
   return ''
 enddef
 
-def HealthServerConfig(name: string, spec: any): list<string>
+# One languageServers entry.  For a remote workspace the command runs on the
+# other host, where neither executable() nor :SimpleCCInstall can reach: the
+# entry is validated for shape and reported as remote, and a command that is
+# missing over there shows up as the server's own startup error.
+def HealthServerConfig(name: string, spec: any, remote: dict<any> = {}): list<string>
   if type(spec) != v:t_dict
     return [HealthLine('ERROR', printf('server %s: not an object', name),
       'each languageServers entry must be a JSON object')]
@@ -3935,6 +4592,14 @@ def HealthServerConfig(name: string, spec: any): list<string>
     add(lines, HealthLine('WARN', printf('server %s: no "filetypes"', name),
       'no buffer will ever select it'))
   endif
+  if !empty(remote)
+    add(lines, HealthLine('INFO', printf('server %s: %s%s on %s:%s', name, cmd,
+      type(filetypes) == v:t_list && !empty(filetypes)
+        ? ' [' .. join(filetypes, ', ') .. ']' : '',
+      get(remote, 'kind', ''), get(remote, 'target', '')),
+      'the command must be on the remote PATH (or the project .venv/bin); a missing one is reported when the server starts'))
+    return lines
+  endif
   var resolved = ResolveServerCommand(name, cmd)
   if resolved ==# ''
     add(lines, HealthLine('ERROR',
@@ -3948,7 +4613,54 @@ def HealthServerConfig(name: string, spec: any): list<string>
   return lines
 enddef
 
+# The remote workspace's configuration: what SimpleRemote fetched from
+# <root>/simplecc.json into g:vimrc_remote_simplecc_config, which is what
+# `initialize` and every reload hand the daemon in place of a local file.
+def HealthRemoteConfig(remote: dict<any>): list<string>
+  var lines = ['CONFIG']
+  var config_path = RemoteConfigPath(remote)
+  var config = get(g:, 'vimrc_remote_simplecc_config', '')
+  if type(config) != v:t_string || config ==# ''
+    var fallback = expand('~/.config/simplecc/simplecc.json')
+    add(lines, HealthLine('INFO', printf('remote config: none (%s not found on %s:%s)',
+      config_path, get(remote, 'kind', ''), get(remote, 'target', '')),
+      filereadable(fallback)
+        ? 'the daemon falls back to the LOCAL ' .. fallback .. '; :SimpleCCConfig creates one in the workspace'
+        : 'using built-in defaults; :SimpleCCConfig creates one in the workspace'))
+    return lines
+  endif
+  add(lines, HealthLine('OK', printf('remote config: %s (%d bytes, fetched by SimpleRemote)',
+    config_path, strlen(config))))
+  var parsed: any
+  try
+    parsed = json_decode(config)
+  catch
+    add(lines, HealthLine('ERROR', 'remote config is not valid JSON: ' .. v:exception,
+      'the daemon keeps using built-in defaults until it parses'))
+    return lines
+  endtry
+  if type(parsed) != v:t_dict
+    add(lines, HealthLine('ERROR', 'remote config is not a JSON object',
+      'the whole file is ignored'))
+    return lines
+  endif
+  var servers = get(parsed, 'languageServers', {})
+  if type(servers) != v:t_dict || empty(servers)
+    add(lines, HealthLine('WARN', 'remote config declares no "languageServers"',
+      'only the built-in defaults can start a server'))
+    return lines
+  endif
+  for name in sort(keys(servers))
+    extend(lines, HealthServerConfig(name, servers[name], remote))
+  endfor
+  return lines
+enddef
+
 def HealthConfig(): list<string>
+  var remote = RemoteWorkspace()
+  if !empty(remote)
+    return HealthRemoteConfig(remote)
+  endif
   var lines = ['CONFIG']
   var configured = get(g:, 'simplecc_config_path', '')
   if configured !=# '' && !filereadable(fnamemodify(expand(configured), ':p'))
@@ -3993,6 +4705,87 @@ def HealthConfig(): list<string>
   return lines
 enddef
 
+# The SimpleRemote workspace the daemon serves, if any: where the language
+# servers run, how they are launched, and what the runtime probe found —
+# the facts behind "completion works locally but not on my server".
+def HealthRemote(): list<string>
+  var lines = ['REMOTE']
+  var remote = RemoteWorkspace()
+  if empty(remote)
+    add(lines, HealthLine('INFO', 'remote workspace: none',
+      exists('*g:SimpleRemoteConnect') == 1
+        ? 'language servers run locally; :SimpleRemoteConnect moves them to a host'
+        : 'language servers run locally'))
+    return lines
+  endif
+  add(lines, HealthLine('OK', printf('workspace: %s:%s %s (generation %s)',
+    get(remote, 'kind', ''), get(remote, 'target', ''), get(remote, 'root', ''),
+    string(get(remote, 'id', '?')))))
+  var mode = get(remote, 'mode', 'virtual')
+  var local_root = get(remote, 'local_root', '')
+  add(lines, HealthLine('INFO', printf('mode: %s%s', mode,
+    local_root ==# '' ? ' (remote:// buffers)' : ', projected at ' .. local_root)))
+  var runtime = get(remote, 'runtime', '')
+  if type(runtime) != v:t_string || runtime ==# ''
+    add(lines, HealthLine('WARN', 'runtime: none; servers start through plain ssh/docker',
+      'install SimpleRemote''s Rust runtime (its install.sh) to share one connection'))
+  else
+    add(lines, HealthLine(executable(runtime) ? 'OK' : 'ERROR',
+      printf('runtime: %s%s (protocol %s)', runtime,
+        get(remote, 'runtime_version', '') ==# '' ? '' : ' v' .. get(remote, 'runtime_version', ''),
+        get(remote, 'protocol', '?')),
+      executable(runtime) ? 'language servers launch through `simpleremote-daemon exec`'
+        : 'not executable; rebuild it with SimpleRemote''s install.sh'))
+  endif
+  var probe = get(remote, 'probe', {})
+  if type(probe) != v:t_dict || empty(probe)
+    add(lines, HealthLine('INFO', 'runtime probe: not run yet',
+      ':SimpleRemoteProbe; Python defaults come from :SimpleCCPython until then'))
+  else
+    var probe_error = get(probe, 'error', '')
+    if type(probe_error) == v:t_string && probe_error !=# ''
+      add(lines, HealthLine('WARN', 'runtime probe: ' .. probe_error, ':SimpleRemoteProbe to retry'))
+    endif
+    var python = get(probe, 'python', '')
+    var lsp = get(probe, 'python_lsp', '')
+    add(lines, HealthLine(python ==# '' ? 'WARN' : 'OK',
+      'remote python: ' .. (python ==# '' ? '(none found)' : python
+        .. (get(probe, 'python_version', '') ==# '' ? '' : ' (' .. get(probe, 'python_version', '') .. ')')),
+      python ==# '' ? 'no python3/python on the remote PATH; :SimpleCCPython names one' : ''))
+    add(lines, HealthLine(lsp ==# '' ? 'WARN' : 'OK',
+      'remote python LSP: ' .. (lsp ==# '' ? '(none found)' : lsp),
+      lsp ==# '' ? 'no pyright-langserver/basedpyright-langserver on the remote PATH or project .venv/bin' : ''))
+    var details: list<string> = []
+    for key in ['uname', 'host', 'runtime_ms', 'node', 'git', 'rg']
+      var value = get(probe, key, '')
+      if type(value) == v:t_string && value !=# ''
+        add(details, printf('%s=%s', key, value))
+      endif
+    endfor
+    if !empty(details)
+      add(lines, HealthLine('INFO', 'probe: ' .. join(details, ' ')))
+    endif
+  endif
+  var selection = PythonSelection()
+  var effective = EffectivePythonSelection(remote)
+  if selection.python !=# '' || selection.lsp !=# ''
+    add(lines, HealthLine('INFO', printf('python selection: %s / %s (:SimpleCCPython)',
+      selection.python ==# '' ? '(auto)' : selection.python,
+      selection.lsp ==# '' ? '(auto)' : selection.lsp)))
+  elseif effective.python !=# '' || effective.lsp !=# ''
+    add(lines, HealthLine('INFO', printf('python selection: %s / %s (from the runtime probe)',
+      effective.python ==# '' ? '(auto)' : effective.python,
+      effective.lsp ==# '' ? '(auto)' : effective.lsp)))
+  else
+    add(lines, HealthLine('INFO', 'python selection: automatic (remote project .venv, then PATH)'))
+  endif
+  if s_initialize_remote_id != get(remote, 'id', -1) && (s_initialized || s_initializing)
+    add(lines, HealthLine('WARN', 'the daemon was initialized for another workspace',
+      ':SimpleCCRestart, or wait for the SimpleRemoteConnected restart'))
+  endif
+  return lines
+enddef
+
 def HealthRuntime(): list<string>
   var lines = ['RUNTIME']
   # Process facts come from the supervisor that owns the process: uptime,
@@ -4005,7 +4798,8 @@ def HealthRuntime(): list<string>
     s_initialized ? '' : (IsRunning() ? 'give it a moment, then :SimpleCCRestart'
       : ':SimpleCCStart')))
   add(lines, HealthLine('INFO', 'workspace root: ' ..
-    (s_root ==# '' ? '(none)' : s_root)))
+    (s_root ==# '' ? '(none)' : s_root)
+    .. (s_initialize_remote_id >= 0 && s_root !=# '' ? ' (remote)' : '')))
   if s_julia_environment !=# ''
     add(lines, HealthLine('INFO', 'Julia environment: ' .. s_julia_environment))
   endif
@@ -4066,7 +4860,23 @@ def HealthContext(bnr: number): list<string>
   var name = bufname(bnr)
   add(lines, HealthLine('INFO', 'file: ' .. (name ==# '' ? '(unnamed)' : name)))
   var buftype = getbufvar(bnr, '&buftype', '')
-  if buftype !=# ''
+  var remote_info = getbufvar(bnr, 'vimrc_remote', {})
+  var is_remote = type(remote_info) == v:t_dict && !empty(remote_info)
+  if is_remote
+    var remote = RemoteWorkspace()
+    var current = !empty(remote)
+      && get(remote_info, 'generation', -1) == get(remote, 'id', -2)
+    add(lines, HealthLine(current ? 'OK' : 'WARN',
+      printf('remote file: %s (connection %s)', get(remote_info, 'path', ''),
+        current ? 'current' : empty(remote) ? 'closed' : 'previous'),
+      current ? '' : 'not sent to a server until it is re-read on the active connection (:edit!)'))
+  elseif name =~# '^remote://'
+    add(lines, HealthLine('WARN', 'remote file: not read yet',
+      'SimpleRemote has not delivered its contents; nothing is sent until it does'))
+  elseif buftype ==# 'acwrite'
+    add(lines, HealthLine('INFO', 'buftype: acwrite',
+      'sent to the server under its buffer name like a file'))
+  elseif buftype !=# ''
     add(lines, HealthLine('WARN', 'buftype: ' .. buftype,
       'special buffers are never sent to a language server'))
   endif
@@ -4106,8 +4916,8 @@ enddef
 # so a test can read it without a window.
 export def HealthReport(): list<string>
   var lines: list<string> = ['SimpleCC health — ' .. strftime('%Y-%m-%d %H:%M:%S')]
-  for section in [HealthEnvironment(), HealthBinary(), HealthConfig(),
-                  HealthRuntime(), HealthContext(bufnr('%'))]
+  for section in [HealthEnvironment(), HealthBinary(), HealthRemote(),
+                  HealthConfig(), HealthRuntime(), HealthContext(bufnr('%'))]
     add(lines, '')
     extend(lines, section)
   endfor
@@ -4165,8 +4975,15 @@ export def Status()
     return
   endif
   var julia_env = s_julia_environment ==# '' ? '' : ' | Julia env: ' .. s_julia_environment
-  echo printf('[SimpleCC] running | root: %s | server: %s%s',
-      s_root, g:simplecc_status, julia_env)
+  var remote = ''
+  if exists('*g:SimpleRemoteStatusline') == 1
+    var statusline = call('g:SimpleRemoteStatusline', [])
+    if type(statusline) == v:t_string && statusline !=# ''
+      remote = ' | remote: ' .. statusline
+    endif
+  endif
+  echo printf('[SimpleCC] running | root: %s | server: %s%s%s',
+      s_root, g:simplecc_status, julia_env, remote)
 enddef
 
 export def JuliaActivateEnvironment(path: string = '')
@@ -4227,15 +5044,43 @@ export def ReloadConfiguration()
   endif
 
   var configured = get(g:, 'simplecc_config_path', '')
-  var config_path = configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
-  SendWithCb({
+  var remote = RemoteWorkspace()
+  # Same rule as `initialize`: in a remote workspace the configuration is the
+  # remote simplecc.json SimpleRemote fetched, never a local file — a local
+  # path would make the daemon read this machine's config for that host.
+  var config_path = !empty(remote) ? ''
+        : configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
+  var request = {
     type: 'workspace/reloadConfiguration',
     id: NextId(),
     configPath: config_path,
-  }, OnConfigurationReload)
+  }
+  if !empty(remote)
+    var config = get(g:, 'vimrc_remote_simplecc_config', v:null)
+    request.remoteConfig = type(config) == v:t_string && config !=# '' ? config : v:null
+  endif
+  SendWithCb(request, OnConfigurationReload)
 enddef
 
+const CONFIG_TEMPLATE = [
+  '{',
+  '  "languageServers": {',
+  '    "example": {',
+  '      "command": "language-server",',
+  '      "args": ["--stdio"],',
+  '      "filetypes": ["filetype"],',
+  '      "rootPatterns": ["marker-file"]',
+  '    }',
+  '  }',
+  '}',
+]
+
 export def OpenConfig()
+  var remote = RemoteWorkspace()
+  if !empty(remote)
+    OpenRemoteConfig(remote)
+    return
+  endif
   var active = ActiveConfigPath()
   if active !=# ''
     execute 'edit ' .. fnameescape(active)
@@ -4247,20 +5092,43 @@ export def OpenConfig()
   var project_config = root .. '/simplecc.json'
   execute 'edit ' .. fnameescape(project_config)
   if line('$') == 1 && getline(1) ==# ''
-    setline(1, [
-      '{',
-      '  "languageServers": {',
-      '    "example": {',
-      '      "command": "language-server",',
-      '      "args": ["--stdio"],',
-      '      "filetypes": ["filetype"],',
-      '      "rootPatterns": ["marker-file"]',
-      '    }',
-      '  }',
-      '}',
-    ])
+    setline(1, CONFIG_TEMPLATE)
     setlocal filetype=json
   endif
+enddef
+
+# :SimpleCCConfig for a remote workspace opens <root>/simplecc.json on the
+# host: through the projection when there is one, otherwise as a remote://
+# buffer.  A file that does not exist yet is created on the host first
+# (SimpleRemote's BufReadCmd cannot back a buffer for a missing file), with
+# the same starting point the local command writes.
+def OpenRemoteConfig(remote: dict<any>)
+  var remote_path = RemoteConfigPath(remote)
+  var target = LocalPath(remote_path, remote)
+  if target !~# '^remote://'
+    execute 'edit ' .. fnameescape(target)
+    if line('$') == 1 && getline(1) ==# ''
+      setline(1, CONFIG_TEMPLATE)
+      setlocal filetype=json
+    endif
+    return
+  endif
+  if exists('*g:SimpleRemoteExecute') != 1
+    execute 'edit ' .. fnameescape(target)
+    return
+  endif
+  var script = printf('[ -e %s ] || printf ''%%s\n'' %s > %s',
+    shellescape(remote_path), shellescape(join(CONFIG_TEMPLATE, "\n")),
+    shellescape(remote_path))
+  RemoteExecute(script, (ok: bool, output: string) => {
+    if !ok
+      echohl ErrorMsg
+      echom '[SimpleCC] could not create ' .. remote_path .. ': ' .. trim(output)
+      echohl None
+      return
+    endif
+    execute 'edit ' .. fnameescape(target)
+  })
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -4427,6 +5295,7 @@ def OnWorkspaceSymbol(ev: dict<any>)
       col: UriUtf16Column(uri, get(s, 'line', 0) + 1,
           get(s, 'character', 0)),
       text: printf('[%s] %s', get(s, 'kind', ''), get(s, 'name', '')),
+      user_data: {character: get(s, 'character', 0)},
     })
   endfor
   setqflist(qf_items)
@@ -5769,11 +6638,14 @@ def WsSymbolFilter(id: number, key: string): bool
       var item = s_ws_results[sel]
       var uri = get(item, 'detail', get(item, 'uri', ''))
       var fpath = UriToPath(uri)
-      if fpath !=# '' && filereadable(fpath)
+      if fpath !=# '' && (filereadable(fpath) || fpath =~# '^remote://')
         execute 'edit ' .. fnameescape(fpath)
         var lnum = get(item, 'line', 0) + 1
-        cursor(lnum, Utf16LineColumn(getline(lnum), get(item, 'character', 0)))
-        normal! zz
+        var character = get(item, 'character', 0)
+        if !DeferRemoteCursor(bufnr('%'), lnum, character)
+          cursor(lnum, Utf16LineColumn(getline(lnum), character))
+          normal! zz
+        endif
       endif
     endif
     return true

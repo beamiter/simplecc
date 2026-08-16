@@ -75,6 +75,21 @@ enum Request {
         id: u64,
         #[serde(rename = "configPath", default)]
         config_path: Option<String>,
+        /// The remote workspace's simplecc.json, verbatim, when SimpleRemote
+        /// is connected — the same text `initialize` carries in
+        /// `remote_config`.  Without it a reload would search the local
+        /// filesystem for a file that lives on the other host.
+        #[serde(rename = "remoteConfig", default)]
+        remote_config: Option<String>,
+    },
+    /// Files created, changed or deleted outside a buffer write.  The daemon
+    /// runs no filesystem watcher for a remote workspace, so SimpleRemote's
+    /// SimpleRemoteFilesChanged event is forwarded through this request.
+    #[serde(rename = "workspace/didChangeWatchedFiles")]
+    DidChangeWatchedFiles {
+        #[serde(default)]
+        id: u64,
+        changes: Vec<WatchedFileChange>,
     },
 
     // Document sync
@@ -444,6 +459,19 @@ enum Request {
     },
 }
 
+/// One entry of `workspace/didChangeWatchedFiles`: an LSP FileChangeType
+/// (1 created, 2 changed, 3 deleted) for a document URI.
+#[derive(Debug, Deserialize)]
+struct WatchedFileChange {
+    uri: String,
+    #[serde(rename = "type", default = "default_watched_file_change_type")]
+    change_type: u32,
+}
+
+fn default_watched_file_change_type() -> u32 {
+    2
+}
+
 impl Request {
     fn preserves_document_order(&self) -> bool {
         matches!(
@@ -457,6 +485,9 @@ impl Request {
                 | Self::JuliaActivateEnvironment { .. }
                 | Self::JuliaRefreshLanguageServer { .. }
                 | Self::ReloadConfiguration { .. }
+                // A rename delivered as deleted+created must reach the
+                // server after the didClose/didOpen of the buffers it moved.
+                | Self::DidChangeWatchedFiles { .. }
                 // A pending language server is blocked until its answer
                 // arrives; never queue it behind slow feature tasks.
                 | Self::ServerResponse { .. }
@@ -913,11 +944,19 @@ async fn handle_request(
             }
         }
 
-        Request::ReloadConfiguration { id, config_path } => {
+        Request::ReloadConfiguration {
+            id,
+            config_path,
+            remote_config,
+        } => {
             let result = {
                 let mut registry = registry.write().await;
                 match registry.as_mut() {
-                    Some(registry) => registry.reload_configuration(config_path.as_deref()).await,
+                    Some(registry) => {
+                        registry
+                            .reload_configuration(config_path.as_deref(), remote_config.as_deref())
+                            .await
+                    }
                     None => Err(anyhow::anyhow!("SimpleCC is not initialized")),
                 }
             };
@@ -1003,6 +1042,28 @@ async fn handle_request(
                 .unwrap_or_default();
             for client in clients {
                 let _ = client.did_change_watched_file(&uri).await;
+            }
+        }
+
+        Request::DidChangeWatchedFiles { id: _, changes } => {
+            let changes: Vec<(String, u32)> = changes
+                .into_iter()
+                .map(|change| (change.uri, change.change_type))
+                .collect();
+            if changes.is_empty() {
+                return;
+            }
+            // Routing is decided by each server's dynamic registration
+            // (did_change_watched_files filters through it), not by any
+            // filetype, so every running client is offered the batch.
+            let clients = registry
+                .read()
+                .await
+                .as_ref()
+                .map(Registry::active_clients)
+                .unwrap_or_default();
+            for client in clients {
+                let _ = client.did_change_watched_files(&changes).await;
             }
         }
 
@@ -2172,12 +2233,79 @@ mod request_tests {
         .unwrap();
 
         match request {
-            Request::ReloadConfiguration { id, config_path } => {
+            Request::ReloadConfiguration {
+                id,
+                config_path,
+                remote_config,
+            } => {
                 assert_eq!(id, 9);
                 assert_eq!(config_path.as_deref(), Some("/tmp/simplecc.json"));
+                assert!(remote_config.is_none());
             }
             _ => panic!("unexpected request variant"),
         }
+    }
+
+    #[test]
+    fn parses_configuration_reload_with_remote_config() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "workspace/reloadConfiguration",
+            "id": 10,
+            "configPath": "",
+            "remoteConfig": "{\"languageServers\":{}}"
+        }))
+        .unwrap();
+
+        match request {
+            Request::ReloadConfiguration {
+                id,
+                config_path,
+                remote_config,
+            } => {
+                assert_eq!(id, 10);
+                assert_eq!(config_path.as_deref(), Some(""));
+                assert_eq!(remote_config.as_deref(), Some("{\"languageServers\":{}}"));
+            }
+            _ => panic!("unexpected request variant"),
+        }
+    }
+
+    #[test]
+    fn parses_watched_file_changes_and_keeps_them_ordered() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "workspace/didChangeWatchedFiles",
+            "id": 12,
+            "changes": [
+                {"uri": "file:///srv/app/new.py", "type": 1},
+                {"uri": "file:///srv/app/old.py", "type": 3},
+                {"uri": "file:///srv/app/touched.py"}
+            ]
+        }))
+        .unwrap();
+
+        match &request {
+            Request::DidChangeWatchedFiles { id, changes } => {
+                assert_eq!(*id, 12);
+                let seen: Vec<(&str, u32)> = changes
+                    .iter()
+                    .map(|change| (change.uri.as_str(), change.change_type))
+                    .collect();
+                assert_eq!(
+                    seen,
+                    vec![
+                        ("file:///srv/app/new.py", 1),
+                        ("file:///srv/app/old.py", 3),
+                        // A missing type is a plain change.
+                        ("file:///srv/app/touched.py", 2),
+                    ]
+                );
+            }
+            _ => panic!("unexpected request variant"),
+        }
+        // A rename arrives as deleted+created and must follow the
+        // didClose/didOpen of the buffers it moved.
+        assert!(request.preserves_document_order());
+        assert!(!request.is_lifecycle_barrier());
     }
 
     #[test]

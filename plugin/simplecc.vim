@@ -302,5 +302,15 @@ augroup simplecc
   autocmd CursorHold * simplecc#OnCursorHold()
   autocmd WinScrolled * simplecc#OnWinScrolled()
   autocmd InsertCharPre * simplecc#OnInsertCharPre()
+  # SimpleRemote integration.  Harmless without SimpleRemote: nothing fires
+  # User SimpleRemote* events, and every handler reads its payload from
+  # g:simpleremote_event.  SimpleCC owns its own lifecycle in a remote
+  # workspace — SimpleRemote only announces; see |simplecc-remote|.
   autocmd User SimpleRemoteConnected,SimpleRemoteDisconnected if g:simplecc_remote_auto_restart | simplecc#OnRemoteWorkspace() | endif
+  # A projection being mounted (SimpleRemoteWorkspaceChanged) changes how
+  # paths are spelled, not where the servers run: deliberately no restart.
+  autocmd User SimpleRemoteBufferRead simplecc#OnRemoteBufferRead()
+  autocmd User SimpleRemoteConfigChanged simplecc#OnRemoteConfigChanged()
+  autocmd User SimpleRemoteFilesChanged simplecc#OnRemoteFilesChanged()
+  autocmd User SimpleRemoteRuntimeReady simplecc#OnRemoteRuntimeReady()
 augroup END

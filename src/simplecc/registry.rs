@@ -261,9 +261,22 @@ impl Registry {
 
     /// Reload configuration and update every running server in place. New
     /// server instances also use the replacement config through `self.config`.
-    pub async fn reload_configuration(&mut self, config_path: Option<&str>) -> Result<usize> {
+    ///
+    /// `remote_config` is the remote workspace's simplecc.json text, exactly
+    /// as `initialize` received it: for a remote workspace `root_dir` is a
+    /// path on the other host, so searching the local filesystem under it
+    /// would silently replace the running remote settings with local
+    /// defaults (or this machine's ~/.config/simplecc/simplecc.json).
+    pub async fn reload_configuration(
+        &mut self,
+        config_path: Option<&str>,
+        remote_config: Option<&str>,
+    ) -> Result<usize> {
         self.prune_dead_clients();
-        let config = Config::load_selected(&self.root_dir, config_path)?;
+        let config = match remote_config {
+            Some(content) => Config::parse(content)?,
+            None => Config::load_selected(&self.root_dir, config_path)?,
+        };
         let updates: Vec<_> = self
             .clients
             .iter()
@@ -662,6 +675,94 @@ mod tests {
     fn directory_uri_percent_encodes_reserved_path_characters() {
         let uri = directory_uri(Path::new("/tmp/Simple CC#workspace")).unwrap();
         assert_eq!(uri, "file:///tmp/Simple%20CC%23workspace/");
+    }
+
+    fn remote(kind: &str, runtime: Option<&str>) -> RemoteConfig {
+        RemoteConfig {
+            kind: kind.to_string(),
+            target: "dev-box".to_string(),
+            root: "/srv/app".to_string(),
+            runtime: runtime.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn remote_command_uses_the_runtime_exec_contract_when_available() {
+        let args = vec!["--stdio".to_string(), "--log level".to_string()];
+        let (program, argv, cwd) = remote_command(
+            &remote("ssh", Some("/opt/simpleremote-daemon")),
+            "pyright-langserver",
+            &args,
+        )
+        .unwrap();
+
+        assert_eq!(program, "/opt/simpleremote-daemon");
+        // The runtime quotes each element for the remote shell individually,
+        // so arguments travel as a real argv: nothing here is re-joined.
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "--kind",
+                "ssh",
+                "--target",
+                "dev-box",
+                "--root",
+                "/srv/app",
+                "--",
+                "pyright-langserver",
+                "--stdio",
+                "--log level",
+            ]
+        );
+        // The runtime changes into the workspace itself; a local cwd would
+        // have to exist on this machine.
+        assert!(cwd.is_none());
+    }
+
+    #[test]
+    fn remote_command_falls_back_to_ssh_and_docker_without_a_runtime() {
+        let args = vec!["--stdio".to_string()];
+
+        let (program, argv, cwd) =
+            remote_command(&remote("ssh", None), "pyright-langserver", &args).unwrap();
+        assert_eq!(program, "ssh");
+        assert!(cwd.is_none());
+        assert_eq!(&argv[..4], ["-T", "dev-box", "sh", "-c"]);
+        // OpenSSH re-joins the remote command through the login shell, so
+        // the whole script is one quoted word; it changes into the workspace,
+        // prefers the project .venv, and exec's the quoted server argv.
+        let script = &argv[4];
+        assert!(
+            script.starts_with('\''),
+            "quoted for the login shell: {script}"
+        );
+        assert!(script.contains("cd '\\''/srv/app'\\''"), "{script}");
+        assert!(script.contains(".venv/bin"), "{script}");
+        assert!(
+            script.contains("exec '\\''pyright-langserver'\\'' '\\''--stdio'\\''"),
+            "{script}"
+        );
+
+        let (program, argv, cwd) =
+            remote_command(&remote("docker", None), "pyright-langserver", &args).unwrap();
+        assert_eq!(program, "docker");
+        assert!(cwd.is_none());
+        assert_eq!(&argv[..5], ["exec", "-i", "dev-box", "sh", "-c"]);
+        // docker exec passes argv through unchanged: no outer quoting layer.
+        let script = &argv[5];
+        assert!(script.starts_with("cd '/srv/app' && "), "{script}");
+        assert!(
+            script.ends_with("exec 'pyright-langserver' '--stdio'"),
+            "{script}"
+        );
+
+        // An empty runtime path means "no runtime", not a program called "".
+        let (program, _, _) =
+            remote_command(&remote("ssh", Some("")), "pyright-langserver", &args).unwrap();
+        assert_eq!(program, "ssh");
+
+        assert!(remote_command(&remote("telnet", None), "x", &[]).is_err());
     }
 
     #[test]

@@ -2,6 +2,72 @@
 
 ## Unreleased - 2026-08-05
 
+### SimpleCC 独占远程工作区的生命周期
+
+- SimpleRemote 不再替 SimpleCC 跑 `:SimpleCCRestart` / `:SimpleCCStop`,也不再
+  轮询 `g:simplecc_status` 去调 `simplecc#OnBufOpen()`;它只发事件,SimpleCC 自己
+  决定要不要动。于是一次工作区切换不再是"断开重启一遍本地 server、连上再重启
+  一遍远程 server":`SimpleRemoteDisconnected` 的 `reason` 是 `reconnect` 时什么
+  都不做,daemon 继续服务旧工作区直到新的被宣布;`SimpleRemoteConnected` 带来的
+  如果是已经在服务的那个 generation(`g:simpleremote_workspace.id`),同样什么都
+  不做。投影挂载(`SimpleRemoteWorkspaceChanged`)改的是路径怎么拼,不是 server
+  跑在哪,故意不重启。
+- `remote://` buffer 是 `BufReadCmd` 异步填的,`BufReadPost` 从不触发。现在
+  `User SimpleRemoteBufferRead` 到达时把 buffer 挂到 server 上(有 window 就
+  `win_execute`,隐藏的直接 `SendDidOpen`),并唤醒一切在等这份内容的人。
+
+### 远程跳转不再落在 1:1
+
+- `edit remote:///…` 之后 buffer 只有一行空行,`cursor()` 会把每一次定义、引用、
+  showDocument 和 quickfix 跳转都夹到第 1 行第 1 列。`DeferRemoteCursor()` 在读
+  还没回来时挂一个一次性的等待者,内容到了再按真实那一行换算 UTF-16 列。
+  quickfix 条目把 LSP 列存进 `user_data`,`<CR>` 进入未读文件时用的是它,不是
+  读不到文件时那个"估算"列。
+- 工作区根之外的定义(stdlib、site-packages、`~/.cargo/registry`)以前会被当成
+  本地绝对路径打开——打开的要么是空文件,要么是同名的另一个文件。现在
+  `UriToPath()` 在有远程工作区时把根之外的路径映射成 `remote://`,投影模式下也
+  一样:那些路径本来就不在挂载点里。
+
+### 远程文件上的 workspace edit 真的能改
+
+- `OnApplyEdit()` 改成续延循环:没有 buffer 的 `remote://` 文件先等
+  `SimpleRemoteBufferRead`,再套用编辑——以前是 `bufload()` 之后立刻改那一行空
+  buffer,读回来的内容随后被 `read result ignored because the buffer changed`
+  丢掉,文件内容就此报废。create/rename/delete 走 `g:SimpleRemoteExecute()` 在
+  远端执行(`mkdir -p`/`: >`/`mv -f`/`rm`),rename 前先把未保存的改动写回去、
+  之后把 buffer 重定向到新名字。server 只在整批结束时被回复一次。
+
+### 远程配置、远程文件变更、远程探针
+
+- `workspace/reloadConfiguration` 增加 `remoteConfig`,Rust 侧用 `Config::parse`
+  接住。以前的热重载在**本地**文件系统上按远程根路径找 `simplecc.json`,找不到
+  就悄悄退回本机的 `~/.config/simplecc/simplecc.json`。`:SimpleCCConfig` 现在打
+  开远端那份(虚拟模式下是 `remote://` buffer,必要时先在远端创建),保存它会让
+  SimpleRemote 重新抓取并发 `SimpleRemoteConfigChanged`,由此热重载。
+- 新增 `workspace/didChangeWatchedFiles` 请求:远程工作区没有文件系统 watcher,
+  远程树、上传、API 写入产生的增删改以前对 language server 完全不可见。
+  `SimpleRemoteFilesChanged` 现在按 LSP FileChangeType 转发给每个 client。
+  `BufUri()` 优先用 `b:vimrc_remote.path`,这样远程树里的重命名不会让 buffer 继
+  续用旧 URI 发 didChange。
+- 没有 `:SimpleCCPython` 选择时,远程工作区用 SimpleRemote 运行时探针找到的
+  解释器与 pyright;探针晚于 daemon 就绪时,只有当它真的改变了这个选择,
+  `SimpleRemoteRuntimeReady` 才重启。
+
+### 只把该发的 buffer 发出去,健康报告说远程的事
+
+- `remote://` buffer 只在连接存在、且 `b:vimrc_remote.generation` 等于当前
+  `g:simpleremote_workspace.id` 时才发给 server:断开后不会把上一台主机的文件
+  喂给本地 server,换主机后也不会把旧 buffer 重放给新连接。`&buftype` 不是空或
+  `acwrite` 的 buffer(quickfix、terminal、prompt)一律不发。
+- `:SimpleCCHealth` 增加 REMOTE 段(工作区与 generation、投影模式、runtime 与
+  协议、探针结果、生效的 Python 选择);CONFIG 段在远程时校验的是远端 JSON,不
+  再对跑在另一台机器上的命令做 `executable()` 判断、也不再建议 `:SimpleCCInstall`;
+  CONTEXT 段不再把 `remote://` 的 `acwrite` buffer 说成"special buffers are never
+  sent"。`:SimpleCC` 追加 `g:SimpleRemoteStatusline()`。
+- `test/remote_paths.vim` 与 `test/remote_lifecycle.vim` 覆盖两种模式的路径映射、
+  事件驱动的挂载与延迟跳转、远程 workspace edit、配置热重载与健康报告;Rust 侧
+  补了 `remote_command()` 的 argv 与两个新请求的反序列化测试。
+
 ### 原生扩展点只接管真正有 server 的 buffer
 
 - `gq` 在没有 language server 的 filetype 里什么都不做了。`SendDidOpen()` 会给

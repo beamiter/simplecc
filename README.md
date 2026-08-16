@@ -149,15 +149,50 @@ List managed servers with <code>:SimpleCCServers</code>. Install one with
 <code>:SimpleCCInstall {name}</code>. Managed installs may contact GitHub,
 npm, the Go module proxy, or Julia package registries.
 
-## SimpleRemote Python workspaces
+## SimpleRemote workspaces
 
-SimpleCC automatically follows the active
-[SimpleRemote](https://github.com/beamiter/simpleremote) workspace. Connecting
-or disconnecting rebuilds the LSP workspace, starts the configured language
-server through SSH or Docker, and maps both virtual buffers and SSHFS paths to
-their real remote `file://` URIs. Completion, diagnostics, definitions,
-references, rename, and imports therefore use the server's Python environment
-instead of the local machine.
+SimpleCC follows the active
+[SimpleRemote](https://github.com/beamiter/simpleremote) workspace and owns the
+whole language-server lifecycle inside it. SimpleRemote only publishes
+`g:simpleremote_workspace` and fires its `User SimpleRemote*` events; SimpleCC
+decides what they mean. Everything below is feature-detected, so none of it
+happens when SimpleRemote is not installed.
+
+- **Lifecycle.** `SimpleRemoteConnected` re-initializes the daemon for the
+  workspace, so the servers are launched over the connection.
+  `SimpleRemoteDisconnected` brings them back locally — except for the
+  `reconnect` half of a workspace switch, which is skipped so a switch does
+  not restart every server twice, and a connect to the workspace already being
+  served, which does nothing at all. A projection being mounted
+  (`SimpleRemoteWorkspaceChanged`) changes how paths are spelled, not where the
+  servers run, so it is deliberately not a restart.
+- **Attaching.** Remote buffers are filled asynchronously by SimpleRemote's
+  `BufReadCmd`, so `BufReadPost` never fires for them. SimpleCC opens them on
+  the server when `SimpleRemoteBufferRead` says the contents arrived.
+- **Paths.** A server always sees the remote absolute path as a `file://` URI.
+  Coming back, a URI inside the workspace root becomes the projected local file
+  (sshfs, docker-bind, local-map) or a `remote://` buffer in virtual mode; a URI
+  outside the root — the standard library, site-packages,
+  `~/.cargo/registry` — opens as a `remote://` buffer in every mode, because
+  nothing is mounted there. Jumps into a buffer that is still being read wait
+  for the text and then place the cursor on the right UTF-16 column.
+- **Workspace edits.** Rename symbol and code actions apply to remote files:
+  edits for a file with no buffer wait for its contents, create/rename/delete
+  run on the host through SimpleRemote's agent connection, and the server is
+  answered once at the end.
+- **Configuration.** The daemon receives the text of the *remote*
+  `simplecc.json` rather than a local path. `:SimpleCCConfig` opens that file
+  (creating it on the host if needed) and saving it hot-reloads the running
+  servers through `SimpleRemoteConfigChanged`.
+- **Watched files.** Files created, renamed or deleted outside a buffer write —
+  the remote tree, uploads — arrive as `SimpleRemoteFilesChanged` and are
+  forwarded to every server as `workspace/didChangeWatchedFiles`. The daemon
+  runs no filesystem watcher for a remote workspace, so this is how the servers
+  learn that a module appeared or went away.
+- **What is not sent.** A `remote://` buffer is sent only while connected and
+  only when *that* connection filled it, so a buffer left over from a previous
+  host is never replayed to a new one, and nothing from the old host reaches
+  the local servers after a disconnect.
 
 When SimpleRemote's Rust runtime is installed, SimpleCC launches the language
 server through `simpleremote-daemon exec`. Filesystem RPC and LSP processes
@@ -169,10 +204,16 @@ editor daemon and language server run on different hosts. This prevents
 Pyright from monitoring an unrelated remote PID and exiting after startup.
 
 For the built-in Python configuration, `pyright-langserver` must be available
-in the remote project `.venv/bin` or on the remote `PATH`. Put `simplecc.json`
-in the remote project root when a different command or pyright settings are
-needed. Set
+in the remote project `.venv/bin` or on the remote `PATH`; without a
+`:SimpleCCPython` selection SimpleCC uses what SimpleRemote's runtime probe
+found on the host. Put `simplecc.json` in the remote project root when a
+different command or pyright settings are needed. Set
 `g:simplecc_remote_auto_restart = 0` to disable lifecycle synchronization.
+
+`:SimpleCCHealth` grows a REMOTE section — workspace, generation, projection
+mode, runtime and protocol, probe results, effective Python selection, and
+whether the remote configuration parses — and `:SimpleCC` appends SimpleRemote's
+status line.
 
 Run `:SimpleCCPython` to discover project virtual environments, the active
 venv or conda environment, every environment reported by conda, and system
@@ -192,11 +233,11 @@ behavior, or pass explicit interpreter and LSP paths for a custom setup.
 | <code>:SimpleCCStart</code> | Start and initialize SimpleCC |
 | <code>:SimpleCCStop</code> | Shut down SimpleCC and its servers |
 | <code>:SimpleCCRestart</code> | Restart the daemon |
-| <code>:SimpleCCConfig</code> | Open or create the active configuration |
+| <code>:SimpleCCConfig</code> | Open or create the active configuration; the remote <code>simplecc.json</code> in a SimpleRemote workspace |
 | <code>:SimpleCCReloadConfig</code> | Validate configuration and hot-reload server settings |
 | <code>:SimpleCCPython [python] [lsp]</code> | Select and persist the project Python interpreter and LSP executable |
 | <code>:SimpleCCLog</code> | Open the in-memory SimpleCC log |
-| <code>:SimpleCCHealth</code> | Full report in a scratch buffer: environment, daemon age vs. plugin sources, config and server-command resolution, runtime, and why this buffer is or is not served |
+| <code>:SimpleCCHealth</code> | Full report in a scratch buffer: environment, daemon age vs. plugin sources, the SimpleRemote workspace, config and server-command resolution, runtime, and why this buffer is or is not served |
 | <code>:SimpleCCInstall [server]</code> | Install a managed language server |
 | <code>:SimpleCCServers</code> | List managed server installation state |
 
@@ -317,7 +358,7 @@ Set options before <code>plugin/simplecc.vim</code> is loaded.
 | Option | Default | Purpose |
 | --- | ---: | --- |
 | <code>g:simplecc_auto_start</code> | 1 | Start on VimEnter |
-| <code>g:simplecc_remote_auto_restart</code> | 1 | Follow SimpleRemote connect/disconnect lifecycle |
+| <code>g:simplecc_remote_auto_restart</code> | 1 | Re-initialize the workspace on SimpleRemote connect/disconnect |
 | <code>g:simplecc_python_path</code> | empty | Default Python interpreter without a saved project selection |
 | <code>g:simplecc_python_lsp_path</code> | empty | Default Python LSP executable without a saved project selection |
 | <code>g:simplecc_python_state_file</code> | automatic | Per-project Python environment selection store |
