@@ -106,6 +106,48 @@ call assert_notequal('', s:Line('^\[OK\] filetype: rust'))
 call assert_notequal('', s:Line('^\[ERROR\] document: never opened on the server'),
       \ 'a buffer the daemon has never heard of is the answer to "why nothing works"')
 
+" -------------------------------------------------------- remote workspace ---
+
+" What the report says about a SimpleRemote workspace.  SimpleRemote is not
+" on the runtimepath: g:simpleremote_workspace is set the way it publishes it.
+let g:simplecc_python_state_file = tempname()
+
+" A probe SimpleRemote has started but not answered yet is seeded as
+" {status: -1}.  Reporting that as "no python on the remote PATH" sends the
+" reader after a problem that does not exist.
+let g:simpleremote_workspace = {'id': 7, 'kind': 'ssh', 'target': 'devbox',
+      \ 'root': '/srv/app', 'tree_root': '/srv/app', 'local_root': '',
+      \ 'mode': 'virtual', 'runtime': '', 'runtime_version': '',
+      \ 'protocol': 'json', 'probe': {'status': -1}}
+call assert_notequal('', s:Line('^REMOTE$'), 'the report has a REMOTE section')
+call assert_notequal('', s:Line('^\[INFO\] runtime probe: not run yet'),
+      \ 'a probe still in flight has not found nothing -- it has not answered')
+call assert_equal('', s:Line('remote python: (none found)'),
+      \ 'so nothing is claimed about the host''s python yet')
+
+" A probe entry that is not a string (a truncated or hand-written snapshot)
+" is no answer either -- and must not throw out of the middle of the report.
+let g:simpleremote_workspace.probe = {'status': 0, 'python': 42, 'python_lsp': ''}
+call assert_notequal('', s:Line('^\[WARN\] remote python: (none found)'),
+      \ 'a probe value that is not a string is treated as no answer')
+
+let g:simpleremote_workspace.probe = {'status': 0, 'python': '/usr/bin/python3',
+      \ 'python_version': 'Python 3.12.1', 'python_lsp': '', 'uname': 'Linux'}
+call assert_notequal('', s:Line('^\[OK\] remote python: /usr/bin/python3 (Python 3.12.1)'))
+call assert_notequal('', s:Line('^\[INFO\] probe: uname=Linux'))
+call assert_notequal('', s:Line('^\[INFO\] python selection: /usr/bin/python3 / (auto) (from the runtime probe)'))
+
+" The buffer this report is about is a local file, and every server of a
+" connected workspace runs on the host: it is not sent to any of them.
+call assert_notequal('', s:Line('^\[WARN\] local file: outside the remote workspace'),
+      \ 'the report says why a local buffer is inert while a workspace is connected')
+call assert_equal(1, s:Line('^\[WARN\] local file:') =~# 'ssh:devbox',
+      \ 'and names the host whose servers would have to serve it')
+unlet g:simpleremote_workspace
+call assert_equal('', s:Line('^\[WARN\] local file: outside the remote workspace'),
+      \ 'while local, a local file is exactly what the daemon serves')
+unlet g:simplecc_python_state_file
+
 " --------------------------------------------------------- scratch rendering ---
 
 call simplecc#Health()

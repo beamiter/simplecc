@@ -868,23 +868,42 @@ enddef
 #
 # Special buffers (quickfix, terminals, prompts, help) never had a file behind
 # them; 'acwrite' is allowed because that is what SimpleRemote's remote://
-# buffers are.  A remote:// buffer is only sent while a workspace is connected
-# and while the buffer belongs to *that* connection: after a disconnect its
-# URI would reach the local servers, and after a reconnect to another host a
-# buffer still holding the previous host's file would be replayed to the new
-# one.  SimpleRemote stamps b:vimrc_remote.generation with the connection id
-# when it fills the buffer, so a buffer whose read has not completed yet is
-# skipped as well and picked up by OnRemoteBufferRead() when it has.
+# buffers are.
+#
+# While a workspace is connected the daemon launches *every* language server
+# on the host (`initialize` carries the remote block), so the only files any
+# of them can see are the host's: a remote:// buffer of this connection, or,
+# in a projected mode, a local file under local_root, which is the same file
+# seen through the mount.  An ordinary local buffer — ~/scratch.py, a config
+# file, another project — is none of those, and offering it does harm in both
+# directions: its text goes to a server that cannot resolve it, and every URI
+# that server echoes back names a path on the host, so a `gd` inside it, or a
+# diagnostic on it, is read as a remote file and jumps into a remote:// buffer
+# for a file that only exists here.  Such buffers are simply not offered while
+# connected; the disconnect restarts the daemon, which replays them to the
+# local servers.
+#
+# A remote:// buffer is only sent while a workspace is connected and while the
+# buffer belongs to *that* connection: after a disconnect its URI would reach
+# the local servers, and after a reconnect to another host a buffer still
+# holding the previous host's file would be replayed to the new one.
+# SimpleRemote stamps b:vimrc_remote.generation with the connection id when it
+# fills the buffer, so a buffer whose read has not completed yet is skipped as
+# well and picked up by OnRemoteBufferRead() when it has.
 def BufferServable(buffer: number = 0): bool
   var nr = buffer == 0 ? bufnr('%') : buffer
   var buftype = getbufvar(nr, '&buftype', '')
   if buftype !=# '' && buftype !=# 'acwrite'
     return false
   endif
-  if bufname(nr) !~# '^remote://'
-    return true
-  endif
+  var name = bufname(nr)
   var remote = RemoteWorkspace()
+  if name !~# '^remote://'
+    # A locally named buffer: served by the local daemon when nothing is
+    # remote, and by the remote servers only when a projection makes it a
+    # file on the host as well.
+    return empty(remote) || !empty(RemotePath(name, remote))
+  endif
   if empty(remote)
     return false
   endif
@@ -1030,12 +1049,27 @@ def PythonSelection(): dict<any>
   }
 enddef
 
+# A runtime probe SimpleRemote has not answered yet.  It seeds the in-flight
+# probe as {status: -1} the moment it starts the process, so an empty dict is
+# only what a workspace without the Rust runtime ever has: both mean "no
+# answer", and reporting either as "no python found" sends the reader after a
+# PATH problem that does not exist.
+def ProbePending(probe: dict<any>): bool
+  return empty(probe) || (len(probe) <= 1 && get(probe, 'status', -1) == -1)
+enddef
+
+# One probe entry as a string, whatever it actually is.
+def ProbeString(probe: dict<any>, key: string): string
+  var value: any = get(probe, key, '')
+  return type(value) == v:t_string ? value : ''
+enddef
+
 # What `initialize` sends as the Python interpreter and language server: the
 # user's :SimpleCCPython choice, or, in a remote workspace that has none, what
 # SimpleRemote's runtime probe found on the host — the interpreter and
 # pyright/basedpyright that the same PATH prelude the language servers are
-# launched with resolves to.  {} probe (not run yet) leaves both empty, and
-# OnRemoteRuntimeReady() revisits the choice when the probe lands.
+# launched with resolves to.  A probe that has not answered yet leaves both
+# empty, and OnRemoteRuntimeReady() revisits the choice when it lands.
 def EffectivePythonSelection(remote: dict<any>): dict<string>
   var selected = PythonSelection()
   var python: string = get(selected, 'python', '')
@@ -1043,14 +1077,11 @@ def EffectivePythonSelection(remote: dict<any>): dict<string>
   if !empty(remote) && python ==# '' && lsp ==# ''
     var probe = get(remote, 'probe', {})
     if type(probe) == v:t_dict
-      python = get(probe, 'python', '')
-      lsp = get(probe, 'python_lsp', '')
-      if type(python) != v:t_string
-        python = ''
-      endif
-      if type(lsp) != v:t_string
-        lsp = ''
-      endif
+      # ProbeString(), not get(): a probe entry is whatever the probe output
+      # parsed to, and assigning it into a string variable before the type
+      # check is the very failure the check is here to survive (E1012).
+      python = ProbeString(probe, 'python')
+      lsp = ProbeString(probe, 'python_lsp')
     endif
   endif
   return {python: python, lsp: lsp}
@@ -4738,7 +4769,7 @@ def HealthRemote(): list<string>
         : 'not executable; rebuild it with SimpleRemote''s install.sh'))
   endif
   var probe = get(remote, 'probe', {})
-  if type(probe) != v:t_dict || empty(probe)
+  if type(probe) != v:t_dict || ProbePending(probe)
     add(lines, HealthLine('INFO', 'runtime probe: not run yet',
       ':SimpleRemoteProbe; Python defaults come from :SimpleCCPython until then'))
   else
@@ -4746,19 +4777,22 @@ def HealthRemote(): list<string>
     if type(probe_error) == v:t_string && probe_error !=# ''
       add(lines, HealthLine('WARN', 'runtime probe: ' .. probe_error, ':SimpleRemoteProbe to retry'))
     endif
-    var python = get(probe, 'python', '')
-    var lsp = get(probe, 'python_lsp', '')
+    # Probe values are whatever the probe output parsed to, so they are read
+    # untyped and normalised before anything compares them (E1030).
+    var python = ProbeString(probe, 'python')
+    var lsp = ProbeString(probe, 'python_lsp')
     add(lines, HealthLine(python ==# '' ? 'WARN' : 'OK',
       'remote python: ' .. (python ==# '' ? '(none found)' : python
-        .. (get(probe, 'python_version', '') ==# '' ? '' : ' (' .. get(probe, 'python_version', '') .. ')')),
+        .. (ProbeString(probe, 'python_version') ==# '' ? ''
+          : ' (' .. ProbeString(probe, 'python_version') .. ')')),
       python ==# '' ? 'no python3/python on the remote PATH; :SimpleCCPython names one' : ''))
     add(lines, HealthLine(lsp ==# '' ? 'WARN' : 'OK',
       'remote python LSP: ' .. (lsp ==# '' ? '(none found)' : lsp),
       lsp ==# '' ? 'no pyright-langserver/basedpyright-langserver on the remote PATH or project .venv/bin' : ''))
     var details: list<string> = []
     for key in ['uname', 'host', 'runtime_ms', 'node', 'git', 'rg']
-      var value = get(probe, key, '')
-      if type(value) == v:t_string && value !=# ''
+      var value = ProbeString(probe, key)
+      if value !=# ''
         add(details, printf('%s=%s', key, value))
       endif
     endfor
@@ -4879,6 +4913,15 @@ def HealthContext(bnr: number): list<string>
   elseif buftype !=# ''
     add(lines, HealthLine('WARN', 'buftype: ' .. buftype,
       'special buffers are never sent to a language server'))
+  endif
+  # "Why does nothing work in this file?" while connected is almost always
+  # this: the servers run on the host, and this buffer is not a file there.
+  var context_remote = RemoteWorkspace()
+  if !is_remote && name !=# '' && name !~# '^remote://' && !empty(context_remote)
+      && empty(RemotePath(name, context_remote))
+    add(lines, HealthLine('WARN', 'local file: outside the remote workspace',
+      printf('the language servers run on %s:%s; local buffers are not sent while connected',
+        get(context_remote, 'kind', ''), get(context_remote, 'target', ''))))
   endif
   var ft = BufFt(bnr)
   add(lines, HealthLine(ft ==# '' ? 'WARN' : 'OK',
@@ -5614,27 +5657,38 @@ def OnCallHierarchyPrepare(ev: dict<any>)
   })
 enddef
 
+# Call and type hierarchies answer with the same shape — {uri, line,
+# character, kind, name} — and become the same quickfix list, with the same
+# <CR> as every other SimpleCC list: it carries the LSP column in user_data,
+# because the byte column beside it is only an estimate while the file cannot
+# be read here, and it can wait for a remote:// buffer to be filled.
+def HierarchyToQuickfix(items: list<any>)
+  var qf_items: list<dict<any>> = []
+  for item in items
+    var uri = get(item, 'uri', '')
+    add(qf_items, {
+      filename: UriToPath(uri),
+      lnum: get(item, 'line', 0) + 1,
+      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
+          get(item, 'character', 0)),
+      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
+      user_data: {character: get(item, 'character', 0)},
+    })
+  endfor
+  var source_winid = win_getid()
+  setqflist(qf_items)
+  copen
+  w:simplecc_source_winid = source_winid
+  SetupQfMappings()
+enddef
+
 def OnIncomingCallsResult(ev: dict<any>)
   var calls = get(ev, 'calls', [])
   if empty(calls)
     echo 'No incoming calls'
     return
   endif
-  var qf_items: list<dict<any>> = []
-  for c in calls
-    var item = get(c, 'item', {})
-    var uri = get(item, 'uri', '')
-    var fpath = UriToPath(uri)
-    add(qf_items, {
-      filename: fpath,
-      lnum: get(item, 'line', 0) + 1,
-      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
-          get(item, 'character', 0)),
-      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
-    })
-  endfor
-  setqflist(qf_items)
-  copen
+  HierarchyToQuickfix(mapnew(calls, (_, c) => get(c, 'item', {})))
 enddef
 
 def OnOutgoingCallsResult(ev: dict<any>)
@@ -5643,21 +5697,7 @@ def OnOutgoingCallsResult(ev: dict<any>)
     echo 'No outgoing calls'
     return
   endif
-  var qf_items: list<dict<any>> = []
-  for c in calls
-    var item = get(c, 'item', {})
-    var uri = get(item, 'uri', '')
-    var fpath = UriToPath(uri)
-    add(qf_items, {
-      filename: fpath,
-      lnum: get(item, 'line', 0) + 1,
-      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
-          get(item, 'character', 0)),
-      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
-    })
-  endfor
-  setqflist(qf_items)
-  copen
+  HierarchyToQuickfix(mapnew(calls, (_, c) => get(c, 'item', {})))
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -6546,7 +6586,7 @@ def OnSupertypesResult(ev: dict<any>)
     echo 'No supertypes'
     return
   endif
-  TypeHierarchyToQuickfix(items, 'Supertypes')
+  HierarchyToQuickfix(items)
 enddef
 
 def OnSubtypesResult(ev: dict<any>)
@@ -6555,24 +6595,7 @@ def OnSubtypesResult(ev: dict<any>)
     echo 'No subtypes'
     return
   endif
-  TypeHierarchyToQuickfix(items, 'Subtypes')
-enddef
-
-def TypeHierarchyToQuickfix(items: list<any>, title: string)
-  var qf_items: list<dict<any>> = []
-  for item in items
-    var uri = get(item, 'uri', '')
-    var fpath = UriToPath(uri)
-    add(qf_items, {
-      filename: fpath,
-      lnum: get(item, 'line', 0) + 1,
-      col: UriUtf16Column(uri, get(item, 'line', 0) + 1,
-          get(item, 'character', 0)),
-      text: printf('[%s] %s', get(item, 'kind', ''), get(item, 'name', '')),
-    })
-  endfor
-  setqflist(qf_items)
-  copen
+  HierarchyToQuickfix(items)
 enddef
 
 # ═════════════════════════════════════════════════════════

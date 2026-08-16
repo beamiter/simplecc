@@ -202,13 +202,41 @@ call assert_equal(v:false, s:Call('RemoteBufferUnread', bufnr('%')))
 call assert_equal(v:true, s:Call('BufferServable', bufnr('%')))
 
 " Special buffers never had a file; acwrite is what remote buffers are.
+unlet g:simpleremote_workspace
 enew!
+silent file /tmp/simplecc-local.py
 call assert_equal(v:true, s:Call('BufferServable', bufnr('%')))
 setlocal buftype=nofile
 call assert_equal(v:false, s:Call('BufferServable', bufnr('%')))
 setlocal buftype=acwrite
 call assert_equal(v:true, s:Call('BufferServable', bufnr('%')))
 setlocal buftype=
+
+" A purely local buffer is not offered to the servers of a connected
+" workspace: they all run on the host, so its text would go to a server that
+" cannot resolve it -- and every file:// URI that server answered with would
+" be read as a path on the host, which turned `gd` inside ~/scratch.py into a
+" jump to remote:///home/.../scratch.py.
+let g:simpleremote_workspace = {'id': 4, 'kind': 'ssh', 'target': 'h',
+      \ 'root': '/srv/app', 'local_root': '', 'mode': 'virtual'}
+call assert_equal(v:false, s:Call('BufferServable', bufnr('%')),
+      \ 'a local file is never sent to the servers running on the host')
+unlet g:simpleremote_workspace
+call assert_equal(v:true, s:Call('BufferServable', bufnr('%')),
+      \ 'and is served again as soon as the servers are local ones')
+
+" In a projected mode the mount is the workspace: a buffer under local_root
+" is a file on the host too and is sent, its neighbours are not.
+let g:simpleremote_workspace = {'id': 5, 'kind': 'ssh', 'target': 'h',
+      \ 'root': '/srv/app', 'local_root': s:mount, 'mode': 'sshfs'}
+execute 'silent file ' .. fnameescape(s:mount .. '/pkg/m.py')
+call assert_equal(v:true, s:Call('BufferServable', bufnr('%')),
+      \ 'the projection makes it the same file the servers see')
+execute 'silent file ' .. fnameescape(s:mount .. '-other/m.py')
+call assert_equal(v:false, s:Call('BufferServable', bufnr('%')),
+      \ 'a sibling of the mount is not part of the workspace')
+let g:simpleremote_workspace = {'id': 4, 'kind': 'ssh', 'target': 'h',
+      \ 'root': '/srv/app', 'local_root': '', 'mode': 'virtual'}
 
 " -------------------------------------------------------- python fallback ---
 
@@ -231,6 +259,27 @@ call assert_equal({'python': '/opt/py/bin/python', 'lsp': ''},
       \ s:Call('EffectivePythonSelection', g:simpleremote_workspace),
       \ 'an explicit selection always wins over the probe')
 let g:simplecc_python_path = ''
+
+" A probe entry that is not a string is no answer at all: it used to be
+" assigned into a string variable before the guard could look at it, which
+" threw E1012 out of EffectivePythonSelection() -- and, since SendInitialize()
+" calls it, would have left the daemon initialized for nothing.
+let g:simpleremote_workspace.probe = {'python': 42, 'python_lsp': v:null,
+      \ 'status': 0}
+call assert_equal({'python': '', 'lsp': ''},
+      \ s:Call('EffectivePythonSelection', g:simpleremote_workspace))
+
+" A probe that is still in flight is seeded {status: -1} by SimpleRemote; it
+" is not "not run" for the fallback either, it simply has no python in it.
+let g:simpleremote_workspace.probe = {'status': -1}
+call assert_equal({'python': '', 'lsp': ''},
+      \ s:Call('EffectivePythonSelection', g:simpleremote_workspace))
+call assert_equal(v:true, s:Call('ProbePending', {'status': -1}))
+call assert_equal(v:true, s:Call('ProbePending', {}))
+call assert_equal(v:false, s:Call('ProbePending', {'status': 0}),
+      \ 'a probe that ran and found nothing is an answer')
+call assert_equal(v:false, s:Call('ProbePending', {'status': -1, 'error': 'timed out'}),
+      \ 'and so is one that failed')
 
 call delete(s:mount, 'rf')
 

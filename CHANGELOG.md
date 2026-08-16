@@ -68,6 +68,41 @@
   事件驱动的挂载与延迟跳转、远程 workspace edit、配置热重载与健康报告;Rust 侧
   补了 `remote_command()` 的 argv 与两个新请求的反序列化测试。
 
+### 连着远程时,本地 buffer 不再被当成远端文件
+
+- 工作区连着的时候每个 language server 都跑在主机上,所以现在只有主机上的文件
+  会发出去:属于本次连接的 `remote://` buffer,或投影模式下挂载点里的本地文件。
+  只存在于这台机器上的 buffer(`~/scratch.py`、另一个项目、本地配置文件)不再
+  发给远端 server——以前会发,而 server 回答的 `file:///home/…/scratch.py` 又被
+  `UriToPath()` 当成远端路径映射成 `remote:///home/…/scratch.py`,于是在这个
+  buffer 里按 `gd` 会跳进一台主机上并不存在的远程文件,诊断走的是同一条路。
+  断开之后 daemon 重启,这些 buffer 照旧由本地 server 服务。
+- `:SimpleCCHealth` 的 CONTEXT 段直说这件事:连着远程时本地文件会被标成
+  `local file: outside the remote workspace`,而不是只留下一句
+  `document: never opened on the server`。
+
+### 探针里的非字符串值不再让 initialize 半路夭折
+
+- `EffectivePythonSelection()` 先把探针值赋进 string 变量、再检查类型,类型不对
+  时抛的是 E1012,底下那句 `if type(python) != v:t_string` 永远轮不到执行;
+  `HealthRemote()` 用 `==#` 直接比较未定型的值,抛 E1030。前者由
+  `SendInitialize()` 调用,一抛异常 daemon 就再也不会 ready。现在两处都先读进
+  未定型变量、判过类型再用(`ProbeString()`)。
+- SimpleRemote 在探针启动的那一刻就把 `runtime_probe` 播成 `{status: -1}`,
+  `empty(probe)` 因此判不出"还没跑完":连上后的头一秒里 `:SimpleCCHealth` 会说
+  `remote python: (none found)`,还建议去 `:SimpleCCPython` 指一个,而
+  "not run yet" 反倒只有完全没装 runtime 的人看得到。`ProbePending()` 现在把只
+  带一个负 `status` 的探针也算作还没回答。
+
+### 调用/类型层级的列跟其它列表一样准
+
+- `callHierarchy/incomingCalls`、`outgoingCalls` 和类型层级的 quickfix 条目没带
+  `user_data.character`,`QfEnter()` 只能把字节列当 UTF-16 列反推。列表是在目标
+  buffer 还加载着的时候建的(那时是真实字节列),而 buffer 之后可能被卸载或被
+  workspace edit 换掉,`<CR>` 于是落在符号后面很远的地方。三个生产者现在都带上
+  LSP 列,并和其它列表一样绑上 SimpleCC 的 `<CR>`——因此也会等 `remote://`
+  buffer 读完再放光标,跳转后关闭列表,与引用/诊断列表一致。
+
 ### 原生扩展点只接管真正有 server 的 buffer
 
 - `gq` 在没有 language server 的 filetype 里什么都不做了。`SendDidOpen()` 会给

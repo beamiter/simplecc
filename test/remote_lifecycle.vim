@@ -333,6 +333,19 @@ sleep 50m
 call assert_equal([], s:Traced('textDocument/didOpen'), 'nofile buffers are never sent')
 setlocal buftype=
 
+" A file that exists only on this machine is not sent either: every server
+" runs on the host, so it could not resolve the file -- and the file:// URIs
+" it answered with would be read back as paths on the host, which turned a
+" `gd` inside a local buffer into a jump to remote://<that local path>.
+let s:local_file = tempname() .. '.py'
+call writefile(['import os', 'y = 2'], s:local_file)
+call writefile([], s:trace)
+execute 'edit ' .. fnameescape(s:local_file)
+call assert_equal('python', &filetype)
+sleep 50m
+call assert_equal([], s:Traced('textDocument/didOpen'),
+      \ 'a local buffer is not offered to the servers on the host')
+
 " ---------------------------------------------- deferred jumps into remote ---
 
 call writefile(['line 1', 'line 2', 'line 3', 'line 4', 'a中😀z tail'],
@@ -380,6 +393,42 @@ call simplecc#QfEnter()
 call assert_equal('remote://' .. s:remote_root .. '/pkg/target.py', bufname('%'))
 call assert_equal(1, s:Wait("line('.') == 5", 2000), 'QfEnter defers into the unread buffer')
 call assert_equal(9, col('.'), 'and uses the UTF-16 column, not the estimate')
+
+" The call- and type-hierarchy lists are the same kind of list and get the
+" same <CR>.  Their columns are built while the target buffer is loaded, so
+" they are the real byte columns -- and by the time <CR> is pressed that
+" buffer may have been dropped and have to be read again, which is exactly
+" when a byte column must not be re-read as a UTF-16 one.
+execute 'buffer ' .. s:mod
+call s:Call('OnBackendEvent', {'type': 'incomingCalls', 'calls': [
+      \ {'item': {'uri': s:target_uri, 'line': 4, 'character': 4,
+      \   'kind': 'function', 'name': 'caller'}}]})
+call assert_equal('quickfix', &buftype, 'the incoming-calls list is open')
+let s:calls = getqflist()
+call assert_equal(1, len(s:calls))
+call assert_equal({'character': 4}, s:calls[0].user_data,
+      \ 'the UTF-16 column travels with the entry')
+call assert_equal(9, s:calls[0].col, 'the loaded buffer gives the real byte column')
+" ... and now the buffer is unloaded (a hidden remote buffer is dropped, a
+" reconnect re-reads it), so pressing <CR> reads it again, asynchronously.
+execute 'bunload! ' .. bufnr('remote://' .. s:remote_root .. '/pkg/target.py')
+call cursor(1, 1)
+call simplecc#QfEnter()
+call assert_equal('remote://' .. s:remote_root .. '/pkg/target.py', bufname('%'),
+      \ 'the entry opens the remote buffer')
+call assert_equal(1, s:Wait("line('.') == 5", 2000),
+      \ 'and the cursor is placed once the contents arrive')
+call assert_equal(9, col('.'),
+      \ 'on the UTF-16 column from user_data, not on byte column 8')
+
+" The type hierarchy is the same list, built by the same producer.
+call s:Call('OnBackendEvent', {'type': 'supertypes', 'items': [
+      \ {'uri': s:target_uri, 'line': 4, 'character': 4,
+      \   'kind': 'class', 'name': 'Base'}]})
+call assert_equal('quickfix', &buftype, 'the supertypes list is open')
+call assert_equal({'character': 4}, getqflist()[0].user_data,
+      \ 'and carries the LSP column like every other list')
+cclose
 
 " ------------------------------------------ out-of-root definitions: remote ---
 
@@ -584,6 +633,12 @@ sleep 100m
 for s:open in s:Traced('textDocument/didOpen')
   call assert_equal(1, s:open.uri !~# s:remote_root, 'stale remote buffer replayed locally: ' .. s:open.uri)
 endfor
+" The local file that was inert while connected is served again the moment
+" the servers are local ones.
+call assert_equal(1, index(map(copy(s:Traced('textDocument/didOpen')),
+      \ {_, m -> m.uri}), 'file://' .. s:local_file) >= 0,
+      \ 'the local buffer is opened on the local servers after the disconnect: '
+      \ .. string(map(copy(s:Traced('textDocument/didOpen')), {_, m -> m.uri})))
 " A Disconnected for a workspace that was never served is not a restart.
 call s:Disconnect('disconnect')
 sleep 300m
@@ -594,6 +649,7 @@ call s:Wait("g:simplecc_status ==# ''", 3000)
 call delete(s:daemon)
 call delete(s:trace)
 call delete(s:host, 'rf')
+call delete(s:local_file)
 
 if len(v:errors)
   call writefile(v:errors, s:root .. '/test/remote-lifecycle-errors.log')

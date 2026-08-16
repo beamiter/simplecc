@@ -189,10 +189,14 @@ happens when SimpleRemote is not installed.
   forwarded to every server as `workspace/didChangeWatchedFiles`. The daemon
   runs no filesystem watcher for a remote workspace, so this is how the servers
   learn that a module appeared or went away.
-- **What is not sent.** A `remote://` buffer is sent only while connected and
-  only when *that* connection filled it, so a buffer left over from a previous
-  host is never replayed to a new one, and nothing from the old host reaches
-  the local servers after a disconnect.
+- **What is sent.** While a workspace is connected every server runs on the
+  host, so only the host's files reach them: a `remote://` buffer of *that*
+  connection, or a local file under the mount in a projected mode. A buffer
+  that exists only on this machine is left alone until the connection ends —
+  a server could not resolve it, and the URIs it answered with would be read
+  back as paths on the host. A buffer left over from a previous host is never
+  replayed to a new one, and nothing from the old host reaches the local
+  servers after a disconnect.
 
 When SimpleRemote's Rust runtime is installed, SimpleCC launches the language
 server through `simpleremote-daemon exec`. Filesystem RPC and LSP processes
@@ -213,7 +217,10 @@ different command or pyright settings are needed. Set
 `:SimpleCCHealth` grows a REMOTE section — workspace, generation, projection
 mode, runtime and protocol, probe results, effective Python selection, and
 whether the remote configuration parses — and `:SimpleCC` appends SimpleRemote's
-status line.
+status line. A probe that has been started but has not answered yet is reported
+as "not run yet" rather than as a host without Python, and the CONTEXT section
+says when the buffer you are in is a local file the connected servers cannot
+see.
 
 Run `:SimpleCCPython` to discover project virtual environments, the active
 venv or conda environment, every environment reported by conda, and system

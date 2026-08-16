@@ -354,7 +354,10 @@ g:simplecc_remote_auto_restart   number  default: 1
         disconnects, so language servers and URI mapping follow the active
         remote workspace.  A reconnect to the workspace already being served,
         and the "reconnect" half of a workspace switch, never restart
-        anything.  See |simplecc-remote|.
+        anything.  Turning it off leaves the daemon on the servers it has; it
+        does not change which buffers are sent — while a workspace is
+        connected, only the files that exist on the host are.  See
+        |simplecc-remote|.
 
                                       *g:simplecc_python_path*
 g:simplecc_python_path          string  default: empty
@@ -672,18 +675,30 @@ nothing is mounted there: "go to definition" reaches the real file instead of
 a same-named local path that is empty or, worse, a different file.
 
 Jumps into a remote:// buffer that has not been read yet (definitions,
-references, showDocument, quickfix entries) wait for the contents and then
-place the cursor, converting the LSP UTF-16 column against the real line.
-Until the file arrives, a quickfix column is the UTF-16 offset as an estimate.
+references, showDocument, quickfix entries, call and type hierarchies) wait
+for the contents and then place the cursor, converting the LSP UTF-16 column
+against the real line.  Every SimpleCC list carries that column with the
+entry, so <CR> is exact even when the buffer was unloaded after the list was
+built.  Until the file arrives, a quickfix column is the UTF-16 offset as an
+estimate.
 
 What is sent ~
 
-A remote:// buffer is sent to the servers only while a workspace is connected
-and only when that connection filled it: a buffer left over from a previous
-host is never replayed to the new one, and after a disconnect nothing from
-the old host reaches the local servers.  Buffers with a 'buftype' other than
-empty or "acwrite" — quickfix lists, terminals, prompts — are never sent at
-all.
+While a workspace is connected every language server runs on the host, so
+only the host's files are sent to them: a remote:// buffer of that connection,
+or, in a projected mode, a local file under the mount, which is the same file
+seen from this side.  A buffer that exists only on this machine — a scratch
+file, another project, a local dotfile — is left alone until the connection
+ends; sending it would hand a server text it cannot resolve, and every URI
+that server answered with would name a path on the host, so a jump inside it
+would open a remote:// buffer for a file that is not there.  The disconnect
+restarts the daemon and those buffers are served by the local servers again.
+
+A remote:// buffer is sent only while a workspace is connected and only when
+that connection filled it: a buffer left over from a previous host is never
+replayed to the new one, and after a disconnect nothing from the old host
+reaches the local servers.  Buffers with a 'buftype' other than empty or
+"acwrite" — quickfix lists, terminals, prompts — are never sent at all.
 
 Configuration ~
 
@@ -729,9 +744,11 @@ Diagnosis ~
 |:SimpleCCHealth| grows a REMOTE section: the workspace and its generation,
 the projection mode, the runtime and its protocol, what the probe found, the
 effective Python selection, and whether the remote configuration parses and
-which servers it declares.  Remote server commands are reported as remote
-rather than checked with executable() locally, and |:SimpleCC| appends
-SimpleRemote's status line.
+which servers it declares.  A probe that has been started but has not answered
+yet is reported as "not run yet", not as a host without Python.  Remote server
+commands are reported as remote rather than checked with executable() locally,
+and |:SimpleCC| appends SimpleRemote's status line.  The CONTEXT section says
+when the buffer you are in is a local file the connected servers cannot see.
 
 ==============================================================================
 TROUBLESHOOTING                                     *simplecc-troubleshooting*
