@@ -435,6 +435,33 @@ cclose
 call assert_equal('remote:///usr/lib/python3/os.py', simplecc#UriToPath('file:///usr/lib/python3/os.py'),
       \ 'a definition outside the workspace root opens as a remote buffer')
 
+" ... unless this editor is holding the file itself.  A local buffer is
+" outside the root too, and its own file:// URI comes back in a diagnostic, a
+" definition or a workspace edit; reading that as a path on the host turned a
+" jump inside ~/scratch.py into remote:///home/.../scratch.py, a file the
+" BufReadCmd cannot read because the host does not have it.
+let s:scratch = tempname() .. '/scratch.py'
+call mkdir(fnamemodify(s:scratch, ':h'), 'p')
+call writefile(['import os', 'def here(): pass', 'here()'], s:scratch)
+execute 'edit ' .. fnameescape(s:scratch)
+let s:scratch_buf = bufnr('%')
+execute 'buffer ' .. s:mod
+call s:Call('JumpToLocation', {'uri': 'file://' .. s:scratch, 'line': 1, 'character': 4})
+call assert_equal(s:scratch_buf, bufnr('%'),
+      \ 'a jump into a local file lands in the buffer that holds it')
+call assert_equal(2, line('.'))
+call assert_equal(5, col('.'),
+      \ 'on a column converted against a line that is actually there')
+call assert_equal(0, bufexists('remote://' .. s:scratch),
+      \ 'and no remote buffer was opened for a file the host does not have')
+
+" Once nothing here holds the path it is the host's again, like every other
+" out-of-root file.
+execute 'buffer ' .. s:mod
+execute 'bwipeout! ' .. s:scratch_buf
+call assert_equal('remote://' .. s:scratch, simplecc#UriToPath('file://' .. s:scratch))
+call delete(fnamemodify(s:scratch, ':h'), 'rf')
+
 " ------------------------------------------ workspace edits on remote files ---
 
 " A text edit for a remote file that has no buffer: the buffer is loaded

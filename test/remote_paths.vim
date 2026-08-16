@@ -238,6 +238,87 @@ call assert_equal(v:false, s:Call('BufferServable', bufnr('%')),
 let g:simpleremote_workspace = {'id': 4, 'kind': 'ssh', 'target': 'h',
       \ 'root': '/srv/app', 'local_root': '', 'mode': 'virtual'}
 
+" ----------------------------------------------- a local buffer's own URI ---
+
+" Outside the workspace root two very different things live: the paths the
+" server reports from the host -- the stdlib, site-packages, ~/.cargo/registry
+" -- and every ordinary local buffer, ~/scratch.py or a checkout of another
+" project.  The rule that turns the first into a remote:// buffer used to
+" swallow the second as well, so a diagnostic for a local file was filed under
+" a key its buffer never looks up and a jump inside it went to
+" remote:///home/.../scratch.py, a file the host does not have.  A buffer open
+" for exactly that path is what tells them apart.
+let s:scratch_dir = tempname()
+call mkdir(s:scratch_dir, 'p')
+let s:scratch = s:scratch_dir .. '/scratch.py'
+call writefile(['import os'], s:scratch)
+let s:pane = s:scratch_dir .. '/pane.py'
+
+let g:simpleremote_workspace = {'id': 6, 'kind': 'ssh', 'target': 'h',
+      \ 'root': '/srv/app', 'local_root': '', 'mode': 'virtual'}
+
+" Nothing here holds it: the path is one the host reported.
+call assert_equal('remote://' .. s:scratch, simplecc#UriToPath('file://' .. s:scratch),
+      \ 'an out-of-root path no buffer claims is a path on the remote host')
+
+execute 'silent edit ' .. fnameescape(s:scratch)
+call assert_equal('file://' .. s:scratch, s:Call('BufUri', bufnr('%')),
+      \ 'a local buffer is still spelled with its own path')
+call assert_equal(s:scratch, simplecc#UriToPath('file://' .. s:scratch),
+      \ 'and that URI maps back to the buffer it came from')
+call assert_equal(s:scratch, s:Call('BufDiagKey', bufnr('%')),
+      \ 'so its diagnostics are filed where the buffer looks for them')
+
+" The other direction, unchanged: what the server reports from the host.
+call assert_equal('remote:///usr/lib/python3.12/os.py',
+      \ simplecc#UriToPath('file:///usr/lib/python3.12/os.py'),
+      \ 'a definition in the remote stdlib still opens as a remote buffer')
+call assert_equal('remote:///srv/app/x.py', simplecc#UriToPath('file:///srv/app/x.py'),
+      \ 'and nothing inside the root is ever taken from a local buffer')
+
+" A projection changes nothing about either: the mount covers the root, and
+" both of these are outside it.
+let g:simpleremote_workspace.mode = 'sshfs'
+let g:simpleremote_workspace.local_root = s:mount
+call assert_equal(s:scratch, simplecc#UriToPath('file://' .. s:scratch))
+call assert_equal('remote:///usr/lib/python3.12/os.py',
+      \ simplecc#UriToPath('file:///usr/lib/python3.12/os.py'))
+let g:simpleremote_workspace.mode = 'virtual'
+let g:simpleremote_workspace.local_root = ''
+
+" A buffer that is listed but unloaded is still one this editor holds:
+" 'nohidden' unloads a file the moment another one is edited, and a
+" diagnostic for it has to keep landing in the same place.
+enew!
+call assert_equal(0, bufloaded(s:scratch), 'abandoned, so unloaded')
+call assert_equal(1, buflisted(s:scratch), 'but still a file this editor holds')
+call assert_equal(s:scratch, simplecc#UriToPath('file://' .. s:scratch))
+
+" A remote:// buffer is not a local buffer for the same file: the stdlib file
+" the last jump opened must not make the next URI for it local.
+silent file remote:///usr/lib/python3.12/os.py
+call assert_equal('remote:///usr/lib/python3.12/os.py',
+      \ simplecc#UriToPath('file:///usr/lib/python3.12/os.py'))
+bwipeout!
+
+" Neither is a scratch pane that merely wears a file's name.
+enew!
+execute 'silent file ' .. fnameescape(s:pane)
+setlocal buftype=nofile
+call assert_equal('remote://' .. s:pane, simplecc#UriToPath('file://' .. s:pane))
+setlocal buftype=
+call assert_equal(s:pane, simplecc#UriToPath('file://' .. s:pane),
+      \ 'the same buffer as a file buffer does claim the path')
+bwipeout!
+
+" And once the buffer is gone the path is the host's again.
+execute 'bwipeout! ' .. bufnr(s:scratch)
+call assert_equal('remote://' .. s:scratch, simplecc#UriToPath('file://' .. s:scratch))
+call delete(s:scratch_dir, 'rf')
+
+let g:simpleremote_workspace = {'id': 4, 'kind': 'ssh', 'target': 'h',
+      \ 'root': '/srv/app', 'local_root': '', 'mode': 'virtual'}
+
 " -------------------------------------------------------- python fallback ---
 
 " With no :SimpleCCPython selection, a remote workspace takes the interpreter

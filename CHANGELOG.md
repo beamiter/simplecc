@@ -81,6 +81,25 @@
   `local file: outside the remote workspace`,而不是只留下一句
   `document: never opened on the server`。
 
+### 本地 buffer 自己的 URI 不再被映射成 remote://
+
+- 工作区根之外既住着 server 从主机上报的路径(stdlib、site-packages、
+  `~/.cargo/registry`),也住着这台机器上每一个普通的本地 buffer(`~/scratch.py`、
+  本地配置文件、另一个项目的 checkout)。“根之外一律 `remote://`”这条规则是为前
+  者写的,却把后者一并吞了:本地 buffer 自己的 `file:///home/…/scratch.py` 被
+  daemon 原样回传(诊断、定义、workspace edit)时会被当成主机上的路径,于是在这
+  个 buffer 里 `gd` 会跳进 `remote:///home/…/scratch.py`——主机上并不存在的文
+  件;它的诊断也被存进 buffer 永远不会去查的那个 key 下。
+- 现在只有当这个编辑器自己就持有那个文件时,路径才算本地:存在同名 buffer,加载
+  着的,或者列在 buffer 列表里但已卸载的(`nohidden` 下打开另一个文件就会卸载
+  它)。`:bdelete` 掉的 buffer 不算,只是顶着文件名的 scratch pane(`buftype` 既
+  非空也非 `acwrite`)也不算。其余照旧映射成 `remote://`,根以内的路径更是一律属
+  于工作区,不会因为本地存在同名文件而改变。
+- `test/remote_paths.vim` 覆盖两个方向:本地 buffer 的 URI 映射回它自己,根外的
+  主机路径(stdlib)与根内的路径仍是 `remote://`;投影模式、已卸载、`:bdelete`
+  之后、`nofile` 这几个边界也在内。`test/remote_lifecycle.vim` 端到端跳一次:本
+  地 buffer 里的定义跳转停在这个 buffer 里,不再另开一个 `remote://` buffer。
+
 ### 探针里的非字符串值不再让 initialize 半路夭折
 
 - `EffectivePythonSelection()` 先把探针值赋进 string 变量、再检查类型,类型不对

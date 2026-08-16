@@ -174,8 +174,13 @@ happens when SimpleRemote is not installed.
   (sshfs, docker-bind, local-map) or a `remote://` buffer in virtual mode; a URI
   outside the root — the standard library, site-packages,
   `~/.cargo/registry` — opens as a `remote://` buffer in every mode, because
-  nothing is mounted there. Jumps into a buffer that is still being read wait
-  for the text and then place the cursor on the right UTF-16 column.
+  nothing is mounted there. A file this Vim is holding itself is the exception:
+  an ordinary local buffer is outside the root too, and its own URI comes back
+  in diagnostics, locations and workspace edits, so a buffer open for exactly
+  that path keeps the path local instead of sending a jump inside it to a
+  `remote://` buffer for a file the host does not have. Jumps into a buffer
+  that is still being read wait for the text and then place the cursor on the
+  right UTF-16 column.
 - **Workspace edits.** Rename symbol and code actions apply to remote files:
   edits for a file with no buffer wait for its contents, create/rename/delete
   run on the host through SimpleRemote's agent connection, and the server is

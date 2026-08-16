@@ -752,6 +752,35 @@ def IsRemoteWorkspacePath(path: string): bool
   return !empty(RemotePath(path))
 enddef
 
+# `path` back when this editor is itself holding a buffer for that file, '' when
+# it is not.
+#
+# While a workspace is connected the same absolute path can name two different
+# files: one on the host, one here.  Which of them a file:// URI means is
+# decided by where the URI came from, and not every URI comes from the host —
+# the ones this editor sent for its own local buffers are echoed back verbatim,
+# in a diagnostic, in the definition a server answers with, in a workspace
+# edit.  A buffer open for exactly that path is the evidence that settles it:
+# that file is here, so the URI names this buffer.
+#
+# Only a file buffer counts.  One that is listed but unloaded is still one of
+# them — 'nohidden' unloads a file the moment another is edited — while a
+# :bdelete'd buffer is not, and a scratch pane that merely wears a file's name
+# never was.
+def LocalBufferPath(path: string): string
+  if path !~# '^/' || (!buflisted(path) && !bufloaded(path))
+    return ''
+  endif
+  var nr = bufnr(path)
+  # buflisted()/bufloaded() matched a buffer name exactly, so bufnr() answers
+  # with that same buffer rather than falling back to pattern matching.
+  if nr <= 0 || bufname(nr) =~# '^remote://'
+    return ''
+  endif
+  var buftype = getbufvar(nr, '&buftype', '')
+  return buftype ==# '' || buftype ==# 'acwrite' ? path : ''
+enddef
+
 # The Vim path to open for a remote absolute path.
 #
 # Inside the workspace root a projection (sshfs, docker-bind, local-map) maps
@@ -762,6 +791,16 @@ enddef
 # agent can read (only g:SimpleRemoteReadFile confines itself to the root),
 # which is what turns "go to definition" into a readable file instead of a
 # same-named local path that is empty or, worse, a different file.
+#
+# That rule is about the paths the *server* reports, though, and out-of-root is
+# also where every ordinary local buffer lands: ~/scratch.py, a dotfile, a
+# checkout of another project.  Sending those through it made a jump inside one
+# of them open remote:///home/…/scratch.py — a file the host does not have —
+# and filed their diagnostics under a key the buffer never looks up.  So the
+# host's path wins unless this editor is holding the file itself, which is the
+# one case where the URI provably did not come from the host.  Inside the root
+# nothing is guessed: those paths are the workspace's, and the projection (or
+# remote://) is what they mean even when a local file of the same name exists.
 def LocalPath(path: string, workspace: dict<any>): string
   if path !~# '^/'
     # Not an absolute remote path — 'file://' with nothing after it, or a
@@ -772,7 +811,8 @@ def LocalPath(path: string, workspace: dict<any>): string
   endif
   var root = substitute(get(workspace, 'root', ''), '/\+$', '', '')
   if !UnderPath(path, empty(root) ? '/' : root)
-    return 'remote://' .. path
+    var held = LocalBufferPath(path)
+    return held ==# '' ? 'remote://' .. path : held
   endif
   var local_root = substitute(get(workspace, 'local_root', ''), '/\+$', '', '')
   if empty(local_root)

@@ -674,6 +674,17 @@ definition lands — is opened as a remote:// buffer in every mode, since
 nothing is mounted there: "go to definition" reaches the real file instead of
 a same-named local path that is empty or, worse, a different file.
 
+That rule is about the paths the server reports.  A file this Vim is holding
+itself is outside the root as well — ~/scratch.py, a dotfile, a checkout of
+another project — and the URI it is spelled with comes back from the daemon
+in a diagnostic, in a location, in a workspace edit.  A buffer open for
+exactly that path (loaded, or listed and unloaded) is what tells the two
+machines apart: the file is here, so the URI means this buffer, and a jump
+inside it stays there instead of opening a remote:// buffer for a file the
+host does not have.  Its diagnostics are filed under the same local path the
+buffer looks itself up by.  Inside the root nothing is guessed: those paths
+belong to the workspace even when a local file of the same name exists.
+
 Jumps into a remote:// buffer that has not been read yet (definitions,
 references, showDocument, quickfix entries, call and type hierarchies) wait
 for the contents and then place the cursor, converting the LSP UTF-16 column
