@@ -50,6 +50,10 @@ call cursor(2000, 1)
 
 " --------------------------------------------------------------- matching ---
 
+" 'nomagic' is a search preference, not a completion-token grammar.  The
+" splitter contains a magic dot and used to stop finding words when this was
+" set in the user's vimrc.
+set nomagic
 let s:near = s:Words(s:Collect('nearbyword', {}, 20))
 call assert_true(index(s:near, 'nearbyword_alpha') >= 0, 'a word just above the cursor is found')
 call assert_true(index(s:near, 'nearbyword_beta') >= 0, 'a word just below the cursor is found')
@@ -74,6 +78,7 @@ call assert_true(index(s:dup, 'nearbyword_beta') >= 0, 'other matches still come
 call assert_equal(3, len(s:Collect('filler_', {}, 3)), 'the item limit is respected')
 call assert_equal([], s:Collect('filler_', {}, 0), 'a zero limit collects nothing')
 call assert_equal([], s:Collect('', {}, 20), 'an empty prefix collects nothing')
+set magic
 
 " ------------------------------------------------------------- scan bound ---
 

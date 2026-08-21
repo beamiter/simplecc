@@ -116,7 +116,8 @@ Each language-server entry supports:
 - <code>command</code>: executable name or absolute path.
 - <code>args</code>: command-line arguments.
 - <code>filetypes</code>: Vim filetypes handled by the server.
-- <code>rootPatterns</code>: project marker names.
+- <code>rootPatterns</code>: non-empty project marker names. An empty list uses
+  the workspace root.
 - <code>priority</code>: optional integer used when multiple servers handle the
   same filetype. Higher values win; ties are ordered by server name so
   selection is stable.

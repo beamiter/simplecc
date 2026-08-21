@@ -104,7 +104,8 @@ Entry fields:
 command                 Executable name or absolute path.
 args                    Command-line arguments.
 filetypes               Vim filetypes handled by the server.
-rootPatterns            Project marker filenames.
+rootPatterns            Non-empty project marker filenames.  An empty list
+                        uses the workspace root.
 priority                Optional integer server priority.  Higher values win;
                         ties are ordered by server name.
 initializationOptions   Value sent during LSP initialization.
@@ -879,7 +880,9 @@ What it guarantees:
 DAEMON COMMAND LINE                                      *simplecc-daemon-cli*
 
 The daemon takes no arguments in normal use: the plugin starts it and speaks
-JSON over its stdin and stdout.  For diagnosis it also answers: >
+JSON over its stdin and stdout.  One UTF-8 request line is limited to 64 MiB;
+an oversized record is rejected without losing the next record.  For
+diagnosis it also answers: >
 
   simplecc-daemon --version
   simplecc-daemon --help

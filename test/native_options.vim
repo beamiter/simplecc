@@ -108,6 +108,10 @@ call assert_equal('simplecc#FormatExpr()', &l:formatexpr, 'gq must reach the ser
 
 " ----------------------------------------------------------------- omnifunc ---
 
+" Vim's 'magic' option controls searches typed by the user; it must not change
+" where the LSP completion hook finds an identifier or how tagfunc flags are
+" classified.
+set nomagic
 call cursor(2, 17)
 call assert_equal(12, simplecc#OmniFunc(1, ''),
       \ 'findstart reports the byte where the keyword before the cursor begins')
@@ -133,6 +137,7 @@ call assert_equal(v:null, simplecc#TagFunc('somethingElse', 'c', {}),
       \ ':tag typed by hand must fall back to the tags file')
 call assert_equal(v:null, simplecc#TagFunc('thing', 'ir', {}),
       \ 'insert-mode tag completion must fall back to the tags file')
+set magic
 
 " --------------------------------------------------------------- formatexpr ---
 

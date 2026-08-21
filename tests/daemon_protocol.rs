@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn temporary_workspace(label: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
@@ -112,4 +113,180 @@ fn malformed_input_does_not_poison_the_next_request() {
             .any(|event| event["type"] == "shutdown" && event["id"] == 8)
     );
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn accepted_feature_request_is_drained_after_eof() {
+    // This request is dispatched on the feature-task set rather than handled
+    // inline. Closing stdin immediately after writing it used to abort that
+    // task during daemon shutdown and produce no reply at all.
+    let events = run_daemon(&[json!({
+        "type": "server/listInstallable",
+        "id": 91,
+    })]);
+    assert!(events.iter().any(|event| {
+        event["type"] == "installableServers" && event["id"] == 91 && event["servers"].is_array()
+    }));
+}
+
+#[test]
+fn unread_stdout_cannot_hold_eof_shutdown_forever() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simplecc-daemon"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for id in 1..=256 {
+            writeln!(
+                stdin,
+                "{}",
+                json!({"type": "server/listInstallable", "id": id})
+            )
+            .unwrap();
+        }
+    }
+    drop(child.stdin.take());
+
+    // Keep stdout piped and unread.  The writer's dedicated-thread deadline
+    // must let the process terminate even after the pipe fills.
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("daemon did not bound EOF shutdown under stdout backpressure");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
+}
+
+#[test]
+fn ordered_did_open_cannot_block_eof_behind_stdout_backpressure() {
+    let workspace = temporary_workspace("did-open-backpressure");
+    let requests_path = workspace.join("requests.jsonl");
+    {
+        let mut requests = std::fs::File::create(&requests_path).unwrap();
+        writeln!(
+            requests,
+            "{}",
+            json!({
+                "type": "initialize",
+                "id": 1,
+                "root": "/workspace",
+                "remote": {
+                    "kind": "ssh",
+                    "target": "unused",
+                    "root": "/workspace",
+                    "runtime": "/definitely/not-a-simplecc-runtime"
+                },
+                "remoteConfig": serde_json::json!({
+                    "languageServers": {
+                        "stall-test": {
+                            "command": "never-run",
+                            "filetypes": ["stall-test"]
+                        }
+                    }
+                }).to_string()
+            })
+        )
+        .unwrap();
+        // Fill the bounded stdout path before the ordered didOpen. The daemon
+        // must not depend on PATH or a real language server to reach the
+        // Registry status producer exercised below.
+        for id in 2..=8_001 {
+            writeln!(
+                requests,
+                "{}",
+                json!({"type": "server/listInstallable", "id": id})
+            )
+            .unwrap();
+        }
+        writeln!(
+            requests,
+            "{}",
+            json!({
+                "type": "textDocument/didOpen",
+                "id": 9_000,
+                "uri": "file:///workspace/stall.test",
+                "languageId": "stall-test",
+                "version": 1,
+                "text": "test"
+            })
+        )
+        .unwrap();
+    }
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simplecc-daemon"))
+        .stdin(Stdio::from(std::fs::File::open(&requests_path).unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(&workspace);
+            panic!("ordered didOpen remained blocked behind stdout backpressure");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let _ = std::fs::remove_dir_all(&workspace);
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
+}
+
+#[test]
+fn stdout_stall_interrupts_an_open_idle_stdin() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_simplecc-daemon"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut sent = 0;
+    for id in 1..=8_000 {
+        match writeln!(
+            stdin,
+            "{}",
+            json!({"type": "server/listInstallable", "id": id})
+        ) {
+            Ok(()) => sent += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => break,
+            Err(error) => panic!("could not write request flood: {error}"),
+        }
+    }
+    assert!(
+        sent > 4_096,
+        "fixture never exceeded the stdout channel capacity"
+    );
+
+    // Intentionally keep stdin open and send nothing else. The EventTx notify,
+    // not EOF or another request, must wake the blocked input loop.
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stdout stall did not interrupt an idle stdin read");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    drop(stdin);
+    assert!(status.success(), "daemon exited unsuccessfully: {status}");
 }

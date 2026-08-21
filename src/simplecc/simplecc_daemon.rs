@@ -10,8 +10,9 @@ use lsp::types;
 use registry::{EventTx, Registry};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::Write as StdWrite;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
 use workspace_watcher::WorkspaceWatcher;
 
@@ -497,6 +498,10 @@ impl Request {
     fn is_lifecycle_barrier(&self) -> bool {
         matches!(self, Self::Initialize { .. } | Self::Shutdown { .. })
     }
+
+    fn is_install(&self) -> bool {
+        matches!(self, Self::InstallServer { .. })
+    }
 }
 
 fn default_tab_size() -> u32 {
@@ -514,38 +519,94 @@ fn default_completion_trigger_kind() -> u32 {
 
 // ─── stdout writer ───────────────────────────────────────
 
-async fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
-    let mut out = tokio::io::stdout();
-    while let Some(line) = rx.recv().await {
-        if out.write_all(line.as_bytes()).await.is_err() {
-            break;
+/// A didOpen/didChange request carries the whole source buffer in one JSONL
+/// record. Keep that record large enough for real source files but finite: a
+/// client that loses its newline must not grow the daemon until the machine
+/// runs out of memory.
+const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024 * 1024;
+
+fn finish_request_line(mut bytes: Vec<u8>, too_long: bool, limit: usize) -> Result<String, String> {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if too_long || bytes.len() > limit {
+        return Err(format!("request line exceeds {limit} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "request line is not valid UTF-8".to_string())
+}
+
+/// Read one bounded JSONL record and discard the remainder of an oversized
+/// record through its newline. The next valid request can then still be
+/// processed; `AsyncBufReadExt::lines()` cannot provide either guarantee.
+async fn read_request_line<R>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Result<String, String>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut too_long = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() && !too_long {
+                Ok(None)
+            } else {
+                Ok(Some(finish_request_line(bytes, too_long, limit)))
+            };
         }
-        if out.write_all(b"\n").await.is_err() {
-            break;
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        if !too_long {
+            // CR in CRLF is framing, so retain one extra byte until the record
+            // is finished and strip it before enforcing the documented limit.
+            if bytes.len().saturating_add(content_len) > limit.saturating_add(1) {
+                bytes.clear();
+                too_long = true;
+            } else {
+                bytes.extend_from_slice(&available[..content_len]);
+            }
         }
-        let _ = out.flush().await;
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some(finish_request_line(bytes, too_long, limit)));
+        }
     }
 }
 
-fn send_event(tx: &EventTx, event: Value) {
-    let s = serde_json::to_string(&event).unwrap();
-    match tx.try_send(s) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(line)) => {
-            // Preserve request/reply delivery under temporary stdout
-            // backpressure. The cloned sender also keeps the writer alive while
-            // main drains it during shutdown.
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                if tx.send(line).await.is_err() {
-                    eprintln!("[simplecc] stdout channel closed before a reply was written");
-                }
-            });
+fn stdout_writer(mut rx: tokio::sync::mpsc::Receiver<String>) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    while let Some(line) = rx.blocking_recv() {
+        if out.write_all(line.as_bytes()).is_err() {
+            break;
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            eprintln!("[simplecc] stdout channel is closed; reply could not be written");
+        if out.write_all(b"\n").is_err() {
+            break;
         }
+        let _ = out.flush();
     }
+}
+
+async fn send_event_inner(tx: &EventTx, event: Value) {
+    let line = serde_json::to_string(&event).unwrap();
+    if tx.send(line).await.is_err() {
+        eprintln!("[simplecc] stdout stalled or closed before an event was written");
+    }
+}
+
+// Every call site is inside an async request/lifecycle task. Keeping the await
+// in one macro makes it impossible to accidentally detach a reply while still
+// leaving match arms readable.
+macro_rules! send_event {
+    ($tx:expr, $event:expr $(,)?) => {
+        send_event_inner($tx, $event).await
+    };
 }
 
 async fn primary_client(
@@ -576,7 +637,7 @@ async fn primary_client_or_error(
 ) -> Option<Arc<LspClient>> {
     let client = primary_client(registry, language_id).await;
     if client.is_none() {
-        send_event(
+        send_event!(
             out,
             json!({
                 "type": "error",
@@ -648,8 +709,29 @@ fn self_test() -> Result<()> {
     Ok(())
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> std::process::ExitCode {
+const ASYNC_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("simplecc-daemon: could not start runtime: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let exit = runtime.block_on(run_cli());
+    // spawn_blocking extraction/promotion has explicit size and entry bounds,
+    // but a wedged filesystem must still not defeat the process-level shutdown
+    // deadline after its async owner has been aborted.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    exit
+}
+
+async fn run_cli() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => match serve().await {
@@ -681,14 +763,41 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+async fn drain_install_tasks(
+    tasks: &mut tokio::task::JoinSet<()>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let drained = tokio::time::timeout_at(deadline, async {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("[simplecc] install task failed during drain: {error}");
+            }
+        }
+    })
+    .await
+    .is_ok();
+    if !drained {
+        tasks.abort_all();
+        // Give cancellation one scheduler turn so cheap async owners release
+        // process/staging guards, but never start a second unbounded join.
+        tokio::task::yield_now().await;
+        while tasks.try_join_next().is_some() {}
+    }
+    drained
+}
+
 async fn serve() -> Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut stdin = BufReader::new(tokio::io::stdin());
 
     eprintln!("[simplecc] daemon started");
 
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    let mut stdout_task = tokio::spawn(stdout_writer(out_rx));
+    let (sender, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
+    let out_tx = EventTx::new(sender);
+    let (stdout_done_tx, stdout_done_rx) = std::sync::mpsc::channel();
+    let stdout_thread = std::thread::spawn(move || {
+        stdout_writer(out_rx);
+        let _ = stdout_done_tx.send(());
+    });
 
     let registry: Arc<RwLock<Option<Registry>>> = Arc::new(RwLock::new(None));
     let workspace_watcher: Arc<Mutex<Option<WorkspaceWatcher>>> = Arc::new(Mutex::new(None));
@@ -696,8 +805,33 @@ async fn serve() -> Result<()> {
     let uri_ft: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
     let mut request_tasks = tokio::task::JoinSet::new();
+    // Managed-server installation is global, not tied to one LSP registry.
+    // Reinitializing a workspace must not abort extraction/child processes and
+    // strand their staging directory or the in-process installation marker.
+    let mut install_tasks = tokio::task::JoinSet::new();
 
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        if out_tx.is_stalled() {
+            break;
+        }
+        let next_line = tokio::select! {
+            _ = out_tx.wait_stalled() => break,
+            line = read_request_line(&mut stdin, MAX_REQUEST_LINE_BYTES) => line?,
+        };
+        let Some(line) = next_line else {
+            break;
+        };
+        let line = match line {
+            Ok(line) => line,
+            Err(message) => {
+                eprintln!("[simplecc] bad request: {message}");
+                send_event!(
+                    &out_tx,
+                    json!({"type": "error", "id": 0, "message": message}),
+                );
+                continue;
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -721,6 +855,11 @@ async fn serve() -> Result<()> {
                 eprintln!("[simplecc] request task failed: {error}");
             }
         }
+        while let Some(result) = install_tasks.try_join_next() {
+            if let Err(error) = result {
+                eprintln!("[simplecc] install task failed: {error}");
+            }
+        }
 
         // Document notifications must reach the LSP in input order. Spawning
         // didChange and completion independently lets completion win the race
@@ -731,9 +870,27 @@ async fn serve() -> Result<()> {
             // down the registry so they cannot write after the lifecycle edge.
             request_tasks.abort_all();
             while request_tasks.join_next().await.is_some() {}
-            handle_request(req, reg, out, uft, watcher).await;
+            let stalled_out = out.clone();
+            let stalled = tokio::select! {
+                _ = stalled_out.wait_stalled() => true,
+                _ = handle_request(req, reg, out, uft, watcher) => false,
+            };
+            if stalled {
+                break;
+            }
         } else if req.preserves_document_order() {
-            handle_request(req, reg, out, uft, watcher).await;
+            let stalled_out = out.clone();
+            let stalled = tokio::select! {
+                _ = stalled_out.wait_stalled() => true,
+                _ = handle_request(req, reg, out, uft, watcher) => false,
+            };
+            if stalled {
+                break;
+            }
+        } else if req.is_install() {
+            install_tasks.spawn(async move {
+                handle_request(req, reg, out, uft, watcher).await;
+            });
         } else {
             request_tasks.spawn(async move {
                 handle_request(req, reg, out, uft, watcher).await;
@@ -741,30 +898,89 @@ async fn serve() -> Result<()> {
         }
     }
 
-    // Shutdown
-    request_tasks.abort_all();
-    while request_tasks.join_next().await.is_some() {}
-    workspace_watcher.lock().await.take();
-    let mut registry_to_shutdown = registry.write().await.take();
-    if let Some(ref mut reg) = registry_to_shutdown {
-        reg.shutdown_all().await;
+    let shutdown_deadline = tokio::time::Instant::now() + ASYNC_SHUTDOWN_BUDGET;
+
+    // EOF means no more requests, not that replies to requests already
+    // accepted may be discarded. Give feature tasks a bounded opportunity to
+    // finish before tearing down the language servers they use; a wedged LSP
+    // must still not keep a piped daemon alive forever.
+    let drained = tokio::time::timeout_at(shutdown_deadline, async {
+        while let Some(result) = request_tasks.join_next().await {
+            if let Err(error) = result {
+                eprintln!("[simplecc] request task failed during drain: {error}");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        request_tasks.abort_all();
+        tokio::task::yield_now().await;
+        while request_tasks.try_join_next().is_some() {}
     }
-    drop(registry_to_shutdown);
+    // Installs survive workspace lifecycle barriers, but not process EOF for
+    // minutes. Cancellation never deletes a possibly live hidden staging tree;
+    // Unix child groups are killed, and promotion is one non-cancellable sync
+    // critical section, so async owners can be aborted at the shared deadline.
+    drain_install_tasks(&mut install_tasks, shutdown_deadline).await;
+    let shutdown_services = async {
+        workspace_watcher.lock().await.take();
+        let mut registry_to_shutdown = registry.write().await.take();
+        if let Some(ref mut reg) = registry_to_shutdown {
+            reg.shutdown_all().await;
+        }
+        drop(registry_to_shutdown);
+    };
+    if tokio::time::timeout_at(shutdown_deadline, shutdown_services)
+        .await
+        .is_err()
+    {
+        eprintln!("[simplecc] service shutdown exceeded the process deadline");
+    }
 
     // The stdout writer owns the actual pipe. Let it drain every queued reply
     // (especially the shutdown acknowledgement) before the Tokio runtime tears
     // down spawned tasks at process exit.
     drop(out_tx);
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut stdout_task)
-        .await
-        .is_err()
-    {
-        stdout_task.abort();
-        let _ = stdout_task.await;
+    let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if stdout_done_rx.recv_timeout(remaining).is_ok() {
+        let _ = stdout_thread.join();
     }
 
     eprintln!("[simplecc] daemon exiting");
     Ok(())
+}
+
+/// Run one managed-server install and publish its terminal result.
+///
+/// Deliberately owns no Registry handle: an install may outlive an LSP
+/// initialize/shutdown barrier, so completing it must not rewrite whichever
+/// workspace registry happens to have replaced the one that requested it.
+async fn handle_install_request(id: u64, server: String, out: EventTx) {
+    match installer::install_server(&server, &out).await {
+        Ok(path) => send_event!(
+            &out,
+            json!({
+                "type": "installResult",
+                "id": id,
+                "server": server,
+                "status": "ok",
+                "path": path.to_string_lossy(),
+            }),
+        ),
+        Err(error) => {
+            eprintln!("[simplecc] install {server} failed: {error}");
+            send_event!(
+                &out,
+                json!({
+                    "type": "installResult",
+                    "id": id,
+                    "server": server,
+                    "status": "error",
+                    "message": error.to_string(),
+                }),
+            );
+        }
+    }
 }
 
 async fn handle_request(
@@ -801,7 +1017,7 @@ async fn handle_request(
             let mut cfg = match load_result {
                 Ok(config) => config,
                 Err(error) => {
-                    send_event(
+                    send_event!(
                         &out,
                         json!({
                             "type": "error",
@@ -841,7 +1057,7 @@ async fn handle_request(
                 eprintln!("[simplecc] remote workspace: {root}");
             }
 
-            send_event(&out, json!({"type": "initialized", "id": id}));
+            send_event!(&out, json!({"type": "initialized", "id": id}));
         }
 
         Request::Shutdown { id } => {
@@ -851,7 +1067,7 @@ async fn handle_request(
                 reg.shutdown_all().await;
             }
             uri_ft.lock().await.clear();
-            send_event(&out, json!({"type": "shutdown", "id": id}));
+            send_event!(&out, json!({"type": "shutdown", "id": id}));
         }
 
         Request::JuliaActivateEnvironment {
@@ -860,7 +1076,7 @@ async fn handle_request(
             env_path,
         } => {
             if language_id != "julia" {
-                send_event(
+                send_event!(
                     &out,
                     json!({
                         "type": "error",
@@ -879,7 +1095,7 @@ async fn handle_request(
                         {
                             eprintln!("[simplecc] {err}");
                         }
-                        send_event(
+                        send_event!(
                             &out,
                             json!({
                                 "type": "juliaEnvironment",
@@ -888,12 +1104,12 @@ async fn handle_request(
                             }),
                         );
                     }
-                    Err(err) => send_event(
+                    Err(err) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": err.to_string()}),
                     ),
                 },
-                None => send_event(
+                None => send_event!(
                     &out,
                     json!({
                         "type": "error",
@@ -906,7 +1122,7 @@ async fn handle_request(
 
         Request::JuliaRefreshLanguageServer { id, language_id } => {
             if language_id != "julia" {
-                send_event(
+                send_event!(
                     &out,
                     json!({
                         "type": "error",
@@ -919,8 +1135,8 @@ async fn handle_request(
 
             match primary_client(&registry, &language_id).await {
                 Some(client) => match client.refresh_julia_language_server().await {
-                    Ok(true) => send_event(&out, json!({"type": "juliaRefreshed", "id": id})),
-                    Ok(false) => send_event(
+                    Ok(true) => send_event!(&out, json!({"type": "juliaRefreshed", "id": id})),
+                    Ok(false) => send_event!(
                         &out,
                         json!({
                             "type": "error",
@@ -928,12 +1144,12 @@ async fn handle_request(
                             "message": "Active server is not Julia LanguageServer",
                         }),
                     ),
-                    Err(err) => send_event(
+                    Err(err) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": err.to_string()}),
                     ),
                 },
-                None => send_event(
+                None => send_event!(
                     &out,
                     json!({
                         "type": "error",
@@ -962,7 +1178,7 @@ async fn handle_request(
             };
 
             match result {
-                Ok(server_count) => send_event(
+                Ok(server_count) => send_event!(
                     &out,
                     json!({
                         "type": "configurationReloaded",
@@ -970,7 +1186,7 @@ async fn handle_request(
                         "servers": server_count,
                     }),
                 ),
-                Err(err) => send_event(
+                Err(err) => send_event!(
                     &out,
                     json!({"type": "error", "id": id, "message": err.to_string()}),
                 ),
@@ -1115,7 +1331,7 @@ async fn handle_request(
                     )
                     .await
                 {
-                    Ok(Some((generation, items))) => send_event(
+                    Ok(Some((generation, items))) => send_event!(
                         &out,
                         json!({
                             "type": "completion", "id": id,
@@ -1123,13 +1339,13 @@ async fn handle_request(
                         }),
                     ),
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
                 }
             } else {
-                send_event(
+                send_event!(
                     &out,
                     json!({"type": "completion", "id": id, "generation": 0, "items": []}),
                 );
@@ -1156,20 +1372,20 @@ async fn handle_request(
                 match c.hover(id, &uri, line, character).await {
                     Ok(Some(Some(contents))) => {
                         debug_log!("[simplecc] hover result: {} bytes", contents.len());
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "hover", "id": id, "contents": contents}),
                         );
                     }
                     Ok(Some(None)) => {
                         debug_log!("[simplecc] hover result: none");
-                        send_event(&out, json!({"type": "hover", "id": id, "contents": null}));
+                        send_event!(&out, json!({"type": "hover", "id": id, "contents": null}));
                     }
                     // Superseded by a newer hover; that reply follows.
                     Ok(None) => {}
                     Err(e) => {
                         eprintln!("[simplecc] hover error: {}", e);
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": e.to_string()}),
                         );
@@ -1221,14 +1437,14 @@ async fn handle_request(
                             }
                         }
                         debug_log!("[simplecc] definition result: {} locations", locs.len());
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "definition", "id": id, "locations": locs}),
                         );
                     }
                     Err(e) => {
                         eprintln!("[simplecc] definition error: {}", e);
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": e.to_string()}),
                         );
@@ -1247,11 +1463,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.references(&uri, line, character).await {
-                    Ok(locs) => send_event(
+                    Ok(locs) => send_event!(
                         &out,
                         json!({"type": "references", "id": id, "locations": locs}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1278,11 +1494,11 @@ async fn handle_request(
                     .code_action(&uri, line, character, el, ec, diagnostics)
                     .await
                 {
-                    Ok(actions) => send_event(
+                    Ok(actions) => send_event!(
                         &out,
                         json!({"type": "codeAction", "id": id, "actions": actions}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1299,10 +1515,10 @@ async fn handle_request(
                 let c = client;
                 match c.execute_code_action(index).await {
                     Ok(Some(edit)) => {
-                        send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
+                        send_event!(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
                     }
-                    Ok(None) => send_event(&out, json!({"type": "executeAction", "id": id})),
-                    Err(e) => send_event(
+                    Ok(None) => send_event!(&out, json!({"type": "executeAction", "id": id})),
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1320,11 +1536,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.formatting(&uri, tab_size, insert_spaces).await {
-                    Ok(edits) => send_event(
+                    Ok(edits) => send_event!(
                         &out,
                         json!({"type": "formatting", "id": id, "edits": edits}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1359,11 +1575,11 @@ async fn handle_request(
                 {
                     // Same reply type as whole-document formatting: the editor
                     // applies the edits identically either way.
-                    Ok(edits) => send_event(
+                    Ok(edits) => send_event!(
                         &out,
                         json!({"type": "formatting", "id": id, "edits": edits}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1381,15 +1597,15 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.prepare_rename(&uri, line, character).await {
-                    Ok(Some(item)) => send_event(
+                    Ok(Some(item)) => send_event!(
                         &out,
                         json!({"type": "prepareRename", "id": id, "result": item}),
                     ),
-                    Ok(None) => send_event(
+                    Ok(None) => send_event!(
                         &out,
                         json!({"type": "prepareRename", "id": id, "result": null}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1409,10 +1625,12 @@ async fn handle_request(
                 let c = client;
                 match c.rename(&uri, line, character, &new_name).await {
                     Ok(Some(edit)) => {
-                        send_event(&out, json!({"type": "rename", "id": id, "edit": edit}))
+                        send_event!(&out, json!({"type": "rename", "id": id, "edit": edit}))
                     }
-                    Ok(None) => send_event(&out, json!({"type": "rename", "id": id, "edit": null})),
-                    Err(e) => send_event(
+                    Ok(None) => {
+                        send_event!(&out, json!({"type": "rename", "id": id, "edit": null}))
+                    }
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1430,18 +1648,18 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.signature_help(id, &uri, line, character).await {
-                    Ok(Some(sigs)) if !sigs.is_empty() => send_event(
+                    Ok(Some(sigs)) if !sigs.is_empty() => send_event!(
                         &out,
                         json!({"type": "signatureHelp", "id": id, "signatures": sigs}),
                     ),
-                    Ok(Some(_)) => send_event(
+                    Ok(Some(_)) => send_event!(
                         &out,
                         json!({"type": "signatureHelp", "id": id, "signatures": null}),
                     ),
                     // Superseded by a newer request; skip so a stale null can
                     // never close the popup the newest reply just opened.
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1459,11 +1677,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.implementation(&uri, line, character).await {
-                    Ok(locs) => send_event(
+                    Ok(locs) => send_event!(
                         &out,
                         json!({"type": "implementation", "id": id, "locations": locs}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1481,11 +1699,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.type_definition(&uri, line, character).await {
-                    Ok(locs) => send_event(
+                    Ok(locs) => send_event!(
                         &out,
                         json!({"type": "typeDefinition", "id": id, "locations": locs}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1501,11 +1719,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.document_symbol(&uri).await {
-                    Ok(symbols) => send_event(
+                    Ok(symbols) => send_event!(
                         &out,
                         json!({"type": "documentSymbol", "id": id, "symbols": symbols}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1521,13 +1739,13 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.workspace_symbol(id, &query).await {
-                    Ok(Some(symbols)) => send_event(
+                    Ok(Some(symbols)) => send_event!(
                         &out,
                         json!({"type": "workspaceSymbol", "id": id, "symbols": symbols}),
                     ),
                     // Superseded by a newer query; the newer reply follows.
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1545,14 +1763,14 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.document_highlight(id, &uri, line, character).await {
-                    Ok(Some(highlights)) => send_event(
+                    Ok(Some(highlights)) => send_event!(
                         &out,
                         json!({"type": "documentHighlight", "id": id, "highlights": highlights}),
                     ),
                     // Superseded by a newer cursor position; skip the reply so
                     // stale results never overwrite the upcoming ones.
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1571,11 +1789,11 @@ async fn handle_request(
                 let c = client;
                 match c.inlay_hints(id, &uri, start_line, end_line).await {
                     Ok(Some(hints)) => {
-                        send_event(&out, json!({"type": "inlayHint", "id": id, "hints": hints}))
+                        send_event!(&out, json!({"type": "inlayHint", "id": id, "hints": hints}))
                     }
                     // Superseded by a newer viewport; skip the stale reply.
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1608,12 +1826,12 @@ async fn handle_request(
                                 })
                             })
                             .collect();
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "callHierarchyPrepare", "id": id, "items": converted}),
                         );
                     }
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1631,7 +1849,7 @@ async fn handle_request(
                 let lsp_item = match serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
                     Ok(item) => item,
                     Err(error) => {
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": format!("invalid call hierarchy item: {error}")}),
                         );
@@ -1639,11 +1857,11 @@ async fn handle_request(
                     }
                 };
                 match c.call_hierarchy_incoming(&lsp_item).await {
-                    Ok(calls) => send_event(
+                    Ok(calls) => send_event!(
                         &out,
                         json!({"type": "incomingCalls", "id": id, "calls": calls}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1661,7 +1879,7 @@ async fn handle_request(
                 let lsp_item = match serde_json::from_value::<lsp_types::CallHierarchyItem>(item) {
                     Ok(item) => item,
                     Err(error) => {
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": format!("invalid call hierarchy item: {error}")}),
                         );
@@ -1669,11 +1887,11 @@ async fn handle_request(
                     }
                 };
                 match c.call_hierarchy_outgoing(&lsp_item).await {
-                    Ok(calls) => send_event(
+                    Ok(calls) => send_event!(
                         &out,
                         json!({"type": "outgoingCalls", "id": id, "calls": calls}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1699,11 +1917,11 @@ async fn handle_request(
                     })
                     .collect();
                 match c.selection_range(&uri, &pos).await {
-                    Ok(ranges) => send_event(
+                    Ok(ranges) => send_event!(
                         &out,
                         json!({"type": "selectionRange", "id": id, "ranges": ranges}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1719,11 +1937,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.semantic_tokens_full(&uri).await {
-                    Ok(tokens) => send_event(
+                    Ok(tokens) => send_event!(
                         &out,
                         json!({"type": "semanticTokens", "id": id, "tokens": tokens}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1739,11 +1957,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.semantic_tokens_full_delta(&uri).await {
-                    Ok(tokens) => send_event(
+                    Ok(tokens) => send_event!(
                         &out,
                         json!({"type": "semanticTokens", "id": id, "tokens": tokens}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1772,11 +1990,11 @@ async fn handle_request(
                     )
                     .await
                 {
-                    Ok(tokens) => send_event(
+                    Ok(tokens) => send_event!(
                         &out,
                         json!({"type": "semanticTokens", "id": id, "tokens": tokens}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1792,11 +2010,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.code_lens(&uri).await {
-                    Ok(lenses) => send_event(
+                    Ok(lenses) => send_event!(
                         &out,
                         json!({"type": "codeLens", "id": id, "lenses": lenses}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1812,11 +2030,11 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.folding_range(&uri).await {
-                    Ok(ranges) => send_event(
+                    Ok(ranges) => send_event!(
                         &out,
                         json!({"type": "foldingRange", "id": id, "ranges": ranges}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1834,15 +2052,15 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c.linked_editing_range(&uri, line, character).await {
-                    Ok(Some(ranges)) => send_event(
+                    Ok(Some(ranges)) => send_event!(
                         &out,
                         json!({"type": "linkedEditingRange", "id": id, "result": ranges}),
                     ),
-                    Ok(None) => send_event(
+                    Ok(None) => send_event!(
                         &out,
                         json!({"type": "linkedEditingRange", "id": id, "result": null}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1860,11 +2078,11 @@ async fn handle_request(
             if let Some(client) = client {
                 let c = client;
                 match c.completion_resolve(generation, index).await {
-                    Ok(item) => send_event(
+                    Ok(item) => send_event!(
                         &out,
                         json!({"type": "completionResolve", "id": id, "item": item}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1881,10 +2099,10 @@ async fn handle_request(
                 let c = client;
                 match c.execute_code_lens(index).await {
                     Ok(Some(edit)) => {
-                        send_event(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
+                        send_event!(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
                     }
-                    Ok(None) => send_event(&out, json!({"type": "codeLensExecute", "id": id})),
-                    Err(e) => send_event(
+                    Ok(None) => send_event!(&out, json!({"type": "codeLensExecute", "id": id})),
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1917,12 +2135,12 @@ async fn handle_request(
                                 })
                             })
                             .collect();
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "typeHierarchyPrepare", "id": id, "items": converted}),
                         );
                     }
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1940,7 +2158,7 @@ async fn handle_request(
                 let lsp_item = match serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
                     Ok(item) => item,
                     Err(error) => {
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": format!("invalid type hierarchy item: {error}")}),
                         );
@@ -1948,11 +2166,11 @@ async fn handle_request(
                     }
                 };
                 match c.type_hierarchy_supertypes(&lsp_item).await {
-                    Ok(items) => send_event(
+                    Ok(items) => send_event!(
                         &out,
                         json!({"type": "supertypes", "id": id, "items": items}),
                     ),
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -1970,7 +2188,7 @@ async fn handle_request(
                 let lsp_item = match serde_json::from_value::<lsp_types::TypeHierarchyItem>(item) {
                     Ok(item) => item,
                     Err(error) => {
-                        send_event(
+                        send_event!(
                             &out,
                             json!({"type": "error", "id": id, "message": format!("invalid type hierarchy item: {error}")}),
                         );
@@ -1979,9 +2197,9 @@ async fn handle_request(
                 };
                 match c.type_hierarchy_subtypes(&lsp_item).await {
                     Ok(items) => {
-                        send_event(&out, json!({"type": "subtypes", "id": id, "items": items}))
+                        send_event!(&out, json!({"type": "subtypes", "id": id, "items": items}))
                     }
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -2002,7 +2220,7 @@ async fn handle_request(
                     .await
                     .unwrap_or_default();
                 match c.pull_diagnostics(&uri).await {
-                    Ok(Some(items)) => send_event(
+                    Ok(Some(items)) => send_event!(
                         &out,
                         json!({
                             "type": "diagnostics", "id": id, "server": server,
@@ -2011,7 +2229,7 @@ async fn handle_request(
                     ),
                     // An unchanged report keeps the currently displayed set.
                     Ok(None) => {}
-                    Err(e) => send_event(
+                    Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
                     ),
@@ -2019,49 +2237,11 @@ async fn handle_request(
             }
         }
 
-        Request::InstallServer { id, server } => {
-            let out_clone = out.clone();
-            let reg_clone = registry.clone();
-            // Spawn install in background so it doesn't block the main loop
-            tokio::spawn(async move {
-                match installer::install_server(&server, &out_clone).await {
-                    Ok(path) => {
-                        send_event(
-                            &out_clone,
-                            json!({
-                                "type": "installResult",
-                                "id": id,
-                                "server": server,
-                                "status": "ok",
-                                "path": path.to_string_lossy(),
-                            }),
-                        );
-                        // Update registry so the server can be started with the new path
-                        let mut r = reg_clone.write().await;
-                        if let Some(ref mut reg) = *r {
-                            reg.update_server_command(&server, &path.to_string_lossy());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[simplecc] install {} failed: {}", server, e);
-                        send_event(
-                            &out_clone,
-                            json!({
-                                "type": "installResult",
-                                "id": id,
-                                "server": server,
-                                "status": "error",
-                                "message": e.to_string(),
-                            }),
-                        );
-                    }
-                }
-            });
-        }
+        Request::InstallServer { id, server } => handle_install_request(id, server, out).await,
 
         Request::ListInstallable { id } => {
             let servers = installer::list_installable();
-            send_event(
+            send_event!(
                 &out,
                 json!({
                     "type": "installableServers",
@@ -2100,6 +2280,37 @@ async fn handle_request(
 #[cfg(test)]
 mod request_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_request_reader_recovers_at_the_next_record() {
+        let input = b"0123456789\n{\"type\":\"shutdown\",\"id\":7}\r\n";
+        let mut reader = BufReader::new(&input[..]);
+
+        let oversized = read_request_line(&mut reader, 8)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(oversized, "request line exceeds 8 bytes");
+
+        let next = read_request_line(&mut reader, 64)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, r#"{"type":"shutdown","id":7}"#);
+        assert!(read_request_line(&mut reader, 64).await.unwrap().is_none());
+
+        let mut exact_crlf = BufReader::new(&b"12345678\r\n"[..]);
+        assert_eq!(
+            read_request_line(&mut exact_crlf, 8)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "12345678"
+        );
+    }
 
     #[test]
     fn parses_julia_environment_activation() {
@@ -2154,22 +2365,88 @@ mod request_tests {
         assert!(shutdown.is_lifecycle_barrier());
     }
 
+    #[test]
+    fn managed_install_is_not_an_lsp_lifecycle_task() {
+        let install = Request::InstallServer {
+            id: 3,
+            server: "rust-analyzer".to_string(),
+        };
+        assert!(install.is_install());
+        assert!(!install.is_lifecycle_barrier());
+        assert!(!install.preserves_document_order());
+    }
+
+    #[tokio::test]
+    async fn install_completion_is_decoupled_from_the_current_registry() {
+        // The install helper deliberately has no Registry argument. An install
+        // can span a workspace reinitialize, and its eventual result must not
+        // overwrite the replacement registry's local or remote command.
+        let (sender, mut rx) = tokio::sync::mpsc::channel(4);
+        let tx = EventTx::new(sender);
+        handle_install_request(17, "not-a-simplecc-server".to_string(), tx).await;
+
+        let event: serde_json::Value =
+            serde_json::from_str(&rx.recv().await.expect("one terminal install result")).unwrap();
+        assert_eq!(event["type"], "installResult");
+        assert_eq!(event["id"], 17);
+        assert_eq!(event["server"], "not-a-simplecc-server");
+        assert_eq!(event["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn eof_install_drain_aborts_a_hung_async_owner_after_its_grace() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task_dropped = dropped.clone();
+        tasks.spawn(async move {
+            let _drop_flag = DropFlag(task_dropped);
+            let _ = ready_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+
+        let drained = drain_install_tasks(
+            &mut tasks,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            !drained,
+            "a permanently pending install reported completion"
+        );
+        assert!(tasks.is_empty());
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn replies_wait_for_capacity_instead_of_being_dropped() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (sender, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = EventTx::new(sender);
         tx.send("already queued".to_string()).await.unwrap();
 
-        send_event(&tx, json!({"type": "reply", "id": 42}));
+        let producer = tokio::spawn(async move {
+            send_event!(&tx, json!({"type": "reply", "id": 42}));
+        });
 
         assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
         let reply = rx.recv().await.unwrap();
+        producer.await.unwrap();
         assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], 42);
     }
 
     #[tokio::test]
     async fn missing_primary_client_returns_error_with_request_id() {
         let registry = Arc::new(RwLock::new(None));
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (sender, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = EventTx::new(sender);
 
         let client = primary_client_or_error(&registry, &tx, 73, "rust").await;
 

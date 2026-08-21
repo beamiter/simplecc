@@ -1270,6 +1270,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures-util",
+ "libc",
  "lsp-types",
  "notify",
  "reqwest",

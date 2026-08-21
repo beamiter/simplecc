@@ -157,14 +157,17 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read configuration {}", path.display()))?;
-        let config = Self::parse(&content)
-            .with_context(|| format!("invalid JSON in configuration {}", path.display()))?;
-        config.validate()?;
-        Ok(config)
+        Self::parse(&content)
+            .map_err(|error| anyhow::anyhow!("invalid configuration {}: {error:#}", path.display()))
     }
 
     pub fn parse(content: &str) -> Result<Self> {
-        serde_json::from_str(content).context("invalid SimpleCC JSON")
+        let config: Self = serde_json::from_str(content).context("invalid SimpleCC JSON")?;
+        // Remote workspaces pass the configuration text directly and never
+        // call load().  Validation belongs here so local and remote configs
+        // reject the same semantic errors.
+        config.validate()?;
+        Ok(config)
     }
 
     fn validate(&self) -> Result<()> {
@@ -181,6 +184,16 @@ impl Config {
                 .any(|filetype| filetype.trim().is_empty())
             {
                 bail!("language server '{name}' contains an empty filetype");
+            }
+            if server
+                .root_patterns
+                .iter()
+                .any(|pattern| pattern.trim().is_empty())
+            {
+                // directory.join("") is the directory itself and therefore
+                // always exists.  Accepting an empty marker silently made
+                // every source directory its own server root.
+                bail!("language server '{name}' contains an empty root pattern");
             }
         }
         Ok(())
@@ -446,5 +459,14 @@ mod tests {
         let result = Config::load(&path);
         let _ = std::fs::remove_file(path);
         assert!(result.unwrap_err().to_string().contains("empty command"));
+    }
+
+    #[test]
+    fn configuration_validation_rejects_empty_root_patterns() {
+        let error = Config::parse(
+            r#"{"languageServers":{"broken":{"command":"server","filetypes":["rust"],"rootPatterns":[" "]}}}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("empty root pattern"));
     }
 }

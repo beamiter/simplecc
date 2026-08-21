@@ -1,14 +1,93 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use super::config::{Config, RemoteConfig};
 use super::lsp::client::{LspClient, ServerEvent};
 
-/// EventTx sends events to the stdout writer for Vim.
-pub type EventTx = tokio::sync::mpsc::Sender<String>;
+const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug)]
+pub struct EventSendError;
+
+/// Shared, ordered path from every daemon producer to Vim's stdout writer.
+///
+/// Registry and LSP forwarding code used to hold the raw bounded sender and
+/// could wait on it forever. In particular, didOpen runs inline to preserve
+/// document order, so one full stdout queue prevented the stdin loop from ever
+/// observing EOF. Every reliable send now has the same deadline and trips one
+/// shared fail-closed bit; the request loop notices that bit and shuts down.
+#[derive(Clone)]
+pub struct EventTx {
+    sender: tokio::sync::mpsc::Sender<String>,
+    stalled: Arc<AtomicBool>,
+    stalled_notify: Arc<tokio::sync::Notify>,
+}
+
+impl EventTx {
+    pub fn new(sender: tokio::sync::mpsc::Sender<String>) -> Self {
+        Self {
+            sender,
+            stalled: Arc::new(AtomicBool::new(false)),
+            stalled_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.stalled.load(Ordering::Acquire)
+    }
+
+    pub fn mark_stalled(&self) {
+        if !self.stalled.swap(true, Ordering::AcqRel) {
+            // notify_one stores a permit when the stdin waiter has created but
+            // not yet polled its Notified future; notify_waiters would lose
+            // that transition in precisely that window.
+            self.stalled_notify.notify_one();
+        }
+    }
+
+    pub async fn wait_stalled(&self) {
+        loop {
+            // Register before checking the bit so a transition between the
+            // check and await cannot be lost.
+            let notified = self.stalled_notify.notified();
+            if self.is_stalled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn send(&self, line: String) -> Result<(), EventSendError> {
+        if self.is_stalled() {
+            return Err(EventSendError);
+        }
+        match tokio::time::timeout(EVENT_SEND_TIMEOUT, self.sender.send(line)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) | Err(_) => {
+                self.mark_stalled();
+                Err(EventSendError)
+            }
+        }
+    }
+
+    /// Immediate best-effort path used for supersedable progress and by the
+    /// daemon before it hands a temporary full queue to the reliable send path.
+    pub fn try_send(
+        &self,
+        line: String,
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<String>> {
+        if self.is_stalled() {
+            return Err(tokio::sync::mpsc::error::TrySendError::Closed(line));
+        }
+        self.sender.try_send(line)
+    }
+}
 
 /// Manages multiple LSP server instances.
 pub struct Registry {
@@ -136,9 +215,13 @@ impl Registry {
             "server": &name,
             "status": "starting",
         });
-        let _ = event_tx
+        if event_tx
             .send(serde_json::to_string(&status_event).unwrap())
-            .await;
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
 
         match LspClient::start(
             &name,
@@ -311,13 +394,6 @@ impl Registry {
         for (name, client) in self.clients.drain() {
             eprintln!("[simplecc] shutting down {name}");
             let _ = client.shutdown().await;
-        }
-    }
-
-    /// Update the command path for a server (after installation).
-    pub fn update_server_command(&mut self, name: &str, command: &str) {
-        if let Some(cfg) = self.config.language_servers.get_mut(name) {
-            cfg.command = command.to_string();
         }
     }
 
@@ -684,6 +760,42 @@ mod tests {
             root: "/srv/app".to_string(),
             runtime: runtime.map(str::to_string),
         }
+    }
+
+    #[tokio::test]
+    async fn registry_event_send_fails_closed_under_stdout_backpressure() {
+        let config = Config::parse(
+            r#"{
+                "languageServers": {
+                    "stall-test": {
+                        "command": "never-run",
+                        "filetypes": ["stall-test"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(1);
+        let events = EventTx::new(sender);
+        events.send("already queued".to_string()).await.unwrap();
+        let mut registry = Registry::new(
+            config,
+            "/workspace".to_string(),
+            Some(remote("ssh", Some("/definitely/not-a-simplecc-runtime"))),
+            events.clone(),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            registry.ensure_server("stall-test", "file:///workspace/stall.test"),
+        )
+        .await
+        .expect("Registry event delivery observes its own deadline")
+        .unwrap();
+
+        assert!(result.is_none());
+        assert!(events.is_stalled());
+        assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
     }
 
     #[test]

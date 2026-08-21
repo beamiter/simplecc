@@ -4,13 +4,18 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::registry::EventTx;
 
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_INSTALLER_STDERR_BYTES: usize = 64 * 1024;
 
 // ═════════════════════════════════════════════════════════
 // Platform detection
@@ -326,6 +331,73 @@ fn find_server_meta(name: &str) -> Option<&'static ServerMeta> {
 static INSTALLING: std::sync::LazyLock<Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
 
+struct InstallingGuard {
+    name: String,
+}
+
+impl InstallingGuard {
+    fn acquire(name: &str) -> Result<Self> {
+        let mut set = INSTALLING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !set.insert(name.to_string()) {
+            bail!("{} is already being installed", name);
+        }
+        Ok(Self {
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for InstallingGuard {
+    fn drop(&mut self) {
+        INSTALLING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.name);
+    }
+}
+
+/// Owns one hidden staging path without doing filesystem work in Drop.
+/// Cancellation deliberately leaves `.name.installing-PID-stamp` intact for
+/// startup recovery; only ordinary, fully reaped error paths call cleanup().
+struct StagingGuard {
+    path: PathBuf,
+    finished: AtomicBool,
+    cleanup_safe: AtomicBool,
+}
+
+impl StagingGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            finished: AtomicBool::new(false),
+            cleanup_safe: AtomicBool::new(true),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn mark_promoted(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    fn defer_cleanup(&self) {
+        self.cleanup_safe.store(false, Ordering::Release);
+    }
+
+    async fn cleanup(&self) {
+        if self.finished.load(Ordering::Acquire) || !self.cleanup_safe.load(Ordering::Acquire) {
+            return;
+        }
+        if remove_path(self.path()).await.is_ok() {
+            self.finished.store(true, Ordering::Release);
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct ServerInfo {
     pub name: String,
@@ -355,24 +427,11 @@ pub fn list_installable() -> Vec<ServerInfo> {
 pub async fn install_server(name: &str, event_tx: &EventTx) -> Result<PathBuf> {
     let meta = find_server_meta(name).ok_or_else(|| anyhow::anyhow!("unknown server: {}", name))?;
 
-    // Guard against concurrent installs
-    {
-        let mut set = INSTALLING.lock().await;
-        if set.contains(name) {
-            bail!("{} is already being installed", name);
-        }
-        set.insert(name.to_string());
-    }
-
-    let result = do_install(meta, event_tx).await;
-
-    // Remove from installing set
-    {
-        let mut set = INSTALLING.lock().await;
-        set.remove(name);
-    }
-
-    result
+    // Drop is cancellation-safe: lifecycle changes no longer abort installs,
+    // but process shutdown or a future caller still cannot strand this
+    // daemon's in-memory "already installing" marker.
+    let _guard = InstallingGuard::acquire(name)?;
+    do_install(meta, event_tx).await
 }
 
 // ═════════════════════════════════════════════════════════
@@ -394,6 +453,7 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
     tokio::fs::create_dir_all(parent)
         .await
         .context("failed to create managed server directory")?;
+    recover_stale_install_siblings_off_thread(&install_dir).await?;
     let staging_dir = unique_sibling_path(&install_dir, "installing");
 
     // Build the complete installation beside the active one. A failed
@@ -402,18 +462,19 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
     tokio::fs::create_dir(&staging_dir)
         .await
         .context("failed to create installation staging directory")?;
+    let staging = StagingGuard::new(staging_dir);
 
     let result = async {
         match meta.archive_kind {
             ArchiveKind::Command => {
-                install_via_command(meta, &plat, &staging_dir, event_tx).await?;
+                install_via_command(meta, &plat, &staging, event_tx).await?;
             }
             _ => {
-                install_via_download(meta, &plat, &staging_dir, event_tx).await?;
+                install_via_download(meta, &plat, &staging, event_tx).await?;
             }
         }
 
-        let expected = staging_dir.join((meta.binary_rel_path)(&plat));
+        let expected = staging.path().join((meta.binary_rel_path)(&plat));
         let staged_binary = if expected.exists() {
             expected
         } else {
@@ -423,7 +484,7 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
                 .file_name()
                 .context("managed binary path has no filename")?
                 .to_string_lossy();
-            find_binary_recursive(&staging_dir, &filename)
+            find_binary_recursive(staging.path(), &filename)
                 .await
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -434,18 +495,24 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
         };
         set_executable(&staged_binary)?;
         let relative_binary = staged_binary
-            .strip_prefix(&staging_dir)
+            .strip_prefix(staging.path())
             .context("staged binary escaped its installation directory")?
             .to_path_buf();
 
-        promote_installation(&staging_dir, &install_dir).await?;
+        // No await inside the two-rename critical section: task abort is only
+        // observed at yield points and therefore cannot strand the active
+        // destination between backup and activation.
+        let backup = promote_installation_sync(staging.path(), &install_dir)?;
+        staging.mark_promoted();
+        if let Some(backup) = backup {
+            let _ = remove_path(&backup).await;
+        }
         send_progress(event_tx, meta.name, "done", 100).await;
         Ok(install_dir.join(relative_binary))
     }
     .await;
-
     if result.is_err() {
-        let _ = remove_path(&staging_dir).await;
+        staging.cleanup().await;
     }
     result
 }
@@ -453,9 +520,10 @@ async fn do_install(meta: &ServerMeta, event_tx: &EventTx) -> Result<PathBuf> {
 async fn install_via_download(
     meta: &ServerMeta,
     plat: &Platform,
-    install_dir: &Path,
+    staging: &StagingGuard,
     event_tx: &EventTx,
 ) -> Result<()> {
+    let install_dir = staging.path();
     // Get latest version
     send_progress(event_tx, meta.name, "checking latest version", 0).await;
 
@@ -488,7 +556,6 @@ async fn install_via_download(
     let install_dir_owned = install_dir.to_path_buf();
     let archive_kind = meta.archive_kind;
     let bin_name = (meta.binary_rel_path)(plat);
-
     let extraction = tokio::task::spawn_blocking(move || -> Result<()> {
         match archive_kind {
             ArchiveKind::Gz => extract_gz(&tmp_file_clone, &install_dir_owned.join(&bin_name))?,
@@ -513,12 +580,150 @@ async fn install_via_download(
     Ok(())
 }
 
+#[cfg(unix)]
+struct InstallerProcessGroup {
+    pgid: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl InstallerProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        }
+    }
+
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            // ESRCH simply means the whole group already exited.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InstallerProcessGroup {
+    fn drop(&mut self) {
+        // The child is its own process-group leader. Killing the negative id
+        // reaches npm/go/Julia descendants that Child::kill_on_drop cannot see.
+        self.kill();
+    }
+}
+
+#[cfg(not(unix))]
+struct InstallerProcessGroup;
+
+#[cfg(not(unix))]
+impl InstallerProcessGroup {
+    fn new(_pid: Option<u32>) -> Self {
+        // Windows retains kill_on_drop for the direct child. A Job Object would
+        // be needed for descendant-wide termination and is not available in
+        // this dependency-light daemon.
+        Self
+    }
+
+    fn kill(&self) {}
+}
+
+async fn run_installer_child(
+    mut command: tokio::process::Command,
+    deadline: std::time::Duration,
+    description: &str,
+    staging: Option<&StagingGuard>,
+) -> Result<std::process::Output> {
+    command
+        .stdin(std::process::Stdio::null())
+        // Successful installers can be extremely chatty; their stdout is not
+        // actionable and must not become an unbounded in-memory Output buffer.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {description}"))?;
+    let group = InstallerProcessGroup::new(child.id());
+    let stderr = child
+        .stderr
+        .take()
+        .context("installer stderr pipe was not created")?;
+    let waited = tokio::time::timeout(deadline, async {
+        let (status, stderr) = tokio::join!(child.wait(), read_installer_stderr(stderr));
+        Ok::<_, anyhow::Error>(std::process::Output {
+            status: status.context("could not wait for installer child")?,
+            stdout: Vec::new(),
+            stderr: stderr.context("could not read installer stderr")?,
+        })
+    })
+    .await;
+    let output = match waited {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            if !terminate_installer_child(&group, &mut child).await
+                && let Some(staging) = staging
+            {
+                staging.defer_cleanup();
+            }
+            drop(group);
+            return Err(error).with_context(|| format!("failed to wait for {description}"));
+        }
+        Err(_) => {
+            // A normal timeout is not task cancellation: explicitly stop the
+            // whole group and reap the direct child before returning, so the
+            // caller may safely remove staging on this ordinary Err path.
+            if !terminate_installer_child(&group, &mut child).await
+                && let Some(staging) = staging
+            {
+                staging.defer_cleanup();
+            }
+            drop(group);
+            bail!("{description} timed out");
+        }
+    };
+    // Also clean up any descendant that survived a normally exiting parent.
+    drop(group);
+    Ok(output)
+}
+
+async fn terminate_installer_child(
+    group: &InstallerProcessGroup,
+    child: &mut tokio::process::Child,
+) -> bool {
+    group.kill();
+    let _ = child.start_kill();
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await,
+        Ok(Ok(_))
+    )
+}
+
+async fn read_installer_stderr(
+    mut stderr: tokio::process::ChildStderr,
+) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stderr.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_INSTALLER_STDERR_BYTES.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+    Ok(kept)
+}
+
 async fn install_via_command(
     meta: &ServerMeta,
     plat: &Platform,
-    install_dir: &Path,
+    staging: &StagingGuard,
     event_tx: &EventTx,
 ) -> Result<()> {
+    let install_dir = staging.path();
     let make_cmd = meta
         .install_command
         .ok_or_else(|| anyhow::anyhow!("no install command for {}", meta.name))?;
@@ -543,16 +748,17 @@ async fn install_via_command(
 
     let mut command = tokio::process::Command::new(&install.program);
     command.args(&install.args);
-    command.stdin(std::process::Stdio::null());
-    command.kill_on_drop(true);
     for (k, v) in &install.env {
         command.env(k, v);
     }
 
-    let output = tokio::time::timeout(std::time::Duration::from_secs(20 * 60), command.output())
-        .await
-        .with_context(|| format!("managed installer {} timed out", install.program))?
-        .with_context(|| format!("failed to run managed installer {}", install.program))?;
+    let output = run_installer_child(
+        command,
+        std::time::Duration::from_secs(20 * 60),
+        &format!("managed installer {}", install.program),
+        Some(staging),
+    )
+    .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -562,8 +768,27 @@ async fn install_via_command(
     Ok(())
 }
 
-/// Install LanguageServer.jl into the dedicated `@simplecc` shared environment.
-/// The configured command stays `julia`; we return it so the registry keeps it.
+const JULIA_INSTALL_SCRIPT: &str = "using Pkg; \
+    Pkg.activate(ARGS[1]); \
+    Pkg.add(\"LanguageServer\"); \
+    Pkg.instantiate()";
+
+fn julia_install_command(staging: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("julia");
+    command.args([
+        "--startup-file=no",
+        "--history-file=no",
+        "-e",
+        JULIA_INSTALL_SCRIPT,
+        "--",
+        &staging.to_string_lossy(),
+    ]);
+    command
+}
+
+/// Install LanguageServer.jl into a sibling environment and atomically promote
+/// it to `@simplecc`. The package depot/cache remains shared, while cancellation
+/// cannot leave a half-written Project.toml as the active environment.
 async fn install_julia_lsp(event_tx: &EventTx) -> Result<PathBuf> {
     if which::which("julia").is_err() {
         bail!("'julia' not found in PATH. Please install Julia first.");
@@ -571,32 +796,63 @@ async fn install_julia_lsp(event_tx: &EventTx) -> Result<PathBuf> {
 
     send_progress(event_tx, "julia-lsp", "setting up @simplecc environment", 0).await;
 
-    let script = "using Pkg; \
-        Pkg.activate(\"simplecc\"; shared=true); \
-        Pkg.add(\"LanguageServer\"); \
-        Pkg.instantiate()";
-
-    let mut command = tokio::process::Command::new("julia");
-    command
-        .args(["--startup-file=no", "--history-file=no", "-e", script])
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(30 * 60), command.output())
+    let destination = julia_lsp_env_project()
+        .parent()
+        .context("Julia environment marker has no parent")?
+        .to_path_buf();
+    let parent = destination
+        .parent()
+        .context("Julia environments directory has no parent")?;
+    tokio::fs::create_dir_all(parent)
         .await
-        .context("Julia language-server install timed out")?
-        .context("failed to run julia")?;
+        .context("failed to create Julia environments directory")?;
+    recover_stale_install_siblings_off_thread(&destination).await?;
+    let staging_path = unique_sibling_path(&destination, "installing");
+    tokio::fs::create_dir(&staging_path)
+        .await
+        .context("failed to create Julia installation staging directory")?;
+    let staging = StagingGuard::new(staging_path);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("julia LanguageServer install failed: {}", stderr);
-    }
+    let result: Result<()> = async {
+        let output = run_installer_child(
+            julia_install_command(staging.path()),
+            std::time::Duration::from_secs(30 * 60),
+            "Julia language-server installer",
+            Some(&staging),
+        )
+        .await?;
 
-    if !julia_lsp_env_project().exists() {
-        bail!(
-            "install reported success but {} was not created",
-            julia_lsp_env_project().display()
-        );
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("julia LanguageServer install failed: {}", stderr.trim());
+        }
+
+        let marker = staging.path().join("Project.toml");
+        let project = std::fs::read_to_string(&marker).with_context(|| {
+            format!(
+                "install reported success but {} is missing",
+                marker.display()
+            )
+        })?;
+        if !project.contains("LanguageServer") {
+            bail!(
+                "install reported success but {} has no LanguageServer entry",
+                marker.display()
+            );
+        }
+
+        let backup = promote_installation_sync(staging.path(), &destination)?;
+        staging.mark_promoted();
+        if let Some(backup) = backup {
+            let _ = remove_path(&backup).await;
+        }
+        Ok(())
     }
+    .await;
+    if result.is_err() {
+        staging.cleanup().await;
+    }
+    result?;
 
     send_progress(event_tx, "julia-lsp", "done", 100).await;
     Ok(PathBuf::from("julia"))
@@ -730,7 +986,10 @@ fn extract_tar_gz(src: &Path, dest_dir: &Path) -> Result<()> {
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
     let mut extracted = 0_u64;
-    for entry in archive.entries()? {
+    for (index, entry) in archive.entries()?.enumerate() {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            bail!("tar archive exceeds the entry-count safety limit");
+        }
         let mut entry = entry?;
         let entry_type = entry.header().entry_type();
         if !(entry_type.is_file() || entry_type.is_dir()) {
@@ -752,6 +1011,9 @@ fn extract_tar_gz(src: &Path, dest_dir: &Path) -> Result<()> {
 fn extract_zip(src: &Path, dest_dir: &Path) -> Result<()> {
     let file = std::fs::File::open(src)?;
     let mut archive = zip::ZipArchive::new(file)?;
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        bail!("zip archive exceeds the entry-count safety limit");
+    }
     let mut extracted = 0_u64;
 
     for i in 0..archive.len() {
@@ -820,6 +1082,84 @@ fn unique_sibling_path(path: &Path, label: &str) -> PathBuf {
     path.with_file_name(format!(".{name}.{label}-{}-{unique}", std::process::id()))
 }
 
+fn hidden_sibling_owner(path: &Path, destination: &Path, label: &str) -> Option<(u32, u128)> {
+    let destination = destination.file_name()?.to_string_lossy();
+    let name = path.file_name()?.to_string_lossy();
+    let suffix = name.strip_prefix(&format!(".{destination}.{label}-"))?;
+    let (pid, stamp) = suffix.split_once('-')?;
+    Some((pid.parse().ok()?, stamp.parse().ok()?))
+}
+
+fn owner_is_stale(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        !alive && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        // Without a portable process-liveness probe, never delete another
+        // process's hidden tree. Current-process leftovers are still reaped.
+        false
+    }
+}
+
+/// Reap cancellation leftovers and recover an old active tree if a previous
+/// process died during promotion. Live foreign PIDs are never touched.
+fn recover_stale_install_siblings(destination: &Path) -> Result<()> {
+    let Some(parent) = destination.parent() else {
+        return Ok(());
+    };
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("could not inspect installation siblings"),
+    };
+    let mut backups: Vec<(u128, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        for label in ["installing", "abandoned", "backup"] {
+            let Some((pid, stamp)) = hidden_sibling_owner(&path, destination, label) else {
+                continue;
+            };
+            if !owner_is_stale(pid) {
+                break;
+            }
+            if label == "backup" {
+                backups.push((stamp, path.clone()));
+            } else {
+                let _ = remove_path_sync(&path);
+            }
+            break;
+        }
+    }
+
+    backups.sort_by_key(|(stamp, _)| *stamp);
+    if std::fs::symlink_metadata(destination).is_err()
+        && let Some((_, newest)) = backups.pop()
+    {
+        std::fs::rename(&newest, destination)
+            .context("failed to restore interrupted managed installation")?;
+    }
+    for (_, backup) in backups {
+        let _ = remove_path_sync(&backup);
+    }
+    Ok(())
+}
+
+async fn recover_stale_install_siblings_off_thread(destination: &Path) -> Result<()> {
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || recover_stale_install_siblings(&destination))
+        .await
+        .context("interrupted-install recovery task failed")?
+}
+
 async fn remove_path(path: &Path) -> std::io::Result<()> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
@@ -833,20 +1173,32 @@ async fn remove_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
+fn remove_path_sync(path: &Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 /// Replace an installation only after its staged tree is complete. The old
-/// tree is restored if the final rename fails.
-async fn promote_installation(staged: &Path, destination: &Path) -> Result<()> {
+/// tree is restored if the final rename fails. Called synchronously from an
+/// async task so cancellation cannot land between the two renames.
+fn promote_installation_sync(staged: &Path, destination: &Path) -> Result<Option<PathBuf>> {
     let backup = unique_sibling_path(destination, "backup");
-    let had_destination = tokio::fs::symlink_metadata(destination).await.is_ok();
+    let had_destination = std::fs::symlink_metadata(destination).is_ok();
     if had_destination {
-        tokio::fs::rename(destination, &backup)
-            .await
+        std::fs::rename(destination, &backup)
             .context("failed to stage the previous managed installation")?;
     }
 
-    if let Err(error) = tokio::fs::rename(staged, destination).await {
-        if had_destination && let Err(restore_error) = tokio::fs::rename(&backup, destination).await
-        {
+    if let Err(error) = std::fs::rename(staged, destination) {
+        if had_destination && let Err(restore_error) = std::fs::rename(&backup, destination) {
             bail!(
                 "failed to activate managed installation ({error}); also failed to restore the previous installation ({restore_error})"
             );
@@ -854,10 +1206,7 @@ async fn promote_installation(staged: &Path, destination: &Path) -> Result<()> {
         return Err(error).context("failed to activate managed installation");
     }
 
-    if had_destination {
-        let _ = remove_path(&backup).await;
-    }
-    Ok(())
+    Ok(had_destination.then_some(backup))
 }
 
 fn set_executable(path: &Path) -> Result<()> {
@@ -878,7 +1227,11 @@ async fn send_progress(event_tx: &EventTx, server: &str, stage: &str, percent: u
         "stage": stage,
         "percent": percent,
     });
-    let _ = event_tx.send(serde_json::to_string(&ev).unwrap()).await;
+    // Progress is superseded by the next progress/final result.  Never let an
+    // unread stdout pipe stop the install itself before its network/command
+    // deadlines can fire; the final installResult uses the daemon's reliable
+    // reply path.
+    let _ = event_tx.try_send(serde_json::to_string(&ev).unwrap());
 }
 
 /// Recursively search for a binary by filename.
@@ -913,6 +1266,158 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("simplecc-{label}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn installation_marker_is_released_by_drop() {
+        let name = format!("guard-test-{}", std::process::id());
+        let first = InstallingGuard::acquire(&name).unwrap();
+        assert!(InstallingGuard::acquire(&name).is_err());
+        drop(first);
+        assert!(InstallingGuard::acquire(&name).is_ok());
+    }
+
+    #[test]
+    fn julia_installer_targets_the_sibling_staging_environment() {
+        let staging = Path::new("/tmp/simplecc-julia-staging");
+        let command = julia_install_command(staging);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == JULIA_INSTALL_SCRIPT));
+        assert!(args.iter().any(|arg| arg == staging.to_str().unwrap()));
+        assert!(JULIA_INSTALL_SCRIPT.contains("Pkg.activate(ARGS[1])"));
+        assert!(!JULIA_INSTALL_SCRIPT.contains("shared=true"));
+    }
+
+    #[test]
+    fn stale_backup_is_restored_before_a_new_install() {
+        let root = temp_path("recover-backup");
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("server");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("old"), b"old").unwrap();
+        let backup = unique_sibling_path(&destination, "backup");
+        std::fs::rename(&destination, &backup).unwrap();
+
+        recover_stale_install_siblings(&destination).unwrap();
+        assert_eq!(std::fs::read(destination.join("old")).unwrap(), b"old");
+        assert!(!backup.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_staging_keeps_its_recoverable_installing_name() {
+        let root = temp_path("cancelled-staging");
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("server");
+        let staging_path = unique_sibling_path(&destination, "installing");
+        std::fs::create_dir(&staging_path).unwrap();
+        std::fs::write(staging_path.join("partial"), b"partial").unwrap();
+        drop(StagingGuard::new(staging_path.clone()));
+
+        assert!(staging_path.exists(), "Drop must not race an active writer");
+        assert!(
+            hidden_sibling_owner(&staging_path, &destination, "installing").is_some(),
+            "cancellation must preserve the startup-recovery naming contract"
+        );
+        recover_stale_install_siblings(&destination).unwrap();
+        assert!(!staging_path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn progress_is_best_effort_under_stdout_backpressure() {
+        let (sender, mut rx) = tokio::sync::mpsc::channel(1);
+        let tx = EventTx::new(sender);
+        tx.send("already queued".to_string()).await.unwrap();
+        send_progress(&tx, "rust-analyzer", "downloading", 50).await;
+        assert_eq!(rx.recv().await.as_deref(), Some("already queued"));
+        assert!(
+            rx.try_recv().is_err(),
+            "progress unexpectedly displaced a reply"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn aborting_installer_kills_its_process_group() {
+        let pid_file = temp_path("installer-pids");
+        let script = r#"printf '%s\n' "$$" > "$1"; sleep 30 & child=$!; printf '%s\n' "$child" >> "$1"; wait"#;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script, "simplecc-test", &pid_file.to_string_lossy()]);
+        let runner = tokio::spawn(run_installer_child(
+            command,
+            std::time::Duration::from_secs(30),
+            "process-group test",
+            None,
+        ));
+
+        let pids = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_file).await {
+                    let pids = text
+                        .lines()
+                        .filter_map(|line| line.parse::<libc::pid_t>().ok())
+                        .collect::<Vec<_>>();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("installer parent and child publish their PIDs");
+
+        runner.abort();
+        assert!(runner.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let all_gone = pids.iter().all(|pid| {
+                    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+                    match stat {
+                        Err(_) => true,
+                        Ok(stat) => {
+                            // A zombie has exited and cannot keep writing
+                            // staging; its init/subreaper may reap it later.
+                            let state = stat
+                                .rsplit_once(") ")
+                                .and_then(|(_, rest)| rest.chars().next());
+                            matches!(state, Some('Z' | 'X'))
+                        }
+                    }
+                });
+                if all_gone {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("installer process group exits after task cancellation");
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_stderr_is_drained_but_memory_bounded() {
+        let script = r#"i=0; while [ "$i" -lt 10000 ]; do printf '0123456789abcdef0123456789abcdef\n' >&2; i=$((i + 1)); done; exit 7"#;
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let output = run_installer_child(
+            command,
+            std::time::Duration::from_secs(5),
+            "stderr bound test",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(output.stderr.len(), MAX_INSTALLER_STDERR_BYTES);
+        assert!(output.stdout.is_empty());
     }
 
     #[test]
@@ -1029,10 +1534,14 @@ mod tests {
         std::fs::write(destination.join("version"), b"old").unwrap();
         std::fs::write(staged.join("version"), b"new").unwrap();
 
-        promote_installation(&staged, &destination).await.unwrap();
+        let backup = promote_installation_sync(&staged, &destination)
+            .unwrap()
+            .expect("an old destination produces a cleanup backup");
 
         assert_eq!(std::fs::read(destination.join("version")).unwrap(), b"new");
         assert!(!staged.exists());
+        assert!(backup.exists());
+        remove_path(&backup).await.unwrap();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
 
         let _ = std::fs::remove_dir_all(root);

@@ -861,7 +861,7 @@ export def PathToUri(path: string): string
       absolute = '/' .. absolute
     endif
   endif
-  if absolute =~# '^//[^/]'
+  if absolute =~# '\m^//[^/]'
     return 'file://' .. PercentEncodePath(strpart(absolute, 2))
   endif
   return 'file://' .. PercentEncodePath(absolute)
@@ -1970,7 +1970,7 @@ def RequestCompletion(manual: bool = false)
   endwhile
   var prefix = start < ccol - 1 ? line_text[start : ccol - 2] : ''
   var is_trigger = start > 0
-        && line_text[start - 1] =~# '[^[:alnum:]_[:space:]]'
+        && line_text[start - 1] =~# '\m[^[:alnum:]_[:space:]]'
   if strchars(prefix) < g:simplecc_complete_min_chars && !is_trigger
     return
   endif
@@ -2035,7 +2035,7 @@ def BufferWordList(bnr: number): list<string>
   var words: list<string> = []
   var word_set: dict<bool> = {}
   for text in getbufline(bnr, 1, '$')
-    for w in split(text, '\%(\k\)\@!.')
+    for w in split(text, '\m\%(\k\)\@!.')
       if !has_key(word_set, w)
         word_set[w] = true
         add(words, w)
@@ -2087,7 +2087,7 @@ enddef
 # for lines that can actually contribute.
 def ScanLineWords(text: string, prefix: string, lower_prefix: string, ic: bool,
     seen: dict<bool>, existing: dict<bool>, out: list<dict<any>>, limit: number)
-  for w in split(text, '\%(\k\)\@!.')
+  for w in split(text, '\m\%(\k\)\@!.')
     if len(out) >= limit
       return
     endif
@@ -7346,7 +7346,8 @@ export def OmniFunc(findstart: number, base: string): any
     # matchstr() rather than an index walk so a multi-byte identifier is not
     # cut in half.
     var before = strpart(getline('.'), 0, col('.') - 1)
-    return strlen(before) - strlen(matchstr(before, '\k*$'))
+    # Internal token grammar is independent of the user's search 'magic'.
+    return strlen(before) - strlen(matchstr(before, '\m\k*$'))
   endif
   if !s_initialized || BufFt() ==# '' || !ServerSupports('completion', BufFt())
     # An empty list leaves Vim's own fallbacks alone.
@@ -7376,7 +7377,7 @@ export def TagFunc(pattern: string, flags: string, info: dict<any>): any
   # A definition is a position, not a name. Only a tag command that started
   # from the cursor ('c') describes one; `:tag Foo` typed by hand, a regexp
   # pattern ('r') and insert-mode tag completion ('i') belong to the tags file.
-  if flags !~# 'c' || flags =~# '[ir]' || pattern !=# expand('<cword>')
+  if flags !~# 'c' || flags =~# '\m[ir]' || pattern !=# expand('<cword>')
     return v:null
   endif
 
@@ -7443,7 +7444,7 @@ export def FormatExpr(): number
   # wrap that passes the pending character in v:char — must never take a
   # round-trip through a language server; it would reformat the paragraph
   # under the cursor on every keystroke.
-  if v:char !=# '' || mode() =~# '^[iR]'
+  if v:char !=# '' || mode() =~# '\m^[iR]'
     return 1
   endif
   var last = min([line('$'), v:lnum + max([1, v:count]) - 1])
