@@ -102,6 +102,19 @@ fn malformed_input_does_not_poison_the_next_request() {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
 
+    // Surviving the bad line is half of it; saying so is the other half.  A
+    // line that failed to deserialise used to produce nothing on the channel
+    // at all, so the only record of it was one stderr line the frontend never
+    // reads, and the caller waited out its 30 s request timeout instead.
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "error"
+                && event["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("invalid request:"))
+        }),
+        "a malformed line must be answered on the wire: {events:?}"
+    );
     assert!(
         events
             .iter()
@@ -113,6 +126,37 @@ fn malformed_input_does_not_poison_the_next_request() {
             .any(|event| event["type"] == "shutdown" && event["id"] == 8)
     );
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+/// Protocol drift — a field renamed on one side of a partial upgrade, or a
+/// `type` tag the daemon has never heard of — is well-formed JSON that does
+/// not deserialise.  The reply has to name what failed, because the frontend's
+/// only other outcome is a request timeout whose message says nothing about
+/// the cause.
+#[test]
+fn a_request_the_daemon_cannot_decode_is_answered_with_the_reason() {
+    let events = run_daemon(&[
+        json!({ "type": "textDocument/definitelyNotAThing", "id": 12 }),
+        json!({ "type": "shutdown", "id": 13 }),
+    ]);
+    let reason = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .and_then(|event| event["message"].as_str())
+        .unwrap_or_else(|| panic!("no error event for an undecodable request: {events:?}"));
+    assert!(
+        reason.starts_with("invalid request:"),
+        "unexpected error message: {reason}"
+    );
+    assert!(
+        reason.contains("textDocument/definitelyNotAThing"),
+        "the error must name the tag that failed: {reason}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "shutdown" && event["id"] == 13)
+    );
 }
 
 #[test]

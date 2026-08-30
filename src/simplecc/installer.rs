@@ -1009,12 +1009,22 @@ fn extract_tar_gz(src: &Path, dest_dir: &Path) -> Result<()> {
 }
 
 fn extract_zip(src: &Path, dest_dir: &Path) -> Result<()> {
+    extract_zip_within(src, dest_dir, MAX_EXTRACTED_BYTES)
+}
+
+/// `budget` is how many bytes the extraction may actually *write*, which is
+/// deliberately not how many bytes the archive claims to hold.  Only tests
+/// pass anything but MAX_EXTRACTED_BYTES; the parameter exists so the bound
+/// can be exercised without materialising a gibibyte.
+fn extract_zip_within(src: &Path, dest_dir: &Path, budget: u64) -> Result<()> {
+    use std::io::Read;
+
     let file = std::fs::File::open(src)?;
     let mut archive = zip::ZipArchive::new(file)?;
     if archive.len() > MAX_ARCHIVE_ENTRIES {
         bail!("zip archive exceeds the entry-count safety limit");
     }
-    let mut extracted = 0_u64;
+    let mut remaining = budget;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
@@ -1032,17 +1042,23 @@ fn extract_zip(src: &Path, dest_dir: &Path) -> Result<()> {
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
         } else {
-            extracted = extracted
-                .checked_add(entry.size())
-                .context("expanded archive size overflow")?;
-            if extracted > MAX_EXTRACTED_BYTES {
-                bail!("expanded zip archive exceeds the safety limit");
-            }
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut out_file)?;
+            // `entry.size()` is the uncompressed size the archive declares
+            // about itself, and nothing verifies it: the Deflated reader does
+            // not truncate its output at the declared size, and the CRC is
+            // checked at the read path's EOF — after every byte is already on
+            // disk, and against a field the same archive supplied.  So bound
+            // what the decoder actually produces, exactly as extract_gz does,
+            // and spend the budget per entry so a thousand small bombs cost
+            // the same as one big one.
+            let written = std::io::copy(&mut entry.by_ref().take(remaining + 1), &mut out_file)?;
+            if written > remaining {
+                bail!("expanded zip archive exceeds the safety limit");
+            }
+            remaining -= written;
 
             // Preserve executable bit
             #[cfg(unix)]
@@ -1482,6 +1498,84 @@ mod tests {
 
         extract_zip(&archive_path, &root).unwrap();
         assert_eq!(std::fs::read(root.join("bin/clangd")).unwrap(), b"binary");
+
+        let _ = std::fs::remove_file(archive_path);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Build a one-entry Deflated zip carrying `payload`, then rewrite the
+    /// uncompressed-size field in both the local header (+22) and the central
+    /// directory record (+24).  Nothing in the format cross-checks either
+    /// against the deflate stream, so this is what a zip bomb looks like on
+    /// the wire: a tiny declared size in front of an enormous expansion.
+    fn zip_declaring_a_false_size(payload: &[u8], declared: u32) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut buffer);
+            writer
+                .start_file(
+                    "bomb/payload",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(payload).unwrap();
+            writer.finish().unwrap();
+        }
+        let mut bytes = buffer.into_inner();
+        assert_eq!(&bytes[..4], b"PK\x03\x04", "local file header comes first");
+        bytes[22..26].copy_from_slice(&declared.to_le_bytes());
+        let central = bytes
+            .windows(4)
+            .rposition(|window| window == b"PK\x01\x02")
+            .expect("a central directory record");
+        bytes[central + 24..central + 28].copy_from_slice(&declared.to_le_bytes());
+        bytes
+    }
+
+    /// The zip arm used to add up `entry.size()` — the size the archive
+    /// declares for itself — and then write with an unbounded `io::copy`, so
+    /// the constant that exists to stop a zip bomb never saw a byte that was
+    /// actually written.  `extract_gz` has always bounded its decoder's
+    /// output; this is the same rule for zip.
+    #[test]
+    fn zip_extraction_bounds_the_bytes_it_writes_not_the_size_declared() {
+        let root = temp_path("zip-bomb");
+        let archive_path = root.with_extension("zip");
+        std::fs::create_dir_all(&root).unwrap();
+        // 256 KiB of zeros deflates to a few hundred bytes, and declares one.
+        std::fs::write(
+            &archive_path,
+            zip_declaring_a_false_size(&vec![0_u8; 256 * 1024], 1),
+        )
+        .unwrap();
+
+        // A budget the declared size clears trivially and the real expansion
+        // cannot: if the bound is read off the header, this extraction is
+        // accepted and writes 256 KiB.
+        let budget: u64 = 64 * 1024;
+        let error = extract_zip_within(&archive_path, &root, budget).unwrap_err();
+        assert!(
+            error.to_string().contains("safety limit"),
+            "unexpected error: {error}"
+        );
+        let landed = std::fs::metadata(root.join("payload"))
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            landed <= budget + 1,
+            "wrote {landed} bytes against a {budget} byte budget"
+        );
+
+        // The same archive is fine once the budget covers what it really
+        // expands to, which is the half that proves the bound is on bytes
+        // written rather than on the lie in the header.
+        std::fs::remove_file(root.join("payload")).unwrap();
+        extract_zip_within(&archive_path, &root, 256 * 1024).unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("payload")).unwrap().len(),
+            256 * 1024
+        );
 
         let _ = std::fs::remove_file(archive_path);
         let _ = std::fs::remove_dir_all(root);

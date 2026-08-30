@@ -838,7 +838,18 @@ async fn serve() -> Result<()> {
         let req: Request = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[simplecc] bad request: {e}");
+                // A line the daemon cannot decode still has to be answered on
+                // the wire.  Logging it to stderr alone leaves the frontend
+                // waiting out its request timeout for a reason only the daemon
+                // ever saw; every sibling daemon replies with an Error naming
+                // the field or variant that failed, and so does the
+                // over-length/non-UTF-8 branch directly above.
+                let message = format!("invalid request: {e}");
+                eprintln!("[simplecc] bad request: {message}");
+                send_event!(
+                    &out_tx,
+                    json!({"type": "error", "id": 0, "message": message}),
+                );
                 continue;
             }
         };
