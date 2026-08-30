@@ -1,7 +1,8 @@
 use anyhow::{Result, bail};
+use globset::{GlobBuilder, GlobMatcher};
 use lsp_types::*;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ const CURSOR_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const EXECUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// Semantic-token URIs kept in the delta cache before old entries are evicted.
 const SEMTOK_CACHE_LIMIT: usize = 64;
+const WATCHED_FILES_METHOD: &str = "workspace/didChangeWatchedFiles";
 
 #[derive(Default)]
 struct CompletionCache {
@@ -32,6 +34,161 @@ struct SemanticTokenCache {
     result_id: Option<String>,
     data: Vec<lsp_types::SemanticToken>,
     last_used: Instant,
+}
+
+#[derive(Clone)]
+struct WatchedFilePattern {
+    base_uri: url::Url,
+    matcher: GlobMatcher,
+    kind: u8,
+}
+
+#[derive(Clone)]
+struct RegisteredCapability {
+    method: String,
+    watched_files: Option<Vec<WatchedFilePattern>>,
+}
+
+#[derive(Default)]
+struct DynamicRegistrations {
+    by_id: HashMap<String, RegisteredCapability>,
+}
+
+impl WatchedFilePattern {
+    fn matches(&self, uri: &str, change_type: u32) -> bool {
+        let kind = match change_type {
+            1 => WatchKind::Create.bits(),
+            2 => WatchKind::Change.bits(),
+            3 => WatchKind::Delete.bits(),
+            _ => return false,
+        };
+        if self.kind & kind == 0 {
+            return false;
+        }
+        let Ok(uri) = url::Url::parse(uri) else {
+            return false;
+        };
+        relative_uri_path(&self.base_uri, &uri).is_some_and(|path| self.matcher.is_match(path))
+    }
+}
+
+impl DynamicRegistrations {
+    fn register(&mut self, registrations: Vec<(String, RegisteredCapability)>) {
+        for (id, registration) in registrations {
+            self.by_id.insert(id, registration);
+        }
+    }
+
+    fn unregister(&mut self, unregisterations: &[Unregistration]) {
+        for unregister in unregisterations {
+            if self
+                .by_id
+                .get(&unregister.id)
+                .is_some_and(|registration| registration.method == unregister.method)
+            {
+                self.by_id.remove(&unregister.id);
+            }
+        }
+    }
+
+    fn matches_watched_file(&self, uri: &str, change_type: u32) -> bool {
+        self.by_id.values().any(|registration| {
+            registration.method == WATCHED_FILES_METHOD
+                && registration.watched_files.as_ref().is_some_and(|watchers| {
+                    watchers
+                        .iter()
+                        .any(|watcher| watcher.matches(uri, change_type))
+                })
+        })
+    }
+}
+
+fn relative_uri_path(base: &url::Url, uri: &url::Url) -> Option<String> {
+    if base.scheme() == "file" && uri.scheme() == "file" {
+        let base = base.to_file_path().ok()?;
+        let path = uri.to_file_path().ok()?;
+        return path
+            .strip_prefix(base)
+            .ok()
+            .map(|path| path.to_string_lossy().replace('\\', "/"));
+    }
+    if base.scheme() != uri.scheme()
+        || base.host_str() != uri.host_str()
+        || base.port_or_known_default() != uri.port_or_known_default()
+    {
+        return None;
+    }
+    let base_path = base.path().trim_end_matches('/');
+    let path = uri.path().strip_prefix(base_path)?;
+    if !path.is_empty() && !path.starts_with('/') {
+        return None;
+    }
+    Some(path.trim_start_matches('/').to_string())
+}
+
+fn compile_watched_file_pattern(
+    watcher: FileSystemWatcher,
+    workspace_root_uri: &str,
+) -> std::result::Result<WatchedFilePattern, String> {
+    let (base_uri, pattern) = match watcher.glob_pattern {
+        GlobPattern::String(pattern) => (workspace_root_uri.to_string(), pattern),
+        GlobPattern::Relative(relative) => {
+            let base_uri = match relative.base_uri {
+                OneOf::Left(folder) => folder.uri.as_str().to_string(),
+                OneOf::Right(uri) => uri.as_str().to_string(),
+            };
+            (base_uri, relative.pattern)
+        }
+    };
+    let base_uri = url::Url::parse(&base_uri)
+        .map_err(|error| format!("invalid watched-files base URI: {error}"))?;
+    let mut builder = GlobBuilder::new(&pattern);
+    builder.literal_separator(true).backslash_escape(false);
+    let matcher = builder
+        .build()
+        .map_err(|error| format!("invalid watched-files glob {pattern:?}: {error}"))?
+        .compile_matcher();
+    Ok(WatchedFilePattern {
+        base_uri,
+        matcher,
+        kind: watcher.kind.map_or(7, |kind| kind.bits()),
+    })
+}
+
+fn parse_registrations(
+    params: Option<&Value>,
+    workspace_root_uri: &str,
+) -> std::result::Result<Vec<(String, RegisteredCapability)>, String> {
+    let params: RegistrationParams = serde_json::from_value(params.cloned().unwrap_or(Value::Null))
+        .map_err(|error| format!("invalid capability registration: {error}"))?;
+    params
+        .registrations
+        .into_iter()
+        .map(|registration| {
+            let watched_files = if registration.method == WATCHED_FILES_METHOD {
+                let options: DidChangeWatchedFilesRegistrationOptions = serde_json::from_value(
+                    registration.register_options.clone().unwrap_or(Value::Null),
+                )
+                .map_err(|error| format!("invalid watched-files registration: {error}"))?;
+                Some(
+                    options
+                        .watchers
+                        .into_iter()
+                        .map(|watcher| compile_watched_file_pattern(watcher, workspace_root_uri))
+                        .collect::<std::result::Result<Vec<_>, _>>()?,
+                )
+            } else {
+                None
+            };
+            Ok((
+                registration.id,
+                RegisteredCapability {
+                    method: registration.method,
+                    watched_files,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// A single LSP server client.
@@ -63,9 +220,10 @@ pub struct LspClient {
     /// Full and delta requests for one URI must never mutate the cache out of
     /// order. Different documents can still be processed concurrently.
     semtok_uri_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    /// Methods dynamically registered by the server, such as workspace file
-    /// watching requested by LanguageServer.jl.
-    registered_methods: Arc<Mutex<HashSet<String>>>,
+    /// Capabilities dynamically registered by the server. Watched-file
+    /// registrations retain their IDs, event masks and glob options so each
+    /// server receives only the filesystem events it requested.
+    dynamic_registrations: Arc<Mutex<DynamicRegistrations>>,
     /// Whether the server negotiated incremental document sync. Cached after
     /// initialize so every keystroke does not re-lock the capability mutex.
     incremental_sync: Arc<AtomicBool>,
@@ -161,8 +319,8 @@ impl LspClient {
         let event_tx_clone = event_tx.clone();
         let settings = Arc::new(RwLock::new(settings.unwrap_or_else(|| json!({}))));
         let settings_clone = settings.clone();
-        let registered_methods = Arc::new(Mutex::new(HashSet::new()));
-        let registered_methods_clone = registered_methods.clone();
+        let dynamic_registrations = Arc::new(Mutex::new(DynamicRegistrations::default()));
+        let dynamic_registrations_clone = dynamic_registrations.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
         let workspace_root = Arc::new((root_uri.to_string(), root_path.to_string()));
@@ -183,7 +341,7 @@ impl LspClient {
                             &transport_clone,
                             &event_tx_clone,
                             &settings_clone,
-                            &registered_methods_clone,
+                            &dynamic_registrations_clone,
                             &workspace_root,
                             &editor_ready_clone,
                         )
@@ -231,7 +389,7 @@ impl LspClient {
             cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
             semtok_cache: Arc::new(Mutex::new(HashMap::new())),
             semtok_uri_locks: Arc::new(Mutex::new(HashMap::new())),
-            registered_methods,
+            dynamic_registrations,
             incremental_sync: Arc::new(AtomicBool::new(false)),
             settings,
             watched_file_notifications: Arc::new(Mutex::new(HashMap::new())),
@@ -646,12 +804,15 @@ impl LspClient {
     }
 
     pub async fn did_change_watched_files(&self, changes: &[(String, u32)]) -> Result<()> {
-        if !self
-            .registered_methods
-            .lock()
-            .await
-            .contains("workspace/didChangeWatchedFiles")
-        {
+        let changes: Vec<_> = {
+            let registrations = self.dynamic_registrations.lock().await;
+            changes
+                .iter()
+                .filter(|(uri, change_type)| registrations.matches_watched_file(uri, *change_type))
+                .cloned()
+                .collect()
+        };
+        if changes.is_empty() {
             return Ok(());
         }
 
@@ -659,9 +820,9 @@ impl LspClient {
         let mut recent = self.watched_file_notifications.lock().await;
         recent.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(2));
         let changes: Vec<_> = changes
-            .iter()
+            .into_iter()
             .filter_map(|(uri, change_type)| {
-                let key = (uri.clone(), *change_type);
+                let key = (uri.clone(), change_type);
                 if recent
                     .get(&key)
                     .is_some_and(|seen| now.duration_since(*seen) < Duration::from_millis(250))
@@ -2648,7 +2809,7 @@ async fn handle_server_request(
     transport: &Arc<Mutex<LspTransport>>,
     event_tx: &mpsc::Sender<ServerEvent>,
     settings: &Arc<RwLock<Value>>,
-    registered_methods: &Arc<Mutex<HashSet<String>>>,
+    dynamic_registrations: &Arc<Mutex<DynamicRegistrations>>,
     workspace_root: &Arc<(String, String)>,
     editor_ready: &Arc<AtomicBool>,
 ) {
@@ -2838,9 +2999,41 @@ async fn handle_server_request(
             let _ = t.send(&resp).await;
         }
         "client/registerCapability" => {
-            let methods = registration_methods(msg.get("params"));
-            registered_methods.lock().await.extend(methods);
-            let resp = json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+            let root_uri = &workspace_root.0;
+            let resp = match parse_registrations(msg.get("params"), root_uri) {
+                Ok(registrations) => {
+                    dynamic_registrations.lock().await.register(registrations);
+                    json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+                }
+                Err(message) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": message },
+                }),
+            };
+            let mut t = transport.lock().await;
+            let _ = t.send(&resp).await;
+        }
+        "client/unregisterCapability" => {
+            let params: std::result::Result<UnregistrationParams, _> =
+                serde_json::from_value(msg.get("params").cloned().unwrap_or(Value::Null));
+            let resp = match params {
+                Ok(params) => {
+                    dynamic_registrations
+                        .lock()
+                        .await
+                        .unregister(&params.unregisterations);
+                    json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
+                }
+                Err(error) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": format!("invalid capability unregistration: {error}"),
+                    },
+                }),
+            };
             let mut t = transport.lock().await;
             let _ = t.send(&resp).await;
         }
@@ -2962,16 +3155,6 @@ mod workspace_edit_tests {
     }
 }
 
-fn registration_methods(params: Option<&Value>) -> Vec<String> {
-    params
-        .and_then(|params| params.get("registrations"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|registration| registration.get("method")?.as_str().map(str::to_owned))
-        .collect()
-}
-
 fn configuration_response(params: Option<&Value>, settings: &Value) -> Vec<Value> {
     params
         .and_then(|params| params.get("items"))
@@ -3042,20 +3225,104 @@ mod configuration_tests {
     }
 
     #[test]
-    fn records_dynamic_registration_methods() {
+    fn dynamic_watched_file_registrations_match_globs_bases_and_event_kinds() {
         let params = json!({
             "registrations": [
-                { "id": "files", "method": "workspace/didChangeWatchedFiles" },
-                { "id": "config", "method": "workspace/didChangeConfiguration" }
+                {
+                    "id": "sources",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {
+                        "watchers": [{ "globPattern": "**/*.{rs,py}", "kind": 3 }]
+                    }
+                },
+                {
+                    "id": "config",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": {
+                        "watchers": [{
+                            "globPattern": {
+                                "baseUri": {
+                                    "uri": "file:///workspace/config",
+                                    "name": "config"
+                                },
+                                "pattern": "*.toml"
+                            },
+                            "kind": 4
+                        }]
+                    }
+                }
             ]
         });
-        assert_eq!(
-            registration_methods(Some(&params)),
-            vec![
-                "workspace/didChangeWatchedFiles".to_string(),
-                "workspace/didChangeConfiguration".to_string()
-            ]
+        let mut registrations = DynamicRegistrations::default();
+        registrations.register(parse_registrations(Some(&params), "file:///workspace").unwrap());
+
+        assert!(registrations.matches_watched_file("file:///workspace/src/main.rs", 1));
+        assert!(registrations.matches_watched_file("file:///workspace/tools/check.py", 2));
+        assert!(!registrations.matches_watched_file("file:///workspace/src/main.rs", 3));
+        assert!(!registrations.matches_watched_file("file:///workspace/src/main.go", 1));
+        assert!(!registrations.matches_watched_file("file:///workspace-other/main.rs", 1));
+        assert!(registrations.matches_watched_file("file:///workspace/config/rustfmt.toml", 3));
+        assert!(
+            !registrations.matches_watched_file("file:///workspace/config/nested/rustfmt.toml", 3)
         );
+        assert!(!registrations.matches_watched_file("file:///workspace/config/rustfmt.toml", 2));
+    }
+
+    #[test]
+    fn dynamic_registration_ids_can_be_replaced_and_unregistered() {
+        let rust = json!({
+            "registrations": [{
+                "id": "sources",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.rs" }] }
+            }]
+        });
+        let python = json!({
+            "registrations": [{
+                "id": "sources",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.py" }] }
+            }]
+        });
+        let mut registrations = DynamicRegistrations::default();
+        registrations.register(parse_registrations(Some(&rust), "file:///workspace").unwrap());
+        assert!(registrations.matches_watched_file("file:///workspace/src/main.rs", 2));
+
+        registrations.register(parse_registrations(Some(&python), "file:///workspace").unwrap());
+        assert!(!registrations.matches_watched_file("file:///workspace/src/main.rs", 2));
+        assert!(registrations.matches_watched_file("file:///workspace/src/main.py", 2));
+
+        registrations.unregister(&[Unregistration {
+            id: "sources".to_string(),
+            method: "workspace/didChangeConfiguration".to_string(),
+        }]);
+        assert!(registrations.matches_watched_file("file:///workspace/src/main.py", 2));
+
+        registrations.unregister(&[Unregistration {
+            id: "sources".to_string(),
+            method: WATCHED_FILES_METHOD.to_string(),
+        }]);
+        assert!(!registrations.matches_watched_file("file:///workspace/src/main.py", 2));
+    }
+
+    #[test]
+    fn rejects_invalid_dynamic_watched_file_options() {
+        let missing_options = json!({
+            "registrations": [{
+                "id": "files",
+                "method": "workspace/didChangeWatchedFiles"
+            }]
+        });
+        assert!(parse_registrations(Some(&missing_options), "file:///workspace").is_err());
+
+        let bad_glob = json!({
+            "registrations": [{
+                "id": "files",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "[" }] }
+            }]
+        });
+        assert!(parse_registrations(Some(&bad_glob), "file:///workspace").is_err());
     }
 
     #[test]

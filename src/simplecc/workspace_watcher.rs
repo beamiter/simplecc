@@ -59,16 +59,10 @@ impl WorkspaceWatcher {
                 }
 
                 let manifest_changed = pending.keys().any(|path| is_julia_manifest(path));
-                let changes: Vec<_> = pending
-                    .into_iter()
-                    .filter_map(|(path, change_type)| {
-                        is_lsp_workspace_file(&path).then(|| {
-                            url::Url::from_file_path(path)
-                                .ok()
-                                .map(|uri| (uri.to_string(), change_type))
-                        })?
-                    })
-                    .collect();
+                // Each language server supplies its own dynamic watcher globs.
+                // Forward the complete coalesced batch and let the client-side
+                // registration matcher select the events for that server.
+                let changes = workspace_file_changes(pending);
                 if changes.is_empty() {
                     continue;
                 }
@@ -184,26 +178,17 @@ fn merge_path(pending: &mut HashMap<PathBuf, u32>, path: PathBuf, change_type: u
         .or_insert(change_type);
 }
 
-fn is_lsp_workspace_file(path: &Path) -> bool {
-    if matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("jl" | "jmd" | "md")
-    ) {
-        return true;
-    }
-
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    matches!(
-        name,
-        "Project.toml"
-            | "JuliaProject.toml"
-            | "Manifest.toml"
-            | "JuliaManifest.toml"
-            | ".JuliaLint.toml"
-    ) || ((name.starts_with("Manifest-v") || name.starts_with("JuliaManifest-v"))
-        && name.ends_with(".toml"))
+fn workspace_file_changes(pending: HashMap<PathBuf, u32>) -> Vec<(String, u32)> {
+    let mut changes: Vec<_> = pending
+        .into_iter()
+        .filter_map(|(path, change_type)| {
+            url::Url::from_file_path(path)
+                .ok()
+                .map(|uri| (uri.to_string(), change_type))
+        })
+        .collect();
+    changes.sort_unstable();
+    changes
 }
 
 fn is_julia_manifest(path: &Path) -> bool {
@@ -221,19 +206,36 @@ mod tests {
     use notify::event::{CreateKind, RemoveKind};
 
     #[test]
-    fn filters_the_same_workspace_files_as_julia_language_server() {
-        for path in [
-            "src/main.jl",
-            "notes/readme.md",
-            "Project.toml",
-            "Manifest-v1.12.toml",
-            ".JuliaLint.toml",
-        ] {
-            assert!(is_lsp_workspace_file(Path::new(path)), "{path}");
-        }
-        for path in ["target/cache.bin", ".git/index", "data/table.csv"] {
-            assert!(!is_lsp_workspace_file(Path::new(path)), "{path}");
-        }
+    fn forwards_all_workspace_extensions_for_per_server_glob_matching() {
+        let pending = HashMap::from([
+            (PathBuf::from("/tmp/simplecc/src/main.rs"), CREATED),
+            (PathBuf::from("/tmp/simplecc/lib/tool.py"), CHANGED),
+            (PathBuf::from("/tmp/simplecc/src/main.jl"), DELETED),
+            (PathBuf::from("/tmp/simplecc/target/cache.bin"), CHANGED),
+        ]);
+        let changes = workspace_file_changes(pending);
+
+        assert_eq!(changes.len(), 4);
+        assert!(
+            changes
+                .iter()
+                .any(|(uri, kind)| uri.ends_with("/src/main.rs") && *kind == CREATED)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|(uri, kind)| uri.ends_with("/lib/tool.py") && *kind == CHANGED)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|(uri, kind)| uri.ends_with("/src/main.jl") && *kind == DELETED)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|(uri, kind)| uri.ends_with("/target/cache.bin") && *kind == CHANGED)
+        );
     }
 
     #[test]
