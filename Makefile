@@ -30,6 +30,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/change_sync.vim
 	vim -Nu NONE -n -i NONE -es -S test/remote_paths.vim
 	vim -Nu NONE -n -i NONE -es -S test/remote_lifecycle.vim
+	vim -Nu NONE -n -i NONE -es -S test/plugin_reload.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

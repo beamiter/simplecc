@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - 2026-09-28
+
+### 重新 source 一次 vimrc 之后,`:SimpleCCInstall` 的补全不再失效
+
+- 插件管理器在 vimrc 被重新 source 时会把 `plugin/` 再 source 一遍。
+  `plugin/simplecc.vim` 有 `g:loaded_simplecc` 守卫,什么都不会重新定义——但普通的
+  `vim9script` 在走到守卫的 `finish` 之前,就已经把脚本里所有的 script-local 函数
+  删掉了,而第一次加载时定义的命令还在。`:SimpleCCInstall` 的
+  `-complete=custom` 指向的 `SimpleCCInstallComplete()` 因此消失,之后按 Tab 报
+  E117。首行改为 `vim9script noclear`。
+- 新增 `test/plugin_reload.vim`:把脚本 source 两遍,断言 script-local 的函数一个
+  不少,并且补全仍然给出候选。
+
 ## Unreleased - 2026-08-05
 
 ### SimpleCC 独占远程工作区的生命周期
