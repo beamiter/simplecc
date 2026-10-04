@@ -96,6 +96,36 @@ let [s:built, s:existing] = s:Build([
 call assert_equal(['a', 'b'], map(copy(s:built), {_, v -> v.word}))
 let g:simplecc_complete_max_items = 100
 
+" --------------------------------------------------------------- byte vs char ---
+
+" col() is a byte column; Vim9 string slices are character indexes.  A CJK
+" character before the identifier used to shift the prefix walk so the server
+" saw '中abc' (or worse) instead of 'abc', and complete() replaced from the
+" wrong byte.
+function! s:Ctx(text, col) abort
+  return call(function(printf('<SNR>%d_CompletionContext', s:sid)), [a:text, a:col])
+endfunction
+
+" 'x：abc' — fullwidth colon is 3 bytes and not 'iskeyword', so the identifier
+" is just 'abc'.  Cursor after c is byte column 8.
+let s:line = 'x：abc'
+call assert_equal(8, strlen(s:line) + 1)
+let s:ctx = s:Ctx(s:line, 8)
+call assert_equal(v:true, s:ctx.ok)
+call assert_equal('abc', s:ctx.prefix,
+      \ 'the prefix is the keyword in bytes, not characters: ' .. string(s:ctx))
+call assert_equal(4, s:ctx.start,
+      \ 'complete() must replace from the first byte of the identifier')
+call assert_equal('：', s:ctx.trigger)
+
+" Trigger-only path with a multi-byte character before the dot: 'x：.abc'
+let s:dotted = 'x：.abc'
+call assert_equal(9, strlen(s:dotted) + 1)
+let s:ctx = s:Ctx(s:dotted, 9)
+call assert_equal('abc', s:ctx.prefix)
+call assert_equal('.', s:ctx.trigger,
+      \ 'the trigger is the punctuation immediately before the keyword')
+
 if len(v:errors)
   call writefile(v:errors, s:root .. '/test/completion-items-errors.log')
   for s:e in v:errors

@@ -1,5 +1,76 @@
 # Changelog
 
+## Unreleased - 2026-10-04
+
+### 补全前缀不再把字节列当成字符下标
+
+- Vim9 的 `string[n]` / `string[a : b]` 按字符走,`col()` 和 `complete()` 按字节走。
+  光标前面只要有一个全角标点,自动补全就把标识符切错:发给 server 的 prefix 是空的,
+  菜单替换的字节范围也不对。抽出 `CompletionContext()`,改走 `strpart()` /
+  `matchstr('\k*$')`,与 `'omnifunc'` 的 findstart 同一套算法。
+- `test/completion_items.vim` 钉住 `x：abc` 与 `x：.abc`。
+
+### 格式化回包不再改你已经跳走的那个 buffer
+
+- `OnFormatting()` 对 `bufnr('%')` 调 `ApplyTextEdits`。`gq` / `:SimpleCCFormat`
+  发出去之后一次 `gd` 或切窗口,回包就把当前文件改成刚才那个文件的排版。现在按
+  请求 id 记下 buffer 与 changedtick,对不上就丢掉。
+- `test/range_requests.vim` 在回包前切到另一个 buffer,断言只有请求方被改。
+
+### 诊断 signs 不再画到名字碰巧匹配的另一个 buffer
+
+- `DisplayDiagnostics()` 用 `bufnr(path)`。`bufnr()` 在精确匹配失败之后把参数当
+  正则,于是 `foo.rs` 的 `.` 会匹配已经打开的 `foxrs`,一份打不开的文件的诊断画到
+  了诱饵上。改走已经为 workspace edit 准备好的 `BufnrForPath()`。
+- `test/diagnostics_store.vim` 打开 `foxrs`、给未打开的 `foo.rs` 发诊断,signs
+  必须仍是空的。
+
+### quickfix 列不再量到诱饵 buffer 的行
+
+- `PathLine()` 同样走 `bufnr(path)`,UTF-16 列在错误的那一行上换算,quickfix 的
+  `col` 于是指向另一个文件里一个完全不相干的位置。同样改 `BufnrForPath()`。
+- 同上测试:短文件 `foo.rs` 的 character 10 必须夹到该行末尾,而不是 20 字节诱饵
+  的第 11 列。
+
+### `g:simplecc_diag_sources` 写成字符串不再把诊断全部藏掉
+
+- 文档例子容易写成 `'pyright'`。`index()` 对字符串按字符找,永远匹配不上 server
+  名,于是所有诊断消失;`:SimpleCCHealth` 的 RUNTIME 段对它 `join()` 直接 E730。
+  现在字符串当单元素列表,其它非列表值当没设。
+- `test/diagnostics_store.vim` / `test/health_doctor.vim` 覆盖这两种入口。
+
+### `:SimpleCCHealth` 不再把同龄或未知 mtime 的 daemon 说成"更新"
+
+- `built > 0 && newest > built` 为假就报 `daemon is newer than every plugin
+  source`。时间戳相等(刚编译完)、或 `getftime()` 失败,都走了这句。分开说
+  "as new as" 和 "mtime is unknown"。
+
+### `g:simplecc_tagfunc_timeout = 0` 不再被抬成 50ms
+
+- `'tagfunc'` 用 `max([50, timeout])`,0 本意是"立刻退回 tags 文件",却仍发一次
+  定义请求并等 50ms。0 现在直接 `v:null`,线上一个请求都不发。
+
+### 非数字的 debounce 不再在第一下按键抛 E1013
+
+- `timer_start(g:simplecc_change_delay)` 和补全/resolve 的 delay、以及
+  `max([0, g:simplecc_request_timeout])` 都假定选项是数字。vimrc 里写 `'off'`
+  或 `'fast'` 时,第一次改动、第一次补全、甚至 `:SimpleCCHealth` 都会中止。
+  抽出 `ConfNumber()`,类型不对回落到默认值,0 仍是合法 delay。
+
+### 含全角字符的行上,snippet 不再切错 word
+
+- `ExpandSnippet()` 用字符切片拼 `new_line`,却用 `col()` / `len(word)` 当字节。
+  标识符前面有全角标点时,替换范围把前缀吃掉。主路径改 `strpart()`,解析循环改
+  `strcharpart()` + `strchars()`,tabstop 的 `start` 按字节算,与 `cursor()` 一致。
+- `test/vim9_smoke.vim` 在 `x：abc` 上展开 `Y${1:z}`,断言结果是 `x：Yz`。
+
+### 切走 buffer 之后选中的 code action 不再发给错误的 languageId
+
+- `OnCodeAction()` 在回包时用当时的 `BufFt()` 填 `executeAction`。请求从 rust
+  文件发出、回包时已经站在 markdown 里,动作就被交给一个从没听过它的 server。
+  现在 `languageId` 在发送那一刻按请求 id 记下。
+- `test/range_requests.vim` 在回包前切到 markdown,断言记下的仍是 rust。
+
 ## Unreleased - 2026-09-28
 
 ### 重新 source 一次 vimrc 之后,`:SimpleCCInstall` 的补全不再失效

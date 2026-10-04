@@ -67,6 +67,22 @@ call simplecc#ApplyTextEdits(bufnr('%'), [
       \ ])
 call assert_equal(['aM', 'N行'], getline(1, '$'))
 
+" Snippet expansion used Vim9 character slices against col() (bytes).  A
+" fullwidth character before the completed word shifted the replacement so
+" the prefix was eaten and the suffix glued to the wrong place.
+enew!
+set virtualedit=onemore
+let s:colon = nr2char(0xFF1A)
+call setline(1, 'x' . s:colon . 'abc')
+call cursor(1, strlen(getline(1)) + 1)
+let s:sid = getscriptinfo({'name': 'autoload/simplecc.vim'})[0].sid
+call call(function(printf('<SNR>%d_ExpandSnippet', s:sid)),
+      \ [{'word': 'abc'}, 'Y${1:z}'])
+call assert_equal(['x' . s:colon . 'Yz'], getline(1, '$'),
+      \ 'snippet expansion must keep the multi-byte prefix and replace only the word')
+call call(function(printf('<SNR>%d_SnippetFinish', s:sid)), [])
+set virtualedit=
+
 " Statusline diagnostic counts: the exported function returns the documented
 " shape even for buffers with no diagnostics or a bufnr that does not exist.
 let s:zero_counts = {'error': 0, 'warning': 0, 'info': 0, 'hint': 0}

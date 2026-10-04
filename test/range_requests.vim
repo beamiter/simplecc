@@ -132,6 +132,41 @@ call assert_equal([1, 0, 2, 14],
       \ 'a selection formats that range, not the whole document')
 call assert_equal(&tabstop, s:msg.tab_size)
 
+" ------------------------------------------------ formatting belongs to a buffer ---
+
+set hidden
+let s:src_buf = bufnr('%')
+let s:src_tick = b:changedtick
+let s:fmt_id = s:Call('NextId') + 1
+call simplecc#Format()
+let s:otherfmt = tempname() .. '.rs'
+call writefile(['fn untouched() {}'], s:otherfmt)
+execute 'edit! ' .. fnameescape(s:otherfmt)
+call s:Call('OnFormatting', {'id': s:fmt_id, 'edits': [
+      \ {'line': 1, 'character': 0, 'end_line': 1, 'end_character': 15,
+      \  'new_text': '    let x = FORMATTED;'}]})
+call assert_equal(['fn untouched() {}'], getline(1, '$'),
+      \ 'a format reply must not rewrite the buffer you jumped to')
+call assert_equal(['fn main() {', '    let x = FORMATTED;', '    let y = 2;', '}'],
+      \ getbufline(s:src_buf, 1, '$'),
+      \ 'it must still apply to the buffer that asked, even after a jump')
+execute 'buffer ' .. s:src_buf
+setfiletype rust
+call writefile([], s:trace)
+SimpleCCAction
+let s:act = s:Traced('textDocument/codeAction')
+let s:act_id = get(s:act, 'id', 0)
+call assert_equal('rust', get(s:act, 'languageId', ''),
+      \ 'the request itself names the originating filetype: ' .. string(s:act))
+let s:md = tempname() .. '.md'
+call writefile(['hello'], s:md)
+execute 'edit! ' .. fnameescape(s:md)
+setfiletype markdown
+call assert_equal('rust', s:Call('PendingActionFiletype', s:act_id),
+      \ 'code-action execute must keep the filetype of the requesting buffer')
+execute 'buffer ' .. s:src_buf
+call delete(s:md)
+
 " ------------------------------------------------------- repeatable expansion ---
 
 " With -range this no longer aborts on the '<,'> Vim inserts after the first

@@ -214,6 +214,27 @@ call assert_equal(
 call assert_equal(1, s:Call('ServerSupports', 'definition', 'rust') ? 1 : 0,
       \ 'the rust buffers in this same session still reach their server')
 
+" 0 means "do not wait", not "wait the default".  max([50, 0]) used to send
+" CTRL-] on a 50ms trip even when the user asked for none.
+call writefile([], s:trace)
+let g:simplecc_tagfunc_timeout = 0
+call cursor(2, 13)
+call assert_equal(v:null, simplecc#TagFunc('thing', 'c', {}),
+      \ 'g:simplecc_tagfunc_timeout = 0 must fall back immediately')
+sleep 50m
+call assert_equal([], filter(readfile(s:trace), {_, l -> l =~# 'textDocument/definition'}),
+      \ 'and must not send a definition request at all')
+let g:simplecc_tagfunc_timeout = 1000
+
+" A string delay used to throw E1013 out of timer_start on the first edit.
+let g:simplecc_change_delay = 'fast'
+try
+  call s:Call('ScheduleDidChange', bufnr('%'))
+catch
+  call assert_report('a non-number g:simplecc_change_delay must not throw from timer_start: ' .. v:exception)
+endtry
+let g:simplecc_change_delay = 120
+
 " With a dead daemon every hook has to hand the key straight back.
 call simplecc#Stop()
 call s:Wait("g:simplecc_status ==# ''", 2000)

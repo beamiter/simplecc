@@ -31,6 +31,10 @@ function! s:Publish(event) abort
   call call(function(printf('<SNR>%d_OnDiagnostics', s:sid)), [a:event])
 endfunction
 
+function! s:Call(name, ...) abort
+  return call(function(printf('<SNR>%d_%s', s:sid, a:name)), a:000)
+endfunction
+
 function! s:Diag(line, severity, message) abort
   return {'line': a:line, 'character': 0, 'end_line': a:line, 'end_character': 1,
         \ 'severity': a:severity, 'message': a:message}
@@ -123,6 +127,42 @@ call assert_equal({'error': 1, 'warning': 0, 'info': 0, 'hint': 0},
 let g:simplecc_diag_sources = []
 call assert_equal({'error': 1, 'warning': 1, 'info': 0, 'hint': 0},
       \ simplecc#DiagCounts(), 'an empty filter shows every server again')
+
+" A string was treated as a character list: index('pyright', 'pyright') is
+" never 0, so every diagnostic vanished, and :SimpleCCHealth threw E730 on
+" join().
+let g:simplecc_diag_sources = 'pyright'
+call assert_equal({'error': 1, 'warning': 0, 'info': 0, 'hint': 0},
+      \ simplecc#DiagCounts(), 'a bare string names one source, not a character list')
+let g:simplecc_diag_sources = 0
+call assert_equal({'error': 1, 'warning': 1, 'info': 0, 'hint': 0},
+      \ simplecc#DiagCounts(), 'a non-list filter is ignored rather than throwing')
+let g:simplecc_diag_sources = []
+
+" -------------------------------------------- bufnr() is a pattern, not a name ---
+
+" Signs used bufnr(path).  The path of foo.rs is a pattern that also matches
+" a listed buffer named foxrs (`.` = any character), so diagnostics for a
+" file that is not even open painted the decoy.
+let s:decoy_dir = tempname()
+call mkdir(s:decoy_dir)
+let s:decoy = s:decoy_dir . '/foxrs'
+let s:missing = s:decoy_dir . '/foo.rs'
+call writefile(['xxxxxxxxxxxxxxxxxxxx'], s:decoy)
+call writefile(['ab'], s:missing)
+execute 'edit! ' .. fnameescape(s:decoy)
+call s:Publish({'uri': s:missing, 'server': 'rust-analyzer',
+      \ 'items': [{'line': 0, 'character': 10, 'end_line': 0, 'end_character': 11,
+      \  'severity': 1, 'message': 'on the missing file'}]})
+call assert_equal([], sign_getplaced(bufnr('%'), {'group': 'simplecc'})[0].signs,
+      \ 'diagnostics for foo.rs must not paint signs onto foxrs')
+let s:qf = s:Call('DiagnosticQfItem', s:missing,
+      \ {'line': 0, 'character': 10, 'end_line': 0, 'end_character': 11,
+      \  'severity': 1, 'message': 'on the missing file'})
+call assert_equal(3, s:qf.col,
+      \ 'PathLine must measure foo.rs (2 bytes → col 3), not the 20-byte decoy')
+bwipeout!
+call delete(s:decoy_dir, 'rf')
 
 " ------------------------------------------------------------------ cleanup ---
 

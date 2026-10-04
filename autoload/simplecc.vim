@@ -164,6 +164,8 @@ var s_inlay_requests: dict<dict<any>> = {}
 var s_semtok_requests: dict<dict<any>> = {}
 var s_codelens_requests: dict<dict<any>> = {}
 var s_dochl_requests: dict<dict<any>> = {}
+var s_format_requests: dict<dict<any>> = {}
+var s_action_requests: dict<dict<any>> = {}
 # Window/buffer context for asynchronous location requests.  LSP replies can
 # arrive after the user has moved to another split, so navigation must not use
 # whichever window happens to be current when the reply is handled.
@@ -178,6 +180,17 @@ var s_sig_depth: number = 0
 def NextId(): number
   s_next_id += 1
   return s_next_id
+enddef
+
+# g: options that are delays or counts.  A string, a bool or a float used to
+# throw E1013/E1030 out of timer_start() / max() on the first keystroke; 0 is
+# a legal delay ("next event loop") and must not fall through to the default.
+def ConfNumber(name: string, default_val: number, minimum: number = 0): number
+  var value = get(g:, name, default_val)
+  if type(value) != v:t_number
+    return default_val
+  endif
+  return max([minimum, value])
 enddef
 
 def Log(msg: string)
@@ -205,8 +218,8 @@ def SetupCore()
     path_var: 'simplecc_daemon_path',
     codec: 'json',
     auto_restart: get(g:, 'simplecc_auto_restart', 1) ? true : false,
-    max_restarts: max([1, get(g:, 'simplecc_max_restarts', 5)]),
-    request_timeout_ms: max([0, get(g:, 'simplecc_request_timeout', 30000)]),
+    max_restarts: max([1, ConfNumber('simplecc_max_restarts', 5, 1)]),
+    request_timeout_ms: ConfNumber('simplecc_request_timeout', 30000, 0),
     OnEvent: OnBackendEvent,
     OnStderr: (line: string) => Log('stderr: ' .. line),
     OnReady: OnDaemonReady,
@@ -280,6 +293,8 @@ def OnDaemonExit(code: number, restarting: bool)
   s_semtok_requests = {}
   s_codelens_requests = {}
   s_dochl_requests = {}
+  s_format_requests = {}
+  s_action_requests = {}
   # The replacement daemon has no open documents; the replay in the
   # `initialized` handler is what re-opens them, and a stale pending delta is
   # expressed against a version no server ever saw.
@@ -1295,7 +1310,7 @@ def PathLine(path: string, lnum: number): string
   if path ==# '' || lnum <= 0
     return ''
   endif
-  var bnr = bufnr(path)
+  var bnr = BufnrForPath(path)
   if bnr >= 0 && bufloaded(bnr)
     return get(getbufline(bnr, lnum), 0, '')
   endif
@@ -1402,7 +1417,7 @@ enddef
 # typing in a.rs and immediately jumping to b.rs still flushes a.rs.
 def ScheduleDidChange(bnr: number)
   CancelChangeTimer(bnr)
-  s_change_timers[string(bnr)] = timer_start(g:simplecc_change_delay, (_) => {
+  s_change_timers[string(bnr)] = timer_start(ConfNumber('simplecc_change_delay', 120), (_) => {
     if has_key(s_change_timers, string(bnr))
       remove(s_change_timers, string(bnr))
     endif
@@ -1665,7 +1680,7 @@ def TriggerSignatureHelpDebounced()
     timer_stop(s_sig_timer)
   endif
   var bnr = bufnr('%')
-  s_sig_timer = timer_start(g:simplecc_complete_delay, (_) => {
+  s_sig_timer = timer_start(ConfNumber('simplecc_complete_delay', 80), (_) => {
     s_sig_timer = 0
     if !bufexists(bnr) || bufnr('%') != bnr || mode() !~# '^i'
       return
@@ -1801,7 +1816,7 @@ export def OnCompleteChanged()
 
       var ft = BufFt()
       s_comp_resolve_timer = timer_start(
-        g:simplecc_complete_resolve_delay,
+        ConfNumber('simplecc_complete_resolve_delay', 120),
         (_) => ResolveCompletionItem(key, generation, item_index, ft))
     endif
   endif
@@ -1837,7 +1852,7 @@ def TriggerCompletion()
   var tick = b:changedtick
   var lnum = line('.')
   var ccol = col('.')
-  s_comp_timer = timer_start(g:simplecc_complete_delay, (_) => {
+  s_comp_timer = timer_start(ConfNumber('simplecc_complete_delay', 80), (_) => {
     s_comp_timer = 0
     if mode() !~# '^i' || bufnr('%') != bnr || b:changedtick != tick
           || line('.') != lnum || col('.') != ccol
@@ -1946,6 +1961,34 @@ def SyncDocumentForCompletion()
   endif
 enddef
 
+# col() and complete() speak bytes.  Vim9 `string[n]` / `string[a : b]` speak
+# characters.  Mixing them on a line that already contains a multi-byte
+# character walks off the identifier: the prefix sent to the server is the
+# wrong slice, and complete() replaces the wrong byte range.
+def CompletionContext(line_text: string, byte_col: number): dict<any>
+  var empty = {ok: false, start: 0, prefix: '', trigger: ''}
+  if byte_col <= 1
+    return empty
+  endif
+  var before = strpart(line_text, 0, byte_col - 1)
+  if before ==# '' || before =~ '\s$'
+    return empty
+  endif
+  # matchstr() rather than an index walk so a multi-byte identifier is not
+  # cut in half — the same construction OmniFunc() uses for findstart.
+  var keyword = matchstr(before, '\m\k*$')
+  var start = strlen(before) - strlen(keyword)
+  var prev = start > 0 ? strcharpart(strpart(line_text, 0, start),
+        strchars(strpart(line_text, 0, start)) - 1, 1) : ''
+  var is_trigger = prev =~# '\m[^[:alnum:]_[:space:]]'
+  return {
+    ok: true,
+    start: start,
+    prefix: keyword,
+    trigger: is_trigger ? prev : '',
+  }
+enddef
+
 def RequestCompletion(manual: bool = false)
   var ft = BufFt()
   if ft ==# '' || pumvisible()
@@ -1953,28 +1996,18 @@ def RequestCompletion(manual: bool = false)
   endif
 
   var ccol = col('.')
-  if ccol <= 1
-    return
-  endif
   var line_text = getline('.')
-  var before = line_text[: ccol - 2]
-  if before ==# '' || before =~ '\s$'
+  var ctx = CompletionContext(line_text, ccol)
+  if !ctx.ok
     return
   endif
-
-  # Work in Vim byte columns, matching col() and complete(). Use 'iskeyword'
-  # instead of \w so language-specific identifier characters are respected.
-  var start = ccol - 1
-  while start > 0 && line_text[start - 1] =~# '\k'
-    start -= 1
-  endwhile
-  var prefix = start < ccol - 1 ? line_text[start : ccol - 2] : ''
-  var is_trigger = start > 0
-        && line_text[start - 1] =~# '\m[^[:alnum:]_[:space:]]'
-  if strchars(prefix) < g:simplecc_complete_min_chars && !is_trigger
+  var start = ctx.start
+  var prefix = ctx.prefix
+  var is_trigger = ctx.trigger !=# ''
+  if strchars(prefix) < ConfNumber('simplecc_complete_min_chars', 1) && !is_trigger
     return
   endif
-  var trigger_character = !manual && is_trigger ? line_text[start - 1] : ''
+  var trigger_character = !manual && is_trigger ? ctx.trigger : ''
   var trigger_kind = manual
         ? 1
         : (trigger_character !=# '' ? 2 : 3)
@@ -2003,7 +2036,7 @@ def RequestCompletion(manual: bool = false)
   s_comp_resolve_requested = {}
   s_comp_resolved_items = {}
 
-  var max_items = max([1, g:simplecc_complete_max_items])
+  var max_items = max([1, ConfNumber('simplecc_complete_max_items', 100, 1)])
   Send({
     type: 'textDocument/completion',
     id: id,
@@ -2246,7 +2279,7 @@ def ServerCompletionItems(items: list<any>, generation: number,
   var complete_items: list<dict<any>> = []
   var ic = &ignorecase
   var idx = 0
-  var max_items = max([1, g:simplecc_complete_max_items])
+  var max_items = max([1, ConfNumber('simplecc_complete_max_items', 100, 1)])
   # The server's ranking hints: sortText (applied in the daemon, before the
   # max_items cut), filterText and preselect.  One switch covers all three
   # because they are one decision — trust the server's ranking or do not.
@@ -2512,6 +2545,7 @@ export def CodeAction(range_given: bool = false, line1: number = 0, line2: numbe
   endif
 
   var id = NextId()
+  var ft = BufFt()
   var range: dict<number>
   if range_given
     range = LineRange(line1, line2)
@@ -2520,11 +2554,12 @@ export def CodeAction(range_given: bool = false, line1: number = 0, line2: numbe
     var cchar = CursorUtf16()
     range = {line: lnum, character: cchar, end_line: lnum, end_character: cchar}
   endif
+  s_action_requests = {[string(id)]: {ft: ft, bufnr: bufnr('%')}}
   Send({
     type: 'textDocument/codeAction',
     id: id,
     uri: BufUri(),
-    languageId: BufFt(),
+    languageId: ft,
     line: range.line,
     character: range.character,
     end_line: range.end_line,
@@ -2536,6 +2571,10 @@ enddef
 var s_pending_actions: list<dict<any>> = []
 var s_action_ft: string = ''
 
+def PendingActionFiletype(id: number): string
+  return get(get(s_action_requests, string(id), {}), 'ft', '')
+enddef
+
 def OnCodeAction(ev: dict<any>)
   var actions = get(ev, 'actions', [])
   if empty(actions)
@@ -2544,7 +2583,12 @@ def OnCodeAction(ev: dict<any>)
   endif
 
   s_pending_actions = actions
-  s_action_ft = BufFt()
+  var key = string(get(ev, 'id', 0))
+  var req = get(s_action_requests, key, {})
+  if has_key(s_action_requests, key)
+    remove(s_action_requests, key)
+  endif
+  s_action_ft = get(req, 'ft', BufFt())
 
   # Show in popup menu
   var items: list<string> = []
@@ -2607,6 +2651,13 @@ export def Format(range_given: bool = false, line1: number = 0, line2: number = 
   var id = NextId()
   Log(printf('Format: sending formatting request, id=%d, range=%d',
     id, range_given ? 1 : 0))
+  # Formatting edits are position-sensitive.  Record the buffer they belong
+  # to: a reply that lands after a gd / window switch used to ApplyTextEdits
+  # on whatever was current, silently rewriting the wrong file.
+  s_format_requests = {[string(id)]: {
+    bufnr: bufnr('%'),
+    changedtick: b:changedtick,
+  }}
   if range_given
     var range = LineRange(line1, line2)
     Send({
@@ -2634,16 +2685,25 @@ export def Format(range_given: bool = false, line1: number = 0, line2: number = 
 enddef
 
 def OnFormatting(ev: dict<any>)
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_format_requests, key)
+    return
+  endif
+  var req = remove(s_format_requests, key)
+  var bnr = req.bufnr
+  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+    Log('formatting: dropped stale reply for buffer ' .. bnr)
+    return
+  endif
   var edits = get(ev, 'edits', [])
   if empty(edits)
     echo 'No formatting changes'
     return
   endif
-  # Log edits for debugging
   for edit in edits
     Log(printf('Format edit: line %d-%d, char %d-%d: %s', get(edit, 'line', 0), get(edit, 'end_line', 0), get(edit, 'character', 0), get(edit, 'end_character', 0), json_encode(edit)))
   endfor
-  ApplyTextEdits(bufnr('%'), edits)
+  ApplyTextEdits(bnr, edits)
   echo printf('Applied %d edits', len(edits))
 enddef
 
@@ -2821,6 +2881,23 @@ def BufDiagKey(buffer: number = 0): string
   return DiagKey(BufUri(buffer))
 enddef
 
+def DiagSources(): list<string>
+  var raw = get(g:, 'simplecc_diag_sources', [])
+  if type(raw) == v:t_string
+    return raw ==# '' ? [] : [raw]
+  endif
+  if type(raw) != v:t_list
+    return []
+  endif
+  var out: list<string> = []
+  for name in raw
+    if type(name) == v:t_string && name !=# ''
+      add(out, name)
+    endif
+  endfor
+  return out
+enddef
+
 # Every diagnostic known for `path`, merged across the servers that published
 # them.  With more than one publisher the merged list is put back into
 # navigation order; a single publisher keeps the server's own order untouched.
@@ -2829,7 +2906,7 @@ def AllDiagnostics(path: string): list<dict<any>>
   if empty(by_server)
     return []
   endif
-  var sources = get(g:, 'simplecc_diag_sources', [])
+  var sources = DiagSources()
   var merged: list<dict<any>> = []
   var publishers = 0
   for server in sort(keys(by_server))
@@ -2872,8 +2949,10 @@ def OnDiagnostics(ev: dict<any>)
 enddef
 
 def DisplayDiagnostics(path: string)
-  # Find buffer
-  var bufnr = bufnr(path)
+  # Find buffer.  bufnr({name}) is a pattern match, so a path holding `.`
+  # would otherwise paint signs onto a different buffer (and PathLine() would
+  # read that buffer's text for UTF-16 columns).
+  var bufnr = BufnrForPath(path)
   if bufnr < 0
     return
   endif
@@ -2886,7 +2965,7 @@ def DisplayDiagnostics(path: string)
   # read b:simplecc_diag_counts without recounting on every redraw.
   setbufvar(bufnr, 'simplecc_diag_counts', CountDiagnostics(items))
   # Filter by minimum severity level
-  var min_sev = get(g:, 'simplecc_diag_min_severity', 4)
+  var min_sev = ConfNumber('simplecc_diag_min_severity', 4)
   items = filter(copy(items), (_, v) => get(v, 'severity', 3) <= min_sev)
   var sign_id = 1
 
@@ -4601,11 +4680,16 @@ def HealthBinary(): list<string>
   if newest.time == 0
     add(lines, HealthLine('INFO', 'no plugin sources next to the daemon',
       'installed without sources; age cannot be compared'))
-  elseif built > 0 && newest.time > built
+  elseif built <= 0
+    add(lines, HealthLine('WARN', 'daemon mtime is unknown',
+      'age cannot be compared; rebuild with ./install.sh if features look stale'))
+  elseif newest.time > built
     add(lines, HealthLine('ERROR',
       printf('daemon is older than the plugin: %s changed %s', newest.name,
         strftime('%Y-%m-%d %H:%M', newest.time)),
       'run ./install.sh, then :SimpleCCRestart'))
+  elseif newest.time == built
+    add(lines, HealthLine('OK', 'daemon is as new as every plugin source'))
   else
     add(lines, HealthLine('OK', 'daemon is newer than every plugin source'))
   endif
@@ -4918,7 +5002,7 @@ def HealthRuntime(): list<string>
     add(lines, HealthLine('INFO', 'diagnostic sources: ' ..
       join(sort(keys(diag_servers))->map((_, name) => name ==# '' ? '(unnamed)' : name), ', ')))
   endif
-  var diag_filter = get(g:, 'simplecc_diag_sources', [])
+  var diag_filter = DiagSources()
   if !empty(diag_filter)
     add(lines, HealthLine('INFO', 'diagnostic sources shown: ' .. join(diag_filter, ', '),
       'g:simplecc_diag_sources hides every other server'))
@@ -5522,7 +5606,7 @@ def RequestInlayHints()
   # of hints, of which a screenful was ever visible.  Ask for the viewport
   # plus a margin, the shape the semantic-token path already uses, and let
   # scrolling fetch the rest (OnWinScrolled re-requests).
-  var margin = max([0, g:simplecc_inlay_margin])
+  var margin = ConfNumber('simplecc_inlay_margin', 100)
   var top = max([0, line('w0') - 1 - margin])
   # endLine is exclusive: the daemon turns it into an LSP range ending at
   # {line: endLine, character: 0}, which stops before that line's first
@@ -6976,58 +7060,59 @@ def ExpandSnippet(ci: dict<any>, snippet: string)
   var tabstops: list<dict<any>> = []
   var expanded = ''
   var i = 0
-  var slen = len(snippet)
+  var slen = strchars(snippet)
   while i < slen
-    if snippet[i] ==# '$'
-      if i + 1 < slen && snippet[i + 1] ==# '{'
+    if strcharpart(snippet, i, 1) ==# '$'
+      if i + 1 < slen && strcharpart(snippet, i + 1, 1) ==# '{'
         # ${N:placeholder} or ${N}
         var j = i + 2
         var num_str = ''
-        while j < slen && snippet[j] =~ '\d'
-          num_str ..= snippet[j]
+        while j < slen && strcharpart(snippet, j, 1) =~ '\d'
+          num_str ..= strcharpart(snippet, j, 1)
           j += 1
         endwhile
         var placeholder = ''
-        if j < slen && snippet[j] ==# ':'
+        if j < slen && strcharpart(snippet, j, 1) ==# ':'
           j += 1
           var depth = 1
           while j < slen && depth > 0
-            if snippet[j] ==# '}'
+            if strcharpart(snippet, j, 1) ==# '}'
               depth -= 1
               if depth == 0
                 break
               endif
-            elseif snippet[j] ==# '$' && j + 1 < slen && snippet[j + 1] ==# '{'
+            elseif strcharpart(snippet, j, 1) ==# '$'
+                  && j + 1 < slen && strcharpart(snippet, j + 1, 1) ==# '{'
               depth += 1
             endif
-            placeholder ..= snippet[j]
+            placeholder ..= strcharpart(snippet, j, 1)
             j += 1
           endwhile
-        elseif j < slen && snippet[j] ==# '}'
+        elseif j < slen && strcharpart(snippet, j, 1) ==# '}'
           # ${N} without placeholder
         endif
-        if j < slen && snippet[j] ==# '}'
+        if j < slen && strcharpart(snippet, j, 1) ==# '}'
           j += 1
         endif
-        add(tabstops, {num: str2nr(num_str), start: len(expanded), text: placeholder})
+        add(tabstops, {num: str2nr(num_str), start: strlen(expanded), text: placeholder})
         expanded ..= placeholder
         i = j
-      elseif i + 1 < slen && snippet[i + 1] =~ '\d'
+      elseif i + 1 < slen && strcharpart(snippet, i + 1, 1) =~ '\d'
         # $N
         var j = i + 1
         var num_str = ''
-        while j < slen && snippet[j] =~ '\d'
-          num_str ..= snippet[j]
+        while j < slen && strcharpart(snippet, j, 1) =~ '\d'
+          num_str ..= strcharpart(snippet, j, 1)
           j += 1
         endwhile
-        add(tabstops, {num: str2nr(num_str), start: len(expanded), text: ''})
+        add(tabstops, {num: str2nr(num_str), start: strlen(expanded), text: ''})
         i = j
       else
-        expanded ..= snippet[i]
+        expanded ..= strcharpart(snippet, i, 1)
         i += 1
       endif
     else
-      expanded ..= snippet[i]
+      expanded ..= strcharpart(snippet, i, 1)
       i += 1
     endif
   endwhile
@@ -7052,11 +7137,12 @@ def ExpandSnippet(ci: dict<any>, snippet: string)
   var lnum = line('.')
   var cur_col = col('.')
   var line_text = getline(lnum)
-  var word_start = cur_col - len(word) - 1
+  var word_start = cur_col - strlen(word) - 1
   if word_start < 0
     word_start = 0
   endif
-  var new_line = line_text[: word_start - 1] .. expanded .. line_text[cur_col - 1 :]
+  var new_line = strpart(line_text, 0, word_start) .. expanded
+        .. strpart(line_text, cur_col - 1)
   setline(lnum, new_line)
 
   # Setup tabstop navigation
@@ -7308,7 +7394,7 @@ enddef
 # 'formatexpr' at a language server that had never heard of them, and mode 2
 # would additionally have thrown away the formatexpr their own ftplugin set.
 def SetNativeOptions(bnr: number)
-  var mode = g:simplecc_native_options
+  var mode = ConfNumber('simplecc_native_options', 1)
   if mode <= 0
     return
   endif
@@ -7331,7 +7417,7 @@ enddef
 # to every loaded buffer; SetNativeOptions() is idempotent and skips filetypes
 # this server does not serve.
 def ApplyNativeOptionsForServed()
-  if g:simplecc_native_options <= 0
+  if ConfNumber('simplecc_native_options', 1) <= 0
     return
   endif
   for info in getbufinfo({bufloaded: 1})
@@ -7381,6 +7467,10 @@ export def TagFunc(pattern: string, flags: string, info: dict<any>): any
     return v:null
   endif
 
+  var timeout = ConfNumber('simplecc_tagfunc_timeout', 1000)
+  if timeout <= 0
+    return v:null
+  endif
   var locations: list<any> = []
   var pending = true
   s_tagfunc_busy = true
@@ -7399,12 +7489,12 @@ export def TagFunc(pattern: string, flags: string, info: dict<any>): any
     }, (ev: dict<any>) => {
       pending = false
       locations = get(ev, 'locations', [])
-    }, max([50, g:simplecc_tagfunc_timeout]))
+    }, timeout)
 
     # sleep is what lets the channel callback run; :sleep and not a busy loop
     # so the wait costs nothing.
     var started = reltime()
-    while pending && reltimefloat(reltime(started)) * 1000 < g:simplecc_tagfunc_timeout
+    while pending && reltimefloat(reltime(started)) * 1000 < timeout
       sleep 10m
     endwhile
   finally

@@ -61,6 +61,30 @@ call system('touch -d "+1 day" ' .. shellescape(s:daemon))
 call assert_notequal('', s:Line('^\[OK\] daemon is newer than every plugin source'),
       \ 'a freshly built daemon is not an error')
 
+let s:sid = getscriptinfo({'name': 'autoload/simplecc.vim'})[0].sid
+let s:newest = call(function(printf('<SNR>%d_NewestPluginSource', s:sid)), [])
+call system('touch -r ' .. shellescape(s:root .. '/' .. s:newest.name)
+      \ .. ' ' .. shellescape(s:daemon))
+call assert_notequal('', s:Line('as new as every plugin source'),
+      \ 'a daemon with the same mtime as the newest source is not newer than it')
+call system('touch -d "+1 day" ' .. shellescape(s:daemon))
+
+" A string timeout used to throw E1013 from max() inside SetupCore(), so
+" :SimpleCCHealth itself would not run.
+let g:simplecc_request_timeout = 'off'
+try
+  call simplecc#HealthReport()
+catch
+  call assert_report('a non-number request timeout must not throw: ' .. v:exception)
+endtry
+let g:simplecc_request_timeout = 30000
+
+" A string g:simplecc_diag_sources used to throw E730 from join() in RUNTIME.
+let g:simplecc_diag_sources = 'pyright'
+call assert_notequal('', s:Line('diagnostic sources shown: pyright'),
+      \ 'a bare string source filter is reported, not thrown')
+let g:simplecc_diag_sources = []
+
 
 " ------------------------------------------------------- config validation ---
 
