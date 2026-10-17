@@ -21,7 +21,8 @@ which = "8"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 flate2 = "1"
 tar = "0.4"
-zip = "8"
+# Managed clangd releases only need unencrypted ZIPs with Deflate compression.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 futures-util = "0.3"
 dirs = "6"
 url = "2"
