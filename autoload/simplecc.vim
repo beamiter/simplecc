@@ -1752,6 +1752,23 @@ def ResolveCompletionItem(key: string, generation: number, item_index: number, f
   })
 enddef
 
+# These passive text windows have no masks, embedded terminals or custom input
+# filters. Protocol-6 jterm hosts may paint them; Vim still owns their lifetime.
+# Any future masked/nonrectangular surface must omit this opt-in marker.
+def NativePopupsChanged()
+  if exists('#User#JTermVim9PopupChanged')
+    doautocmd <nomodeline> User JTermVim9PopupChanged
+  endif
+enddef
+
+def NativeTextPopup(winid: number)
+  if winid <= 0
+    return
+  endif
+  setwinvar(winid, 'jterm_native_popup', 1)
+  NativePopupsChanged()
+enddef
+
 def ShowCompletionDocumentation(item: dict<any>)
   var detail = get(item, 'detail', '')
   var doc = get(item, 'documentation', '')
@@ -1760,11 +1777,15 @@ def ShowCompletionDocumentation(item: dict<any>)
     text = text !=# '' ? text .. "\n\n" .. doc : doc
   endif
 
-  if s_hover_popup > 0
+  var closed = s_hover_popup > 0
+  if closed
     popup_close(s_hover_popup)
     s_hover_popup = 0
   endif
   if text ==# '' || !pumvisible()
+    if closed
+      NativePopupsChanged()
+    endif
     return
   endif
 
@@ -1781,6 +1802,7 @@ def ShowCompletionDocumentation(item: dict<any>)
     highlight: 'Normal',
     borderhighlight: ['SimpleCCFloatBorder'],
   })
+  NativeTextPopup(s_hover_popup)
 enddef
 
 export def OnCompleteChanged()
@@ -2405,6 +2427,7 @@ def OnHover(ev: dict<any>)
   # Markdown-like syntax for the popup buffer
   var winbuf = winbufnr(s_hover_popup)
   setbufvar(winbuf, '&filetype', 'markdown')
+  NativeTextPopup(s_hover_popup)
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -2851,7 +2874,8 @@ def OnSignatureHelp(ev: dict<any>)
     extend(lines, split(doc, "\n"))
   endif
 
-  CloseSignaturePopup()
+  # The replacement's registration sends one refresh after it is ready.
+  CloseSignaturePopup(false)
   s_sig_popup = popup_atcursor(lines, {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
@@ -2863,12 +2887,16 @@ def OnSignatureHelp(ev: dict<any>)
     moved: [0, 0, 0],
     close: 'none',
   })
+  NativeTextPopup(s_sig_popup)
 enddef
 
-def CloseSignaturePopup()
+def CloseSignaturePopup(notify_native: bool = true)
   if s_sig_popup > 0
     popup_close(s_sig_popup)
     s_sig_popup = 0
+    if notify_native
+      NativePopupsChanged()
+    endif
   endif
 enddef
 
@@ -6497,7 +6525,8 @@ def CompareDiagnosticDetail(a: dict<any>, b: dict<any>): number
 enddef
 
 def ShowDiagFloat(notify_empty: bool)
-  if s_diag_popup > 0
+  var closed = s_diag_popup > 0
+  if closed
     popup_close(s_diag_popup)
     s_diag_popup = 0
   endif
@@ -6505,6 +6534,9 @@ def ShowDiagFloat(notify_empty: bool)
   var cur_line = line('.') - 1
   var line_items = filter(copy(items), (_, v) => get(v, 'line', -1) == cur_line)
   if empty(line_items)
+    if closed
+      NativePopupsChanged()
+    endif
     if notify_empty
       echo 'No visible diagnostics on current line'
     endif
@@ -6528,6 +6560,7 @@ def ShowDiagFloat(notify_empty: bool)
     highlight: 'Normal',
     borderhighlight: ['SimpleCCFloatBorder'],
   })
+  NativeTextPopup(s_diag_popup)
 enddef
 
 # Show diagnostics on demand even when g:simplecc_diag_float is disabled.

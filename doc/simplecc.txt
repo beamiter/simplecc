@@ -340,6 +340,22 @@ never having set them.
 |g:simplecc_native_options| controls whether the options are set at all, and
 whether a value the buffer already has is replaced.
 
+Native text popup rendering ~
+
+Anvil, Forge, Ember and Frost with jterm render protocol 6 can paint short,
+fully visible hover, signature, diagnostic and completion-documentation
+popups over their native Vim buffer. SimpleCC marks only its mask-free passive
+text windows with w:jterm_native_popup=1 and emits the optional
+User JTermVim9PopupChanged event after a popup is ready or explicitly closed.
+Vim keeps the
+contents, input, positioning and closing behavior. Ordinary Vim and older
+hosts ignore this rendering hint and behave as before.
+
+The host validates the actual geometry and styles. Wrapped, clipped, scrolling
+or otherwise unsupported content remains in the compatibility display. This
+does not change automatic signature/inlay defaults or introduce a second LSP
+client. Providers adding masks or nonrectangular content must remove the hint.
+
 ==============================================================================
 OPTIONS                                                     *simplecc-options*
 
