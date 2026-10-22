@@ -128,6 +128,49 @@ call s:HintReply(s:pending, ': Stale')
 call assert_equal([], s:Props(s:buf_a, 'SimpleCCInlay'), 'off/on does not revive a pre-toggle reply')
 call simplecc#InlayHintsToggle()
 
+" Inline hints preserve UTF-16 positions/padding and restore accepted entries
+" even when a malformed server item appeared before them. Empty labels must
+" not create a visible padding-only property. A bad padding type is isolated.
+call setline(1, '甲😀beta')
+call simplecc#InlayHintsToggle()
+call s:Call('StopFeatureTimers')
+let s:hint_a = s:HintRequest()
+let s:before_events = g:decoration_events
+call s:Call('OnBackendEvent', {'type': 'inlayHint', 'id': s:hint_a, 'hints': [
+      \ 'invalid first item',
+      \ {'line': -1, 'character': 0, 'label': 'bad line'},
+      \ {'line': 0, 'character': -1, 'label': 'bad column'},
+      \ {'line': 0, 'character': 0, 'label': '', 'padding_left': v:true},
+      \ {'line': 0, 'character': 0, 'label': 'bad padding', 'padding_right': []},
+      \ {'line': 99, 'character': 0, 'label': 'past EOF'},
+      \ {'line': 0, 'character': 3, 'label': ': T', 'padding_left': v:true, 'padding_right': v:true},
+      \ {'line': 0, 'character': 7, 'label': 'tail'}]})
+let s:hints = s:Props(s:buf_a, 'SimpleCCInlay')
+call assert_equal(2, len(s:hints), 'only successfully placed nonempty hints are cached')
+call assert_equal([8, 12], map(copy(s:hints), {_, p -> p.col}),
+      \ 'CJK and non-BMP characters convert to UTF-8 bytes, including EOL')
+call assert_equal([' : T ', 'tail'], map(copy(s:hints), {_, p -> p.text}),
+      \ 'explicit LSP padding is preserved exactly')
+call assert_equal('甲😀beta', getline(1), 'inline display text never edits the source')
+call assert_equal(s:before_events + 1, g:decoration_events, 'one reply produces one host refresh')
+call prop_remove({'type': 'SimpleCCInlay', 'bufnr': s:buf_a, 'all': 1})
+call s:Call('RestoreInlayHints')
+call assert_equal([' : T ', 'tail'], map(s:Props(s:buf_a, 'SimpleCCInlay'), {_, p -> p.text}),
+      \ 'a rejected leading item does not prevent restoring valid hints')
+let s:before_events = g:decoration_events
+call s:Call('RestoreInlayHints')
+call assert_equal(s:before_events, g:decoration_events, 'intact hints do not repaint on every CursorHold')
+
+" A newer request for the same document retires the previous viewport reply.
+let s:old_hint = s:HintRequest()
+let s:new_hint = s:HintRequest()
+call s:HintReply(s:new_hint, '')
+call s:HintReply(s:old_hint, 'late viewport')
+call s:Call('RestoreInlayHints')
+call assert_equal([], s:Props(s:buf_a, 'SimpleCCInlay'), 'late hints cannot restore a superseded viewport')
+call simplecc#InlayHintsToggle()
+call setline(1, 'let changed = compute();')
+
 " Valid code lenses paint once, notify the host, and execute captured identity.
 let s:before_events = g:decoration_events
 let s:lens_a = s:LensRequest()

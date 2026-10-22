@@ -5873,13 +5873,19 @@ def OnInlayHints(ev: dict<any>)
   if type(hints) != v:t_list
     return
   endif
-  # Empty replies replace the old snapshot too, including the restore cache.
-  s_inlay_cache[string(bnr)] = {context: req, items: deepcopy(hints)}
-  ApplyInlayHints(hints, bnr)
+  # Cache only hints that Vim accepted. A malformed first item must not hide
+  # valid later hints from RestoreInlayHints, or retry failed properties on
+  # every CursorHold. Empty replies retire the old snapshot as well.
+  var applied = ApplyInlayHints(hints, bnr)
+  s_inlay_cache[string(bnr)] = {context: req, items: applied.items}
+  if applied.changed
+    DecorationsChanged()
+  endif
 enddef
 
-def ApplyInlayHints(hints: list<any>, bnr: number)
+def ApplyInlayHints(hints: list<any>, bnr: number): dict<any>
   var changed = ClearInlayHints(bnr, false)
+  var applied: list<dict<any>> = []
   try
     prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
@@ -5891,24 +5897,30 @@ def ApplyInlayHints(hints: list<any>, bnr: number)
       || type(get(h, 'character', '')) != v:t_number || type(get(h, 'label', 0)) != v:t_string
       continue
     endif
-    var lnum = h.line + 1
-    var line_text = get(getbufline(bnr, lnum), 0, '')
-    var col = Utf16LineColumn(line_text, get(h, 'character', 0))
-    var label = get(h, 'label', '')
+    if h.line < 0 || h.line >= line_count || h.character < 0 || h.label ==# ''
+      continue
+    endif
     var pad_l = get(h, 'padding_left', false)
     var pad_r = get(h, 'padding_right', false)
-    var text = (pad_l ? ' ' : '') .. label .. (pad_r ? ' ' : '')
-    if lnum > 0 && lnum <= line_count
-      try
-        prop_add(lnum, col, {type: 'SimpleCCInlay', text: text, bufnr: bnr})
-        changed = true
-      catch
-      endtry
+    if index([v:t_bool, v:t_number], type(pad_l)) < 0
+      || index([v:t_bool, v:t_number], type(pad_r)) < 0
+      continue
     endif
+    var lnum = h.line + 1
+    var line_text = get(getbufline(bnr, lnum), 0, '')
+    # LSP positions use UTF-16 units, while Vim properties use UTF-8 byte
+    # columns. Keep the shared conversion's EOL/surrogate-boundary clamping.
+    var col = Utf16LineColumn(line_text, h.character)
+    var text = (pad_l ? ' ' : '') .. h.label .. (pad_r ? ' ' : '')
+    try
+      prop_add(lnum, col, {type: 'SimpleCCInlay', text: text, bufnr: bnr})
+      add(applied, {line: h.line, character: h.character, label: h.label,
+        padding_left: !!pad_l, padding_right: !!pad_r})
+      changed = true
+    catch
+    endtry
   endfor
-  if changed
-    DecorationsChanged()
-  endif
+  return {items: applied, changed: changed}
 enddef
 
 def RestoreInlayHints()
@@ -5938,7 +5950,11 @@ def RestoreInlayHints()
     return
   endtry
   if empty(existing)
-    ApplyInlayHints(hints, bnr)
+    var applied = ApplyInlayHints(hints, bnr)
+    s_inlay_cache[key] = {context: cached.context, items: applied.items}
+    if applied.changed
+      DecorationsChanged()
+    endif
   endif
 enddef
 

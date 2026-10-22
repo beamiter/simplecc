@@ -83,14 +83,21 @@ asks you to rebuild the daemon.
 Native hosts can subscribe to `User SimpleCCDecorationsChanged` after CodeLens,
 inlay hints or virtual diagnostics are added, replaced or cleared. Anvil, Forge,
 Ember and Frost can use their native surface for single-line after-text CodeLens
-and virtual diagnostics. Inline inlay hints continue to use Vim's compatibility
+and virtual diagnostics, and supported inline hints in `nowrap` views. The host
+advertises inline support through the authenticated
+`g:jterm_vim9_virtual_text_inline` flag; complex layouts retain Vim's compatibility
 view. Existing `g:simplecc_inlay_hints` and `g:simplecc_virtual_diag` preferences
 remain in control; no host is required for ordinary Vim.
 
 `SimpleCCInlayHints` toggles the effective option even when a configuration starts
 it at zero. Switching it off clears hints in all loaded buffers and invalidates
 pending replies. Per-buffer caches retain their source revision, so switching
-buffers cannot restore another file's hints or an edited file's old hints.
+buffers cannot restore another file's hints or an edited file's old hints. The
+restore cache keeps only nonempty hints that Vim successfully placed: a malformed
+leading item cannot prevent valid later hints from being restored. UTF-16 server
+positions are converted to UTF-8 byte columns, including CJK and non-BMP
+characters, and explicit left/right padding is retained. An empty or superseded
+viewport response cannot revive an old hint set.
 
 ## Configuration
 
