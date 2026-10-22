@@ -600,6 +600,25 @@ simplecc#DiagCounts([{bufnr}])
         Return the diagnostic counts for {bufnr} (default: current buffer)
         as a dictionary with the keys error, warning, info, and hint.
 
+                                           *simplecc#DiagnosticSnapshot()*
+simplecc#DiagnosticSnapshot([{bufnr}])
+        Read existing diagnostics for a loaded buffer without daemon requests,
+        disk reads, quickfix changes or buffer loading. Returns {items, total}.
+        items contains at most 256 detached dictionaries {line, column, text,
+        kind}; positions are one-based UTF-8 byte columns measured from current
+        buffer text. kind is error/warning/info/hint; text is limited to 2048
+        characters with control characters replaced by spaces. total counts
+        valid items before truncation. Unloaded/invalid buffers return an empty
+        snapshot. The source filter applies; display severity filtering does not.
+        Repeated reads reuse one bounded snapshot until text, source filtering,
+        buffer identity or diagnostic publication changes. Results are copies.
+
+                                       *SimpleCCDiagnosticsChanged*
+User SimpleCCDiagnosticsChanged
+        Fired after diagnostic rendering/cache updates, including clearing a
+        closing document. Observers read the buffer they need; this event can
+        concern another buffer. An observer exception cannot abort publication.
+
                                                        *$SIMPLECC_DEBUG*
 SIMPLECC_DEBUG                   environment variable
         When set, the daemon logs per-request details (hover, definition)

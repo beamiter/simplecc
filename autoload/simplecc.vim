@@ -83,6 +83,10 @@ const s_plugin_root: string = expand('<sfile>:p:h:h')
 # publishDiagnostics notification replaces that server's whole set for the
 # file, so a flat list made the later publisher erase the earlier one.
 var s_diagnostics: dict<dict<list<dict<any>>>> = {}
+var s_diag_generation = 0
+# Keep only the most recent bounded view; never retain one entry per buffer.
+var s_diag_snapshot_key: list<any> = []
+var s_diag_snapshot: dict<any> = {items: [], total: 0}
 # Document versions
 var s_doc_versions: dict<number> = {}
 # Last Vim changedtick known to have been queued to the daemon
@@ -1589,7 +1593,9 @@ export def OnBufClose(buffer: number = 0)
   var diag_key = DiagKey(uri)
   if has_key(s_diagnostics, diag_key)
     remove(s_diagnostics, diag_key)
+    s_diag_generation += 1
   endif
+  DisplayDiagnostics(diag_key)
   if has_key(s_pending_changes, uri)
     remove(s_pending_changes, uri)
   endif
@@ -2929,13 +2935,16 @@ def OnDiagnostics(ev: dict<any>)
   var server = get(ev, 'server', '')
   var items = get(ev, 'items', [])
   var by_server = get(s_diagnostics, path, {})
+  var changed = false
   if empty(items)
     # Keeping an empty bucket would make Health() and :SimpleCCDiagnostics!
     # report files that have nothing wrong with them.
     if has_key(by_server, server)
       remove(by_server, server)
+      changed = true
     endif
   else
+    changed = !has_key(by_server, server) || by_server[server] !=# items
     by_server[server] = items
   endif
   if empty(by_server)
@@ -2945,7 +2954,18 @@ def OnDiagnostics(ev: dict<any>)
   else
     s_diagnostics[path] = by_server
   endif
+  if changed
+    s_diag_generation += 1
+  endif
   DisplayDiagnostics(path)
+enddef
+
+# Observers must not interrupt a diagnostic publish or document close.
+def DiagnosticsChanged()
+  try
+    silent doautocmd <nomodeline> User SimpleCCDiagnosticsChanged
+  catch
+  endtry
 enddef
 
 def DisplayDiagnostics(path: string)
@@ -2995,6 +3015,7 @@ def DisplayDiagnostics(path: string)
 
   # Virtual text diagnostics
   DisplayVirtualDiag(bufnr, items)
+  DiagnosticsChanged()
 enddef
 
 def UpdateDiagHighlights(bufnr: number, items: list<dict<any>>)
@@ -3066,6 +3087,66 @@ export def DiagCounts(bufnr: number = 0): dict<number>
     return {error: 0, warning: 0, info: 0, hint: 0}
   endif
   return CountDiagnostics(AllDiagnostics(BufDiagKey(bnr)))
+enddef
+
+# A bounded, detached native-workbench view. Only loaded text and the existing
+# source-filtered store are read: no daemon request, disk read or list mutation.
+export def DiagnosticSnapshot(buffer: number = 0): dict<any>
+  var result: dict<any> = {items: [], total: 0}
+  var bnr = buffer == 0 ? bufnr('%') : buffer
+  if bnr <= 0 || !bufloaded(bnr)
+    s_diag_snapshot_key = []
+    s_diag_snapshot = result
+    return deepcopy(result)
+  endif
+  var path = ''
+  var key: list<any> = []
+  try
+    path = BufDiagKey(bnr)
+    key = [bnr, path, getbufvar(bnr, 'changedtick'), DiagSources(), s_diag_generation]
+  catch
+    s_diag_snapshot_key = []
+    s_diag_snapshot = result
+    return deepcopy(result)
+  endtry
+  if key ==# s_diag_snapshot_key
+    return deepcopy(s_diag_snapshot)
+  endif
+  s_diag_snapshot_key = key
+  s_diag_snapshot = result
+  var diagnostics: list<dict<any>> = []
+  try
+    diagnostics = AllDiagnostics(path)
+  catch
+    return deepcopy(result)
+  endtry
+  for item in diagnostics
+    var row = get(item, 'line', 0)
+    var character = get(item, 'character', 0)
+    var message = get(item, 'message', '')
+    var severity = get(item, 'severity', 3)
+    if type(row) != v:t_number || row < 0
+          || type(character) != v:t_number || character < 0
+          || type(message) != v:t_string
+      continue
+    endif
+    var text = getbufline(bnr, row + 1)
+    if empty(text)
+      continue
+    endif
+    result.total += 1
+    if len(result.items) >= 256
+      continue
+    endif
+    var kind = type(severity) == v:t_number
+      ? (severity == 1 ? 'error' : severity == 2 ? 'warning'
+        : severity == 4 ? 'hint' : 'info') : 'info'
+    add(result.items, {line: row + 1,
+      column: Utf16ToByteOffset(text[0], character) + 1,
+      text: substitute(strcharpart(message, 0, 2048), '[[:cntrl:]]', ' ', 'g'),
+      kind: kind})
+  endfor
+  return deepcopy(result)
 enddef
 
 export def CompleteDiagnosticSeverity(arglead: string, _cmdline: string,

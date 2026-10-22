@@ -164,6 +164,75 @@ call assert_equal(3, s:qf.col,
 bwipeout!
 call delete(s:decoy_dir, 'rf')
 
+" ---------------------------------------------- bounded workbench snapshot ---
+execute 'edit! ' .. fnameescape(s:file)
+call setline(1, ['中😀alpha', 'second'])
+let g:simplecc_diag_min_severity = 1
+let g:test_diag_events = 0
+augroup TestDiagnosticSnapshot
+  autocmd!
+  autocmd User SimpleCCDiagnosticsChanged let g:test_diag_events += 1
+augroup END
+call s:Publish({'uri': s:file, 'server': 'pyright', 'items': []})
+call s:Publish({'uri': s:file, 'server': 'ruff-lsp', 'items': []})
+let s:unicode = s:Diag(0, 2, "warning\n" .. repeat('界', 2100))
+let s:unicode.character = 3
+call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': [s:unicode]})
+call assert_true(g:test_diag_events > 0)
+let s:before_qf = getqflist({'id': 0, 'changedtick': 0})
+let s:before_loc = getloclist(0, {'id': 0, 'changedtick': 0})
+let s:view = winsaveview()
+let s:snapshot = simplecc#DiagnosticSnapshot()
+call assert_equal(1, s:snapshot.total)
+call assert_equal(8, s:snapshot.items[0].column, 'UTF-16 three units means seven UTF-8 bytes')
+call assert_equal('warning', s:snapshot.items[0].kind, 'render severity filter does not hide snapshot rows')
+call assert_equal(2048, strchars(s:snapshot.items[0].text))
+call assert_notmatch('[[:cntrl:]]', s:snapshot.items[0].text)
+let s:snapshot.items[0].text = 'changed copy'
+call assert_notequal('changed copy', simplecc#DiagnosticSnapshot().items[0].text)
+call assert_equal(s:before_qf, getqflist({'id': 0, 'changedtick': 0}))
+call assert_equal(s:before_loc, getloclist(0, {'id': 0, 'changedtick': 0}))
+call assert_equal(s:view, winsaveview())
+call assert_equal({'items': [], 'total': 0}, simplecc#DiagnosticSnapshot(-1))
+let g:simplecc_diag_sources = ['other']
+call assert_equal({'items': [], 'total': 0}, simplecc#DiagnosticSnapshot())
+let g:simplecc_diag_sources = []
+call assert_equal(1, simplecc#DiagnosticSnapshot().total, 'source change restores cached diagnostics')
+call setline(1, 'abcd')
+call assert_equal(4, simplecc#DiagnosticSnapshot().items[0].column, 'edits recompute byte columns without a new publish')
+let s:replacement = s:Diag(1, 4, 'new publication')
+call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': [s:replacement]})
+call assert_equal({'line': 2, 'column': 1, 'text': 'new publication', 'kind': 'hint'}, simplecc#DiagnosticSnapshot().items[0])
+let s:many = map(range(300), {_, n -> s:Diag(0, 1, 'row ' .. n)})
+call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': s:many})
+call assert_equal(300, simplecc#DiagnosticSnapshot().total)
+call assert_equal(256, len(simplecc#DiagnosticSnapshot().items))
+" A malformed cached diagnostic must not break a read-only consumer, even
+" when an older publisher supplied invalid position/message types.
+try
+  call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': [
+        \ {'line': 'bad', 'character': 0, 'message': 'invalid row'},
+        \ {'line': 0, 'character': [], 'message': 'invalid column'},
+        \ {'line': 0, 'character': 0, 'message': []}]})
+catch
+  " Rendering legacy malformed input may reject it; the snapshot must not.
+endtry
+call assert_equal({'items': [], 'total': 0}, simplecc#DiagnosticSnapshot())
+" A failing consumer cannot abort publication or clearing.
+augroup TestDiagnosticSnapshot
+  autocmd User SimpleCCDiagnosticsChanged throw 'observer failure'
+augroup END
+call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': []})
+call assert_equal({'items': [], 'total': 0}, simplecc#DiagnosticSnapshot())
+call s:Publish({'uri': s:file, 'server': 'snapshot', 'items': [s:Diag(0, 1, 'close me')]})
+call assert_equal('close me', simplecc#DiagnosticSnapshot().items[0].text)
+call simplecc#OnBufClose(bufnr('%'))
+call assert_equal({'items': [], 'total': 0}, simplecc#DiagnosticSnapshot())
+call assert_equal({'error': 0, 'warning': 0, 'info': 0, 'hint': 0}, b:simplecc_diag_counts)
+augroup TestDiagnosticSnapshot
+  autocmd!
+augroup END
+
 " ------------------------------------------------------------------ cleanup ---
 
 " Closing the buffer drops its entire entry, whichever servers published it.
