@@ -219,7 +219,13 @@ plugin refuses to execute it without generation and URI identity.
 CodeLens and virtual diagnostics use after-text properties with truncation.
 After properties change, |User| SimpleCCDecorationsChanged lets a native host
 refresh without a source edit. Supported native hosts can paint these after-line
-annotations; inline inlay hints continue through Vim's compatibility view.
+annotations and bounded inline hints in 'nowrap' Normal/Insert/Replace views.
+The authenticated g:jterm_vim9_virtual_text_inline flag identifies inline support.
+Inline hints with 'wrap', Visual selections, above/below/right layouts,
+control/bidirectional content, source-grapheme splits, partially clipped wide
+glyphs or excessive label budgets retain Vim's compatibility view. Vim owns
+mouse clicks in windows with inline hints; source-bound Normal/Insert scrolling
+remains available. No display option or hint is silently disabled.
 :SimpleCCInlayHints can enable a configured-zero preference. Switching it off
 clears every loaded buffer's hints and cancels pending replies; restore caches
 are isolated by buffer and checked against changedtick, URI and filetype.
