@@ -77,9 +77,11 @@ jobs:
       - name: Verify installer
         run: |
           ./install.sh
+          installer_host="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$installer_host"
           test -s lib/simplecc-daemon
           test -x lib/simplecc-daemon
-          cmp -s target/release/simplecc-daemon lib/simplecc-daemon
+          cmp -s "target/$installer_host/release/simplecc-daemon" lib/simplecc-daemon
 
   vim:
     name: Vim9
