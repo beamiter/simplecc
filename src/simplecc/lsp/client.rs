@@ -29,6 +29,63 @@ struct CompletionCache {
     items: Vec<lsp_types::CompletionItem>,
 }
 
+/// A lens index is meaningful only inside the exact document reply that
+/// supplied it. Generation is the editor request sequence, so an older task
+/// cannot replace the cache even if it starts or completes later.
+#[derive(Default)]
+struct CodeLensCache {
+    generation: u64,
+    uri: String,
+    items: Vec<lsp_types::CodeLens>,
+}
+
+impl CodeLensCache {
+    fn begin(&mut self, generation: u64, uri: &str) -> bool {
+        if generation <= self.generation || uri.is_empty() {
+            return false;
+        }
+        self.generation = generation;
+        self.uri = uri.to_owned();
+        self.items.clear();
+        true
+    }
+
+    fn matches(&self, generation: u64, uri: &str) -> bool {
+        generation > 0 && !uri.is_empty() && self.generation == generation && self.uri == uri
+    }
+
+    fn replace(&mut self, generation: u64, uri: &str, items: Vec<lsp_types::CodeLens>) -> bool {
+        if !self.matches(generation, uri) {
+            return false;
+        }
+        self.items = items;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        // Keep the request watermark: an already-spawned old task must not
+        // re-open this generation after a document or server refresh edge.
+        self.uri.clear();
+        self.items.clear();
+    }
+
+    fn invalidate_uri(&mut self, uri: &str) {
+        if self.uri == uri {
+            self.invalidate();
+        }
+    }
+
+    fn lens(&self, generation: u64, uri: &str, index: usize) -> Result<lsp_types::CodeLens> {
+        if !self.matches(generation, uri) {
+            bail!("stale code lens identity; refresh code lenses for this document");
+        }
+        self.items
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("invalid code lens index; refresh code lenses"))
+    }
+}
+
 #[derive(Clone)]
 struct SemanticTokenCache {
     result_id: Option<String>,
@@ -213,8 +270,8 @@ pub struct LspClient {
     /// Latest completion generation and its raw items for resolve.
     cached_completions: Arc<Mutex<CompletionCache>>,
     completion_generation: Arc<AtomicU64>,
-    /// Cached code lenses for execute
-    pub cached_code_lenses: Arc<Mutex<Vec<lsp_types::CodeLens>>>,
+    /// Document and reply identity for code-lens execution.
+    cached_code_lenses: Arc<Mutex<CodeLensCache>>,
     /// Previous semantic-token result and raw data, updated atomically per URI.
     semtok_cache: Arc<Mutex<HashMap<String, SemanticTokenCache>>>,
     /// Full and delta requests for one URI must never mutate the cache out of
@@ -321,6 +378,8 @@ impl LspClient {
         let settings_clone = settings.clone();
         let dynamic_registrations = Arc::new(Mutex::new(DynamicRegistrations::default()));
         let dynamic_registrations_clone = dynamic_registrations.clone();
+        let cached_code_lenses = Arc::new(Mutex::new(CodeLensCache::default()));
+        let code_lenses_clone = cached_code_lenses.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_clone = alive.clone();
         let workspace_root = Arc::new((root_uri.to_string(), root_path.to_string()));
@@ -335,6 +394,14 @@ impl LspClient {
                 // Is it a response?
                 if let Some(id) = msg.get("id") {
                     if msg.get("method").is_some() {
+                        // Retire executable lenses before forwarding the refresh
+                        // or acknowledging it. A pending resolve can resume as
+                        // soon as the dispatcher reads its next response.
+                        if msg.get("method").and_then(Value::as_str)
+                            == Some("workspace/codeLens/refresh")
+                        {
+                            code_lenses_clone.lock().await.invalidate();
+                        }
                         // Server request (e.g. workspace/applyEdit)
                         handle_server_request(
                             &msg,
@@ -386,7 +453,7 @@ impl LspClient {
             cached_actions: Arc::new(Mutex::new(Vec::new())),
             cached_completions: Arc::new(Mutex::new(CompletionCache::default())),
             completion_generation: Arc::new(AtomicU64::new(0)),
-            cached_code_lenses: Arc::new(Mutex::new(Vec::new())),
+            cached_code_lenses,
             semtok_cache: Arc::new(Mutex::new(HashMap::new())),
             semtok_uri_locks: Arc::new(Mutex::new(HashMap::new())),
             dynamic_registrations,
@@ -448,7 +515,7 @@ impl LspClient {
         timeout: Duration,
     ) -> Result<Value> {
         match self
-            .request_with_timeout_inner(None, method, params, timeout)
+            .request_with_timeout_inner(None, None, method, params, timeout)
             .await?
         {
             Some(result) => Ok(result),
@@ -469,7 +536,7 @@ impl LspClient {
         params: Value,
         timeout: Duration,
     ) -> Result<Option<Value>> {
-        self.request_with_timeout_inner(Some((key, seq)), method, params, timeout)
+        self.request_with_timeout_inner(Some((key, seq)), None, method, params, timeout)
             .await
     }
 
@@ -479,6 +546,31 @@ impl LspClient {
         }
         let result = {
             let mut transport = self.transport.lock().await;
+            transport.send(msg).await
+        };
+        if result.is_err() {
+            self.mark_dead().await;
+            let _ = self.terminate_transport().await;
+        }
+        result
+    }
+
+    /// Validate immediately before writing a CodeLens command, after all
+    /// pending-map and transport waits. The transport is acquired first so a
+    /// document change can invalidate the cache while a busy transport is
+    /// delaying us. Keep the cache guard only until the write completes, never
+    /// while awaiting the server response. Lifecycle paths release their cache
+    /// guard before taking the transport, so they cannot reverse this order.
+    async fn send_code_lens_message(&self, msg: &Value, generation: u64, uri: &str) -> Result<()> {
+        if !self.is_alive() {
+            bail!("language server {} is not running", self.server_name);
+        }
+        let result = {
+            let mut transport = self.transport.lock().await;
+            let cache = self.cached_code_lenses.lock().await;
+            if !cache.matches(generation, uri) {
+                bail!("code lenses changed before execution; refresh code lenses");
+            }
             transport.send(msg).await
         };
         if result.is_err() {
@@ -516,6 +608,7 @@ impl LspClient {
     async fn request_with_timeout_inner(
         &self,
         latest_key: Option<(&str, u64)>,
+        code_lens_identity: Option<(u64, &str)>,
         method: &str,
         params: Value,
         timeout: Duration,
@@ -557,6 +650,8 @@ impl LspClient {
                 latest.remove(key);
             }
             result
+        } else if let Some((generation, uri)) = code_lens_identity {
+            self.send_code_lens_message(&msg, generation, uri).await
         } else {
             self.send_message(&msg).await
         };
@@ -746,6 +841,7 @@ impl LspClient {
         version: i32,
         text: &str,
     ) -> Result<()> {
+        self.cached_code_lenses.lock().await.invalidate_uri(uri);
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -767,6 +863,9 @@ impl LspClient {
         text: Option<&str>,
         changes: Option<Vec<Value>>,
     ) -> Result<()> {
+        // Text can change while codeLens/resolve is in flight. An editor-side
+        // changedtick check at the original click cannot protect that await.
+        self.cached_code_lenses.lock().await.invalidate_uri(uri);
         let content_changes = if let Some(changes) = changes {
             if self.incremental_sync.load(Ordering::Acquire) {
                 json!(changes)
@@ -846,6 +945,7 @@ impl LspClient {
     }
 
     pub async fn did_close(&self, uri: &str) -> Result<()> {
+        self.cached_code_lenses.lock().await.invalidate_uri(uri);
         let uri_lock = self.semantic_token_uri_lock(uri).await;
         let _guard = uri_lock.lock().await;
         self.semtok_cache.lock().await.remove(uri);
@@ -2123,33 +2223,56 @@ impl LspClient {
         ))
     }
 
-    pub async fn code_lens(&self, uri: &str) -> Result<Vec<types::CodeLensItem>> {
-        let result = self
-            .request(
-                "textDocument/codeLens",
-                json!({
-                    "textDocument": { "uri": uri },
-                }),
-            )
-            .await?;
-        if result.is_null() {
-            return Ok(vec![]);
+    pub async fn code_lens(
+        &self,
+        generation: u64,
+        uri: &str,
+    ) -> Result<Option<Vec<types::CodeLensItem>>> {
+        // Retire executable indices at request time. A popup opened from the
+        // previous reply must not run while another document is being queried.
+        if !self.cached_code_lenses.lock().await.begin(generation, uri) {
+            return Ok(None);
         }
-        let lenses: Vec<lsp_types::CodeLens> = serde_json::from_value(result)?;
-        // Cache for later execution
-        *self.cached_code_lenses.lock().await = lenses.clone();
-        Ok(lenses
-            .iter()
-            .enumerate()
-            .map(|(idx, l)| types::CodeLensItem {
-                line: l.range.start.line,
-                character: l.range.start.character,
-                end_line: l.range.end.line,
-                end_character: l.range.end.character,
-                command_title: l.command.as_ref().map(|c| c.title.clone()),
-                index: idx,
-            })
-            .collect())
+        let result = match self
+            .request_latest_with_timeout(
+                "codeLens",
+                generation,
+                "textDocument/codeLens",
+                json!({ "textDocument": { "uri": uri } }),
+                REQUEST_TIMEOUT,
+            )
+            .await?
+        {
+            Some(result) => result,
+            None => return Ok(None),
+        };
+        let lenses: Vec<lsp_types::CodeLens> = if result.is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(result)?
+        };
+        if !self
+            .cached_code_lenses
+            .lock()
+            .await
+            .replace(generation, uri, lenses.clone())
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            lenses
+                .iter()
+                .enumerate()
+                .map(|(idx, lens)| types::CodeLensItem {
+                    line: lens.range.start.line,
+                    character: lens.range.start.character,
+                    end_line: lens.range.end.line,
+                    end_character: lens.range.end.character,
+                    command_title: lens.command.as_ref().map(|command| command.title.clone()),
+                    index: idx,
+                })
+                .collect(),
+        ))
     }
 
     pub async fn completion_resolve(
@@ -2209,16 +2332,19 @@ impl LspClient {
         Ok(types::from_lsp_completion_item(&resolved, index))
     }
 
-    pub async fn execute_code_lens(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
+    pub async fn execute_code_lens(
+        &self,
+        generation: u64,
+        uri: &str,
+        index: usize,
+    ) -> Result<Option<types::WorkspaceEdit>> {
         // Clone before resolving so a server round trip never holds the cache
         // lock and blocks a newer code-lens response.
         let lens = self
             .cached_code_lenses
             .lock()
             .await
-            .get(index)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("invalid code lens index"))?;
+            .lens(generation, uri, index)?;
         // Resolve if no command yet
         let lens = if lens.command.is_none() {
             let resolved = self
@@ -2228,9 +2354,21 @@ impl LspClient {
         } else {
             lens
         };
+        // Resolving can await a language server. A newer request may have
+        // invalidated the generation during that await; never execute it then.
+        if !self
+            .cached_code_lenses
+            .lock()
+            .await
+            .matches(generation, uri)
+        {
+            bail!("code lenses changed while resolving; refresh code lenses");
+        }
         if let Some(ref cmd) = lens.command {
             let result = self
-                .request_with_timeout(
+                .request_with_timeout_inner(
+                    None,
+                    Some((generation, uri)),
                     "workspace/executeCommand",
                     json!({
                         "command": cmd.command,
@@ -2238,7 +2376,8 @@ impl LspClient {
                     }),
                     EXECUTE_COMMAND_TIMEOUT,
                 )
-                .await?;
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("code lens execution was unexpectedly cancelled"))?;
             // Command may return a workspace edit
             if let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result) {
                 return Ok(Some(types::from_lsp_workspace_edit(&edit)));
@@ -3651,5 +3790,381 @@ fn client_capabilities() -> ClientCapabilities {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod code_lens_cache_tests {
+    use super::*;
+
+    fn lens(title: &str) -> lsp_types::CodeLens {
+        lsp_types::CodeLens {
+            range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            command: Some(Command::new(title.to_owned(), "test.run".to_owned(), None)),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn code_lens_identity_rejects_another_document_or_generation() {
+        let mut cache = CodeLensCache::default();
+        assert!(cache.begin(10, "file:///first.rs"));
+        assert!(cache.replace(10, "file:///first.rs", vec![lens("First")]));
+        assert_eq!(
+            cache
+                .lens(10, "file:///first.rs", 0)
+                .unwrap()
+                .command
+                .unwrap()
+                .title,
+            "First"
+        );
+        assert!(cache.lens(10, "file:///second.rs", 0).is_err());
+        assert!(cache.lens(9, "file:///first.rs", 0).is_err());
+        assert!(cache.lens(10, "file:///first.rs", 1).is_err());
+    }
+
+    #[test]
+    fn new_request_retires_old_indices_before_the_reply_arrives() {
+        let mut cache = CodeLensCache::default();
+        assert!(cache.begin(10, "file:///first.rs"));
+        assert!(cache.replace(10, "file:///first.rs", vec![lens("First")]));
+        assert!(cache.begin(11, "file:///second.rs"));
+        assert!(cache.lens(10, "file:///first.rs", 0).is_err());
+        assert!(cache.lens(11, "file:///second.rs", 0).is_err());
+        assert!(!cache.begin(9, "file:///first.rs"));
+        assert!(!cache.replace(10, "file:///first.rs", vec![lens("Late")]));
+        assert!(cache.replace(11, "file:///second.rs", vec![lens("Second")]));
+        assert_eq!(
+            cache
+                .lens(11, "file:///second.rs", 0)
+                .unwrap()
+                .command
+                .unwrap()
+                .title,
+            "Second"
+        );
+    }
+
+    #[test]
+    fn empty_reply_clears_the_executable_snapshot() {
+        let mut cache = CodeLensCache::default();
+        assert!(cache.begin(10, "file:///first.rs"));
+        assert!(cache.replace(10, "file:///first.rs", vec![lens("First")]));
+        assert!(cache.begin(11, "file:///first.rs"));
+        assert!(cache.replace(11, "file:///first.rs", vec![]));
+        assert!(cache.lens(10, "file:///first.rs", 0).is_err());
+        assert!(cache.lens(11, "file:///first.rs", 0).is_err());
+    }
+
+    #[test]
+    fn document_invalidation_preserves_watermark_and_rejects_late_repopulation() {
+        let mut cache = CodeLensCache::default();
+        assert!(cache.begin(10, "file:///first.rs"));
+        assert!(cache.replace(10, "file:///first.rs", vec![lens("First")]));
+        cache.invalidate_uri("file:///other.rs");
+        assert!(cache.lens(10, "file:///first.rs", 0).is_ok());
+        cache.invalidate_uri("file:///first.rs");
+        assert_eq!(cache.generation, 10);
+        assert!(!cache.matches(10, "file:///first.rs"));
+        assert!(!cache.matches(10, ""));
+        assert!(!cache.replace(10, "file:///first.rs", vec![lens("Late")]));
+        assert!(!cache.begin(10, "file:///first.rs"));
+        assert!(!cache.begin(9, "file:///other.rs"));
+        assert!(cache.begin(11, "file:///first.rs"));
+        assert!(cache.replace(11, "file:///first.rs", vec![lens("Fresh")]));
+        cache.invalidate();
+        assert!(!cache.replace(11, "file:///first.rs", vec![lens("After refresh")]));
+        assert!(cache.begin(12, "file:///first.rs"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn document_changes_and_server_refresh_cancel_a_resolving_lens() {
+        // A controlled real LSP transport leaves resolve pending until the
+        // test releases it. No timer race decides whether an edit wins.
+        let server = r#"
+import json, sys
+pending = None
+executions = 0
+def send(value):
+    body = json.dumps(dict(jsonrpc='2.0', **value)).encode()
+    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+    sys.stdout.buffer.flush()
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b'\r\n', b'\n'):
+            break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    msg = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method = msg.get('method')
+    if method == 'initialize':
+        send(dict(id=msg['id'], result={'capabilities': {'codeLensProvider': {'resolveProvider': True}}}))
+    elif method == 'codeLens/resolve':
+        pending = msg
+        send(dict(method='window/logMessage', params={'type': 3, 'message': 'resolving'}))
+    elif method == 'test/release':
+        result = pending['params']
+        result['command'] = {'title': 'Run', 'command': 'test.run'}
+        send(dict(id=pending['id'], result=result))
+        pending = None
+    elif method == 'test/refresh':
+        send(dict(id='refresh', method='workspace/codeLens/refresh'))
+    elif method == 'workspace/executeCommand':
+        executions += 1
+        send(dict(id=msg['id'], result=None))
+    elif method == 'test/executions':
+        send(dict(id=msg['id'], result=executions))
+    elif method == 'shutdown':
+        send(dict(id=msg['id'], result=None))
+    elif method == 'exit':
+        break
+"#;
+        let (client, mut events) = LspClient::start(
+            "code-lens-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        let uri = "file:///tmp/first.rs";
+        for (index, lifecycle) in ["open", "change", "close", "refresh"].iter().enumerate() {
+            let generation = index as u64 + 1;
+            {
+                let mut cache = client.cached_code_lenses.lock().await;
+                assert!(cache.begin(generation, uri));
+                let mut unresolved = lens("Run");
+                unresolved.command = None;
+                assert!(cache.replace(generation, uri, vec![unresolved]));
+            }
+            client
+                .did_change("file:///tmp/other.rs", 2, Some("unrelated"), None)
+                .await
+                .unwrap();
+            let executing = client.clone();
+            let task =
+                tokio::spawn(async move { executing.execute_code_lens(generation, uri, 0).await });
+            let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(event, ServerEvent::LogMessage { message, .. } if message == "resolving")
+            );
+            match *lifecycle {
+                "open" => client.did_open(uri, "rust", 2, "new").await.unwrap(),
+                "change" => client.did_change(uri, 2, Some("new"), None).await.unwrap(),
+                "close" => client.did_close(uri).await.unwrap(),
+                _ => {
+                    client.notify("test/refresh", Value::Null).await.unwrap();
+                    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(event, ServerEvent::Refresh { what } if what == "codeLens"));
+                }
+            }
+            client.notify("test/release", Value::Null).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed while resolving")
+            );
+            assert_eq!(
+                client
+                    .request("test/executions", Value::Null)
+                    .await
+                    .unwrap(),
+                json!(0)
+            );
+            let mut cache = client.cached_code_lenses.lock().await;
+            assert!(!cache.replace(generation, uri, vec![lens("Late")]));
+            assert!(!cache.begin(generation, uri));
+        }
+        client.shutdown().await.unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn code_lens_identity_is_checked_at_send_and_unlocked_before_reply() {
+        let server = r#"
+import json, sys
+pending = None
+executions = 0
+def send(value):
+    body = json.dumps(dict(jsonrpc='2.0', **value)).encode()
+    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+    sys.stdout.buffer.flush()
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b'\r\n', b'\n'):
+            break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    msg = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method = msg.get('method')
+    if method == 'initialize':
+        send(dict(id=msg['id'], result={'capabilities': {'codeLensProvider': {'resolveProvider': True}}}))
+    elif method == 'textDocument/codeLens':
+        send(dict(id=msg['id'], result=[]))
+    elif method == 'workspace/executeCommand':
+        executions += 1
+        pending = msg
+        send(dict(method='window/logMessage', params={'type': 3, 'message': 'executing'}))
+    elif method == 'test/release':
+        send(dict(id=pending['id'], result=None))
+        pending = None
+    elif method == 'test/executions':
+        send(dict(id=msg['id'], result=executions))
+    elif method == 'shutdown':
+        send(dict(id=msg['id'], result=None))
+    elif method == 'exit':
+        break
+"#;
+        let (client, mut events) = LspClient::start(
+            "code-lens-send-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        let uri = "file:///tmp/first.rs";
+        for (generation, lifecycle) in [(10, "change"), (20, "request")] {
+            {
+                let mut cache = client.cached_code_lenses.lock().await;
+                assert!(cache.begin(generation, uri));
+                assert!(cache.replace(generation, uri, vec![lens("Run")]));
+            }
+            // Hold the transport until execution has passed its early check
+            // and registered a pending response. This fixes the race order
+            // without sleeps or production-only test hooks.
+            let transport = client.transport.lock().await;
+            let executing = client.clone();
+            let execution =
+                tokio::spawn(async move { executing.execute_code_lens(generation, uri, 0).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while client.pending.lock().await.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let invalidating = client.clone();
+            let invalidation = tokio::spawn(async move {
+                if lifecycle == "change" {
+                    invalidating
+                        .did_change(uri, 2, Some("edited"), None)
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(
+                        invalidating
+                            .code_lens(generation + 1, uri)
+                            .await
+                            .unwrap()
+                            .is_some()
+                    );
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while client
+                    .cached_code_lenses
+                    .lock()
+                    .await
+                    .matches(generation, uri)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(transport);
+            let result = tokio::time::timeout(Duration::from_secs(5), execution)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed before execution")
+            );
+            tokio::time::timeout(Duration::from_secs(5), invalidation)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(client.pending.lock().await.is_empty());
+            assert_eq!(
+                client
+                    .request("test/executions", Value::Null)
+                    .await
+                    .unwrap(),
+                json!(0)
+            );
+        }
+
+        {
+            let mut cache = client.cached_code_lenses.lock().await;
+            assert!(cache.begin(30, uri));
+            assert!(cache.replace(30, uri, vec![lens("Run")]));
+        }
+        let executing = client.clone();
+        let execution = tokio::spawn(async move { executing.execute_code_lens(30, uri, 0).await });
+        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, ServerEvent::LogMessage { message, .. } if message == "executing"));
+        // The command has been written, but the fixture deliberately withholds
+        // its reply. Editing must still acquire both cache and transport now.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.did_change(uri, 3, Some("later edit"), None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        client.notify("test/release", Value::Null).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), execution)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .request("test/executions", Value::Null)
+                .await
+                .unwrap(),
+            json!(1)
+        );
+        client.shutdown().await.unwrap();
     }
 }

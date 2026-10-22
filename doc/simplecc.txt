@@ -209,6 +209,21 @@ Editing and language features ~
 *:SimpleCCSemanticTokens*        Refresh semantic tokens.
 *:SimpleCCCodeLens*              Display code lenses.
 *:SimpleCCCodeLensRun*           Execute a code lens.
+
+CodeLens execution belongs to the exact reply/document that supplied its index.
+Edits, buffer/filetype changes, a new request, refresh or daemon restart reject
+old menu callbacks. The daemon also validates reply generation and URI. Update
+and rebuild both halves together: a legacy reply is displayable but the new Vim
+plugin refuses to execute it without generation and URI identity.
+
+CodeLens and virtual diagnostics use after-text properties with truncation.
+After properties change, |User| SimpleCCDecorationsChanged lets a native host
+refresh without a source edit. Supported native hosts can paint these after-line
+annotations; inline inlay hints continue through Vim's compatibility view.
+:SimpleCCInlayHints can enable a configured-zero preference. Switching it off
+clears every loaded buffer's hints and cancels pending replies; restore caches
+are isolated by buffer and checked against changedtick, URI and filetype.
+
 *:SimpleCCFold*                  Apply server-provided folding ranges.
 
 Diagnostics and Julia ~

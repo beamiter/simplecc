@@ -403,6 +403,8 @@ enum Request {
         id: u64,
         #[serde(rename = "languageId")]
         language_id: String,
+        generation: u64,
+        uri: String,
         index: usize,
     },
 
@@ -2020,11 +2022,12 @@ async fn handle_request(
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.code_lens(&uri).await {
-                    Ok(lenses) => send_event!(
+                match c.code_lens(id, &uri).await {
+                    Ok(Some(lenses)) => send_event!(
                         &out,
-                        json!({"type": "codeLens", "id": id, "lenses": lenses}),
+                        json!({"type": "codeLens", "id": id, "generation": id, "uri": uri, "lenses": lenses}),
                     ),
+                    Ok(None) => {}
                     Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),
@@ -2104,15 +2107,23 @@ async fn handle_request(
         Request::ExecuteCodeLens {
             id,
             language_id,
+            generation,
+            uri,
             index,
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.execute_code_lens(index).await {
+                match c.execute_code_lens(generation, &uri, index).await {
                     Ok(Some(edit)) => {
-                        send_event!(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
+                        send_event!(
+                            &out,
+                            json!({"type": "codeLensExecute", "id": id, "generation": generation, "uri": uri, "edit": edit})
+                        )
                     }
-                    Ok(None) => send_event!(&out, json!({"type": "codeLensExecute", "id": id})),
+                    Ok(None) => send_event!(
+                        &out,
+                        json!({"type": "codeLensExecute", "id": id, "generation": generation, "uri": uri})
+                    ),
                     Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),

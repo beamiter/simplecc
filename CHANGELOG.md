@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - 2026-10-22
+
+### 原生行末提示与 CodeLens 生命周期
+
+- CodeLens 和 virtual diagnostics 使用截断的单行行末文字；新增
+  `User SimpleCCDecorationsChanged` 通知原生宿主刷新显示或清空。
+- CodeLens 绑定请求 generation、URI、buffer、changedtick、filetype 和 daemon
+  代次；旧菜单、旧回复、空结果和重启不会误用另一份结果的 index。daemon 执行前
+  再核对身份，命令返回的编辑也由专属执行事件检查原始上下文。
+- 新 Vim 插件可显示旧 daemon 回复，但缺少身份字段时拒绝执行并提示重建 daemon。
+- inlay 请求/恢复缓存按 buffer 隔离；关闭提示清理所有 buffer 及待处理回复，
+  配置默认关闭时也可通过命令正常开启。inline inlay 仍由 Vim 兼容视图显示。
+- 新增真实 Vim 生命周期回归及 daemon cache 身份/乱序/空结果测试。
+
 ## Unreleased - 2026-10-04
 
 ### 补全前缀不再把字节列当成字符下标

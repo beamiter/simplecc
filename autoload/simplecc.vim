@@ -146,8 +146,9 @@ var s_ws_timer: number = 0
 var s_ws_results: list<dict<any>> = []
 var s_ws_live: bool = false
 var s_ws_selected: number = 0
-# Code lens cache for execution
-var s_code_lens_cache: list<dict<any>> = []
+# Code-lens indices belong to one daemon reply, never to the current buffer
+# at execution time. Keep that reply's document and generation with its items.
+var s_code_lens_cache: dict<any> = {}
 # Snippet state
 var s_snippet_active: bool = false
 var s_snippet_tabstops: list<dict<any>> = []
@@ -162,11 +163,13 @@ var s_listener_ids: dict<number> = {}
 # Pending request context for buffer-targeted async replies, keyed by request
 # id.  {bufnr, changedtick} is recorded at send time so a reply that arrives
 # after the user switched buffers (or kept editing) is never rendered into the
-# wrong buffer.  Only the most recent request per feature is kept: an older
-# in-flight reply is stale by definition and gets dropped.
+# wrong buffer. Inlay hints retain the newest request per buffer; features
+# with a single daemon-side execution cache retain only their newest request.
 var s_inlay_requests: dict<dict<any>> = {}
 var s_semtok_requests: dict<dict<any>> = {}
 var s_codelens_requests: dict<dict<any>> = {}
+var s_codelens_executions: dict<dict<any>> = {}
+const MAX_CODE_LENS_EXECUTIONS = 16
 var s_dochl_requests: dict<dict<any>> = {}
 var s_format_requests: dict<dict<any>> = {}
 var s_action_requests: dict<dict<any>> = {}
@@ -296,6 +299,7 @@ def OnDaemonExit(code: number, restarting: bool)
   s_inlay_requests = {}
   s_semtok_requests = {}
   s_codelens_requests = {}
+  ClearDecorationCaches()
   s_dochl_requests = {}
   s_format_requests = {}
   s_action_requests = {}
@@ -553,6 +557,11 @@ def OnBackendEvent(ev: dict<any>)
     if id > 0 && has_key(s_navigation_contexts, string(id))
       remove(s_navigation_contexts, string(id))
     endif
+    for contexts in [s_inlay_requests, s_codelens_requests, s_codelens_executions]
+      if has_key(contexts, string(id))
+        remove(contexts, string(id))
+      endif
+    endfor
     Log('error(id=' .. string(id) .. '): ' .. get(ev, 'message', ''))
 
   elseif ev.type ==# 'shutdown'
@@ -1504,6 +1513,7 @@ def SendDidChange(bnr: number)
 enddef
 
 export def OnBufOpen()
+  ClearStaleDecorations(bufnr('%'))
   Log(printf('OnBufOpen called: buf=%s, ft=%s, name=%s', bufnr('%'), &filetype, bufname('%')))
   if !s_initialized
     Log('OnBufOpen: not initialized')
@@ -1531,6 +1541,7 @@ export def OnBufOpen()
 enddef
 
 export def OnBufEnter()
+  ClearStaleDecorations(bufnr('%'))
   if !s_initialized || BufFt() ==# '' || BufUri() ==# 'file://'
         || !BufferServable()
     return
@@ -1578,6 +1589,7 @@ export def OnBufClose(buffer: number = 0)
   var uri = BufUri(bnr)
   UnregisterListener(bnr)
   StopFeatureTimers(bnr)
+  ClearDecorationCaches(bnr)
   if has_key(s_bufword_cache, string(bnr))
     remove(s_bufword_cache, string(bnr))
   endif
@@ -1608,11 +1620,23 @@ export def OnBufClose(buffer: number = 0)
 enddef
 
 export def OnTextChanged()
+  var pending_lens = !empty(filter(copy(s_codelens_executions),
+    (_, execution) => execution.context.bufnr == bufnr('%')))
+  # Text properties move with edits, but a moved hint/lens still describes an
+  # old LSP snapshot. Never restore or execute that old snapshot after typing.
+  ClearDecorationCaches(bufnr('%'))
   if !s_initialized
     return
   endif
 
   ScheduleDidChange(bufnr('%'))
+  if pending_lens
+    # An awaiting codeLens/resolve must learn about this invalidation before
+    # the normal edit debounce expires.
+    FlushDidChange(bufnr('%'))
+    RequestInlayHintsDebounced()
+    RequestSemanticTokensDebounced()
+  endif
 
   # TextChangedI is a more accurate completion trigger than relying only on
   # CursorMovedI. TriggerCompletion itself snapshots the cursor and changedtick,
@@ -1758,6 +1782,12 @@ enddef
 def NativePopupsChanged()
   if exists('#User#JTermVim9PopupChanged')
     doautocmd <nomodeline> User JTermVim9PopupChanged
+  endif
+enddef
+
+def DecorationsChanged()
+  if exists('#User#SimpleCCDecorationsChanged')
+    doautocmd <nomodeline> User SimpleCCDecorationsChanged
   endif
 enddef
 
@@ -3670,6 +3700,10 @@ def OnRefresh(ev: dict<any>)
     RequestSemanticTokensDebounced()
   elseif what ==# 'inlayHint'
     RequestInlayHintsDebounced()
+  elseif what ==# 'codeLens'
+    s_codelens_requests = {}
+    s_codelens_executions = {}
+    ClearCodeLens()
   elseif what ==# 'diagnostics'
     if g:simplecc_pull_diagnostics
       PullDiagnostics()
@@ -4480,6 +4514,7 @@ export def Start()
 enddef
 
 export def Stop(restarting: bool = false)
+  ClearDecorationCaches()
   # A manual stop cancels a queued restart; Restart() keeps the intent until
   # the daemon has really exited.
   s_restart_pending = restarting
@@ -5672,17 +5707,78 @@ enddef
 
 var s_inlay_enabled: bool = true
 var s_inlay_timer: number = 0
-var s_inlay_cache: list<any> = []
-var s_inlay_cache_bufnr: number = -1
+var s_inlay_cache: dict<dict<any>> = {}
+
+# All position-sensitive decoration state uses the same source identity. A
+# changed filetype/URI or a replaced daemon is as stale as a changedtick.
+def SyncDecorationDocument(bnr: number)
+  FlushDidChange(bnr)
+  # A direct host action may arrive before TextChanged scheduled its debounce.
+  # Bring the daemon to the captured tick even in that event ordering.
+  if get(s_doc_changedticks, BufUri(bnr), -1) != getbufvar(bnr, 'changedtick', -2)
+    SendDidChange(bnr)
+  endif
+enddef
+
+def DecorationContext(bnr: number): dict<any>
+  return {bufnr: bnr, changedtick: getbufvar(bnr, 'changedtick', -1),
+    uri: BufUri(bnr), filetype: getbufvar(bnr, '&filetype'), epoch: s_daemon_generation}
+enddef
+
+def LiveDecorationContext(context: dict<any>): bool
+  var bnr = get(context, 'bufnr', -1)
+  return bnr > 0 && bufloaded(bnr)
+    && get(context, 'changedtick', -1) == getbufvar(bnr, 'changedtick', -2)
+    && get(context, 'uri', '') ==# BufUri(bnr)
+    && get(context, 'filetype', '') ==# getbufvar(bnr, '&filetype')
+    && get(context, 'epoch', -1) == s_daemon_generation
+enddef
+
+def ClearStaleDecorations(buffer: number)
+  var key = string(buffer)
+  var inlay = get(s_inlay_cache, key, {})
+  var lens = get(s_code_lens_cache, 'context', {})
+  if (!empty(inlay) && !LiveDecorationContext(inlay.context))
+    || (get(lens, 'bufnr', -1) == buffer && !LiveDecorationContext(lens))
+    ClearDecorationCaches(buffer)
+  endif
+enddef
+
+def ClearInlayCaches(buffer: number = -1)
+  filter(s_inlay_requests, (_, req) => buffer >= 0 && req.bufnr != buffer)
+  var buffers = buffer >= 0 ? [string(buffer)] : keys(s_inlay_cache)
+  for key in buffers
+    if has_key(s_inlay_cache, key)
+      remove(s_inlay_cache, key)
+    endif
+    ClearInlayHints(str2nr(key))
+  endfor
+enddef
+
+def ClearDecorationCaches(buffer: number = -1)
+  ClearInlayCaches(buffer)
+  filter(s_codelens_requests, (_, req) => buffer >= 0 && req.bufnr != buffer)
+  filter(s_codelens_executions, (_, execution) => buffer >= 0 && execution.context.bufnr != buffer)
+  if buffer < 0 || get(get(s_code_lens_cache, 'context', {}), 'bufnr', -1) == buffer
+    ClearCodeLens()
+  endif
+enddef
 
 export def InlayHintsToggle()
-  s_inlay_enabled = !s_inlay_enabled
+  # The option is the initial/managed preference; the command must still be
+  # able to enable hints when a host supplied a default of zero.
+  s_inlay_enabled = !(s_inlay_enabled && !!g:simplecc_inlay_hints)
+  g:simplecc_inlay_hints = s_inlay_enabled ? 1 : 0
   if s_inlay_enabled
     echo '[SimpleCC] Inlay hints ON'
     RequestInlayHints()
   else
     echo '[SimpleCC] Inlay hints OFF'
-    ClearInlayHints(bufnr('%'))
+    if s_inlay_timer > 0
+      timer_stop(s_inlay_timer)
+      s_inlay_timer = 0
+    endif
+    ClearInlayCaches()
   endif
 enddef
 
@@ -5693,7 +5789,7 @@ def RequestInlayHintsDebounced()
   var bnr = bufnr('%')
   s_inlay_timer = timer_start(500, (_) => {
     s_inlay_timer = 0
-    if !bufexists(bnr)
+    if !bufloaded(bnr) || bnr != bufnr('%')
       return
     endif
     RequestInlayHints()
@@ -5705,9 +5801,10 @@ def RequestInlayHints()
     return
   endif
   var ft = BufFt()
-  if ft ==# ''
+  if ft ==# '' || !BufferServable()
     return
   endif
+  SyncDecorationDocument(bufnr('%'))
   var id = NextId()
   # textDocument/inlayHint takes a range, and this asked for the whole
   # document every time: in a 20k-line file the server computed — and this
@@ -5730,7 +5827,9 @@ def RequestInlayHints()
   var bot = max([top + 1, min([line('$'), line('w$') + margin])])
   # Record which buffer snapshot this request was issued for so the async
   # reply is never rendered into whatever buffer is current at reply time.
-  s_inlay_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
+  var bnr = bufnr('%')
+  filter(s_inlay_requests, (_, req) => req.bufnr != bnr && LiveDecorationContext(req))
+  s_inlay_requests[string(id)] = DecorationContext(bnr)
   Send({
     type: 'textDocument/inlayHint',
     id: id,
@@ -5741,50 +5840,46 @@ def RequestInlayHints()
   })
 enddef
 
-def ClearInlayHints(bnr: number)
+def ClearInlayHints(bnr: number, notify: bool = true): bool
+  if !bufloaded(bnr)
+    return false
+  endif
+  var removed = false
   try
-    prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
+    removed = prop_remove({type: 'SimpleCCInlay', bufnr: bnr, all: true}) > 0
   catch
   endtry
-  try
-    prop_remove({type: 'SimpleCCInlay', bufnr: bnr, all: true})
-  catch
-  endtry
+  if removed && notify
+    DecorationsChanged()
+  endif
+  return removed
 enddef
 
 def OnInlayHints(ev: dict<any>)
-  if !s_inlay_enabled
-    return
-  endif
   var key = string(get(ev, 'id', 0))
   if !has_key(s_inlay_requests, key)
     return
   endif
   var req = remove(s_inlay_requests, key)
   var bnr = req.bufnr
-  # Hints are position-sensitive: drop the reply when the buffer was wiped or
-  # edited during the round-trip (the next change re-requests anyway).
-  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+  if !s_initialized || !s_inlay_enabled || !g:simplecc_inlay_hints
+    return
+  endif
+  if !LiveDecorationContext(req)
     Log('inlay hints: dropped stale reply for buffer ' .. bnr)
     return
   endif
-  # An empty reply is a real answer: whatever was on screen is gone. Returning
-  # early left the stale hints in place and, worse, RestoreInlayHints() kept
-  # re-adding them from the cache on every CursorHold — comment out
-  # `let x = compute();` and its `: i32` stayed attached to the comment.
   var hints = get(ev, 'hints', [])
-  # Cache for later restoration
-  s_inlay_cache = hints
-  s_inlay_cache_bufnr = bnr
-  if empty(hints)
-    ClearInlayHints(bnr)
+  if type(hints) != v:t_list
     return
   endif
+  # Empty replies replace the old snapshot too, including the restore cache.
+  s_inlay_cache[string(bnr)] = {context: req, items: deepcopy(hints)}
   ApplyInlayHints(hints, bnr)
 enddef
 
 def ApplyInlayHints(hints: list<any>, bnr: number)
-  ClearInlayHints(bnr)
+  var changed = ClearInlayHints(bnr, false)
   try
     prop_type_add('SimpleCCInlay', {bufnr: bnr, highlight: 'SimpleCCInlayHint'})
   catch
@@ -5792,7 +5887,11 @@ def ApplyInlayHints(hints: list<any>, bnr: number)
   var info = getbufinfo(bnr)
   var line_count = empty(info) ? 0 : info[0].linecount
   for h in hints
-    var lnum = get(h, 'line', 0) + 1
+    if type(h) != v:t_dict || type(get(h, 'line', '')) != v:t_number
+      || type(get(h, 'character', '')) != v:t_number || type(get(h, 'label', 0)) != v:t_string
+      continue
+    endif
+    var lnum = h.line + 1
     var line_text = get(getbufline(bnr, lnum), 0, '')
     var col = Utf16LineColumn(line_text, get(h, 'character', 0))
     var label = get(h, 'label', '')
@@ -5802,31 +5901,44 @@ def ApplyInlayHints(hints: list<any>, bnr: number)
     if lnum > 0 && lnum <= line_count
       try
         prop_add(lnum, col, {type: 'SimpleCCInlay', text: text, bufnr: bnr})
+        changed = true
       catch
       endtry
     endif
   endfor
+  if changed
+    DecorationsChanged()
+  endif
 enddef
 
 def RestoreInlayHints()
-  if empty(s_inlay_cache) || !s_inlay_enabled || !g:simplecc_inlay_hints
-    return
-  endif
   var bnr = bufnr('%')
-  if bnr != s_inlay_cache_bufnr
+  var key = string(bnr)
+  if !has_key(s_inlay_cache, key) || !s_inlay_enabled || !g:simplecc_inlay_hints
     return
   endif
-  # Check if hints are still displayed by looking for a prop on a cached hint line
-  var check_line = get(s_inlay_cache[0], 'line', 0) + 1
+  var cached = s_inlay_cache[key]
+  if !LiveDecorationContext(cached.context)
+    ClearInlayCaches(bnr)
+    return
+  endif
+  var hints = cached.items
+  if empty(hints)
+    return
+  endif
+  var first = hints[0]
+  if type(first) != v:t_dict || type(get(first, 'line', '')) != v:t_number
+    return
+  endif
+  var check_line = first.line + 1
   var existing: list<any> = []
   try
-    existing = check_line > 0 ? prop_list(check_line, {bufnr: bnr, type: 'SimpleCCInlay'}) : []
+    existing = check_line > 0 ? prop_list(check_line, {bufnr: bnr, types: ['SimpleCCInlay']}) : []
   catch
     return
   endtry
   if empty(existing)
-    # Hints were lost, restore from cache
-    ApplyInlayHints(s_inlay_cache, bnr)
+    ApplyInlayHints(hints, bnr)
   endif
 enddef
 
@@ -6248,19 +6360,38 @@ enddef
 # Code Lens
 # ═════════════════════════════════════════════════════════
 
+def ClearCodeLens()
+  var bnr = get(get(s_code_lens_cache, 'context', {}), 'bufnr', -1)
+  s_code_lens_cache = {}
+  if bnr > 0 && bufloaded(bnr)
+    try
+      if prop_remove({type: 'SimpleCCCodeLens', bufnr: bnr, all: true}) > 0
+        DecorationsChanged()
+      endif
+    catch
+    endtry
+  endif
+enddef
+
 export def CodeLens()
   if !s_initialized
     echom '[SimpleCC] not initialized'
     return
   endif
+  if !BufferServable() || BufFt() ==# ''
+    return
+  endif
+  SyncDecorationDocument(bufnr('%'))
   var id = NextId()
-  s_codelens_requests = {[string(id)]: {bufnr: bufnr('%'), changedtick: b:changedtick}}
-  Send({
-    type: 'textDocument/codeLens',
-    id: id,
-    uri: BufUri(),
-    languageId: BufFt(),
-  })
+  # The daemon caches indices per server. Beginning another request must
+  # immediately retire the previous executable snapshot, including its popup.
+  ClearCodeLens()
+  s_codelens_executions = {}
+  var context = DecorationContext(bufnr('%'))
+  context.request = id
+  s_codelens_requests = {[string(id)]: context}
+  Send({type: 'textDocument/codeLens', id: id,
+    uri: context.uri, languageId: context.filetype})
 enddef
 
 def OnCodeLens(ev: dict<any>)
@@ -6270,40 +6401,53 @@ def OnCodeLens(ev: dict<any>)
   endif
   var req = remove(s_codelens_requests, key)
   var bnr = req.bufnr
-  # Lens lines are position-sensitive: drop the reply when the buffer was
-  # wiped or edited during the round-trip.
-  if !bufexists(bnr) || getbufvar(bnr, 'changedtick', -1) != req.changedtick
+  if !s_initialized || !LiveDecorationContext(req)
     Log('code lens: dropped stale reply for buffer ' .. bnr)
     return
   endif
   var lenses = get(ev, 'lenses', [])
-  if empty(lenses)
+  if type(lenses) != v:t_list
+    return
+  endif
+  # A legacy daemon can still display lenses. Execution requires the echoed
+  # generation and URI; old daemons ignore extra execute fields and cannot
+  # safely enforce their identity, so never send them an execution request.
+  var generation = get(ev, 'generation', 0)
+  var executable = type(generation) == v:t_number && generation == req.request
+    && get(ev, 'uri', '') ==# req.uri
+  ClearCodeLens()
+  var valid = filter(copy(lenses), (_, lens) => type(lens) == v:t_dict
+    && type(get(lens, 'line', '')) == v:t_number
+    && type(get(lens, 'index', '')) == v:t_number && lens.index >= 0)
+  s_code_lens_cache = {context: req, items: deepcopy(valid),
+    generation: executable ? generation : 0}
+  if empty(valid)
     echo 'No code lenses'
     return
   endif
-  # Cache for execution
-  s_code_lens_cache = lenses
   try
     prop_type_add('SimpleCCCodeLens', {bufnr: bnr, highlight: 'Comment'})
   catch
   endtry
-  try
-    prop_remove({type: 'SimpleCCCodeLens', bufnr: bnr, all: true})
-  catch
-  endtry
   var info = getbufinfo(bnr)
   var line_count = empty(info) ? 0 : info[0].linecount
-  for l in lenses
-    var lnum = get(l, 'line', 0) + 1
-    var title = get(l, 'command_title', '')
-    if title !=# '' && lnum > 0 && lnum <= line_count
+  var changed = false
+  for lens in valid
+    var lnum = lens.line + 1
+    var title = get(lens, 'command_title', '')
+    if type(title) == v:t_string && !empty(title) && lnum > 0 && lnum <= line_count
       try
-        prop_add(lnum, 0, {type: 'SimpleCCCodeLens', text: '  ' .. title, text_align: 'after', bufnr: bnr})
+        prop_add(lnum, 0, {type: 'SimpleCCCodeLens', text: '  ' .. title,
+          text_align: 'after', text_wrap: 'truncate', bufnr: bnr})
+        changed = true
       catch
       endtry
     endif
   endfor
-  echo printf('[SimpleCC] %d code lenses', len(lenses))
+  if changed
+    DecorationsChanged()
+  endif
+  echo printf('[SimpleCC] %d code lenses', len(valid))
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -6425,18 +6569,22 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     ['SimpleCCVirtualDiagErrorProp', 'SimpleCCVirtualDiagError'],
     ['SimpleCCVirtualDiagWarnProp', 'SimpleCCVirtualDiagWarn'],
   ]
+  var changed = false
   for [ptype, highlight] in prop_types
     try
       prop_type_add(ptype, {bufnr: bufnr, highlight: highlight})
     catch
     endtry
     try
-      prop_remove({type: ptype, bufnr: bufnr, all: true})
+      changed = prop_remove({type: ptype, bufnr: bufnr, all: true}) > 0 || changed
     catch
     endtry
   endfor
   var max_per_line = max([0, get(g:, 'simplecc_diag_max_per_line', 3)])
   if !g:simplecc_virtual_diag || max_per_line == 0
+    if changed
+      DecorationsChanged()
+    endif
     return
   endif
   # Group diagnostics by line, sorted by severity
@@ -6473,11 +6621,15 @@ def DisplayVirtualDiag(bufnr: number, items: list<dict<any>>)
     if lnum > 0 && lnum <= line_count
       try
         prop_add(lnum, 0, {type: ptype, text: '  ' .. join(msgs, ' | '),
-            text_align: 'after', bufnr: bufnr})
+            text_align: 'after', text_wrap: 'truncate', bufnr: bufnr})
+        changed = true
       catch
       endtry
     endif
   endfor
+  if changed
+    DecorationsChanged()
+  endif
 enddef
 
 # ═════════════════════════════════════════════════════════
@@ -6686,55 +6838,83 @@ export def CodeLensRun()
     echom '[SimpleCC] not initialized'
     return
   endif
-  if empty(s_code_lens_cache)
+  var cached = deepcopy(s_code_lens_cache)
+  if empty(cached) || empty(cached.items)
     echo '[SimpleCC] No code lenses cached. Run :SimpleCCCodeLens first.'
     return
   endif
+  if !LiveDecorationContext(cached.context) || cached.context.bufnr != bufnr('%')
+    echo '[SimpleCC] Code lenses are stale for this buffer. Run :SimpleCCCodeLens again.'
+    return
+  endif
+  if cached.generation <= 0
+    echo '[SimpleCC] Rebuild the SimpleCC daemon and run :SimpleCCRestart before executing code lenses.'
+    return
+  endif
   var cur_line = line('.') - 1
-  # Find lenses on or near current line
-  var nearby: list<dict<any>> = []
-  for l in s_code_lens_cache
-    if abs(get(l, 'line', -999) - cur_line) <= 1
-      add(nearby, l)
-    endif
-  endfor
+  var nearby = filter(copy(cached.items), (_, lens) => abs(lens.line - cur_line) <= 1)
   if empty(nearby)
-    # Fall back to all lenses
-    nearby = s_code_lens_cache
+    nearby = cached.items
   endif
   if len(nearby) == 1
-    DoCodeLensExecute(nearby[0])
+    DoCodeLensExecute(nearby[0], cached)
   else
-    var titles = mapnew(nearby, (_, l) => get(l, 'command_title', '(untitled)'))
+    var titles = mapnew(nearby, (_, lens) =>
+      type(get(lens, 'command_title', 0)) == v:t_string && !empty(lens.command_title)
+        ? lens.command_title : '(resolve code lens)')
     popup_menu(titles, {
       title: ' Run Code Lens ',
       border: [1, 1, 1, 1],
       borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
       padding: [0, 1, 0, 1],
       callback: (_, idx) => {
-        if idx > 0
-          DoCodeLensExecute(nearby[idx - 1])
+        if idx > 0 && idx <= len(nearby)
+          DoCodeLensExecute(nearby[idx - 1], cached)
         endif
       },
     })
   endif
 enddef
 
-def DoCodeLensExecute(lens: dict<any>)
-  var idx = get(lens, 'index', -1)
-  if idx < 0
+def DoCodeLensExecute(lens: dict<any>, cached: dict<any>)
+  # A popup callback may run after an edit, a new request, a buffer switch or
+  # a restart. Recheck both the source and the current executable generation.
+  if !s_initialized || !LiveDecorationContext(cached.context)
+    || cached.context.bufnr != bufnr('%') || cached.generation <= 0
+    || get(s_code_lens_cache, 'generation', 0) != cached.generation
+    || get(s_code_lens_cache, 'context', {}) !=# cached.context
+    echo '[SimpleCC] Code lenses changed; run :SimpleCCCodeLens again.'
     return
   endif
-  Send({
-    type: 'codeLens/execute',
-    id: NextId(),
-    languageId: BufFt(),
-    index: idx,
-  })
+  if len(s_codelens_executions) >= MAX_CODE_LENS_EXECUTIONS
+    echo '[SimpleCC] Too many CodeLens commands are pending; wait for a result or refresh code lenses.'
+    return
+  endif
+  var id = NextId()
+  s_codelens_executions[string(id)] = {context: deepcopy(cached.context),
+    generation: cached.generation}
+  Send({type: 'codeLens/execute', id: id,
+    languageId: cached.context.filetype, uri: cached.context.uri,
+    generation: cached.generation, index: lens.index})
 enddef
 
 def OnCodeLensExecute(ev: dict<any>)
-  # If there's a workspace edit, it will come as applyEdit
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_codelens_executions, key)
+    return
+  endif
+  var execution = remove(s_codelens_executions, key)
+  if !s_initialized || !LiveDecorationContext(execution.context)
+    || get(ev, 'generation', 0) != execution.generation
+    || get(ev, 'uri', '') !=# execution.context.uri
+    Log('code lens: discarded stale execution response')
+    return
+  endif
+  # A command's returned workspace edit has its own event. It cannot fall
+  # through the generic applyEdit path after its pending context was retired.
+  if has_key(ev, 'edit')
+    OnApplyEdit(ev)
+  endif
   Log('code lens executed')
 enddef
 

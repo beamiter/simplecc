@@ -69,6 +69,29 @@ If a server is already installed system-wide, no managed installation is
 needed. SimpleCC resolves managed installations first and then searches
 <code>PATH</code>.
 
+### CodeLens and virtual text in a native Vim host
+
+`SimpleCCCodeLens` refreshes bounded, single-line annotations after source text.
+`SimpleCCCodeLensRun` executes a lens for the document snapshot that supplied it.
+A buffer switch, edit, filetype change, newer lens request, server refresh or daemon
+restart invalidates that snapshot. The daemon validates both the reply generation
+and document URI before resolving/executing an index; empty results clear old
+annotations. Update and rebuild the daemon together with the Vim plugin. A new
+plugin can display an old daemon's reply, but refuses index-only execution and
+asks you to rebuild the daemon.
+
+Native hosts can subscribe to `User SimpleCCDecorationsChanged` after CodeLens,
+inlay hints or virtual diagnostics are added, replaced or cleared. Anvil, Forge,
+Ember and Frost can use their native surface for single-line after-text CodeLens
+and virtual diagnostics. Inline inlay hints continue to use Vim's compatibility
+view. Existing `g:simplecc_inlay_hints` and `g:simplecc_virtual_diag` preferences
+remain in control; no host is required for ordinary Vim.
+
+`SimpleCCInlayHints` toggles the effective option even when a configuration starts
+it at zero. Switching it off clears hints in all loaded buffers and invalidates
+pending replies. Per-buffer caches retain their source revision, so switching
+buffers cannot restore another file's hints or an edited file's old hints.
+
 ## Configuration
 
 Set an explicit configuration before the plugin loads:
