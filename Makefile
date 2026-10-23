@@ -27,6 +27,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/viewport_hints.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_options.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_popups.vim
+	vim -Nu NONE -n -i NONE -es -S test/native_popup_cards.vim
 	vim -Nu NONE -n -i NONE -es -S test/decorations.vim
 	vim -Nu NONE -n -i NONE -es -S test/health_doctor.vim
 	vim -Nu NONE -n -i NONE -es -S test/change_sync.vim
