@@ -84,6 +84,8 @@ pub struct CodeAction {
 /// Signature help.
 #[derive(Debug, Clone, Serialize)]
 pub struct SignatureInfo {
+    pub overload_index: usize,
+    pub overload_count: usize,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
@@ -94,6 +96,8 @@ pub struct SignatureInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ParameterInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<[usize; 2]>,
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
@@ -103,34 +107,66 @@ pub struct ParameterInfo {
 /// and current Vim clients display the first entry, so no protocol bump is
 /// needed to honor the server's activeSignature decision.
 pub(crate) fn from_lsp_signature_help(mut help: lsp_types::SignatureHelp) -> Vec<SignatureInfo> {
-    let active = help.active_signature.unwrap_or(0) as usize;
+    let count = help.signatures.len();
+    let requested = help.active_signature.unwrap_or(0) as usize;
+    let active = if requested < count { requested } else { 0 };
     if active > 0 && active < help.signatures.len() {
         let selected = help.signatures.remove(active);
         help.signatures.insert(0, selected);
     }
     help.signatures
         .into_iter()
-        .map(|sig| {
+        .enumerate()
+        .map(|(position, sig)| {
+            let mut search_from = sig.label.find('(').map_or(0, |at| at + 1);
             let parameters = sig
                 .parameters
                 .unwrap_or_default()
                 .into_iter()
                 .map(|parameter| {
-                    let label = match parameter.label {
-                        lsp_types::ParameterLabel::Simple(label) => label,
+                    let (label, byte_range) = match parameter.label {
+                        lsp_types::ParameterLabel::Simple(label) => {
+                            let range = sig
+                                .label
+                                .get(search_from..)
+                                .and_then(|tail| tail.find(&label))
+                                .filter(|_| !label.is_empty())
+                                .map(|offset| {
+                                    [search_from + offset, search_from + offset + label.len()]
+                                });
+                            if let Some([_, end]) = range {
+                                search_from = end;
+                            }
+                            (label, range)
+                        }
                         lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
-                            signature_label_slice(&sig.label, start, end)
-                                .unwrap_or_default()
-                                .to_owned()
+                            let slice = signature_label_slice(&sig.label, start, end);
+                            let range = slice.map(|part| {
+                                let start = part.as_ptr() as usize - sig.label.as_ptr() as usize;
+                                [start, start + part.len()]
+                            });
+                            if let Some([_, end]) = range {
+                                search_from = end;
+                            }
+                            (slice.unwrap_or_default().to_owned(), range)
                         }
                     };
                     ParameterInfo {
                         label,
+                        byte_range,
                         documentation: extract_doc(&parameter.documentation),
                     }
                 })
                 .collect();
             SignatureInfo {
+                overload_index: if position == 0 {
+                    active
+                } else if position <= active {
+                    position - 1
+                } else {
+                    position
+                },
+                overload_count: count,
                 label: sig.label,
                 documentation: extract_doc(&sig.documentation),
                 active_parameter: sig.active_parameter.or(help.active_parameter),
@@ -779,6 +815,19 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn signature_help_mixed_parameter_labels_keep_repeated_arguments_distinct() {
+        let help = serde_json::from_value(json!({
+            "signatures": [{"label": "f(x,x)", "parameters": [
+                {"label": [2, 3]}, {"label": "x"}
+            ]}]
+        }))
+        .unwrap();
+        let signatures = super::from_lsp_signature_help(help);
+        assert_eq!(signatures[0].parameters[0].byte_range, Some([2, 3]));
+        assert_eq!(signatures[0].parameters[1].byte_range, Some([4, 5]));
+    }
+
+    #[test]
     fn signature_help_selects_the_active_overload_and_its_parameter() {
         let help = serde_json::from_value(json!({
             "signatures": [
@@ -809,6 +858,31 @@ mod tests {
             Some("right parameter")
         );
         assert_eq!(signatures[1].active_parameter, Some(0));
+    }
+
+    #[test]
+    fn signature_help_preserves_original_overload_and_repeated_parameter_ranges() {
+        let label = "函数(参数😀, 参数😀)";
+        let help = serde_json::from_value(json!({
+            "signatures": [{"label": "first()"}, {"label": label,
+                "parameters": [{"label": "参数😀"}, {"label": "参数😀"}]}],
+            "activeSignature": 1, "activeParameter": 1
+        }))
+        .unwrap();
+        let signatures = super::from_lsp_signature_help(help);
+        assert_eq!(signatures[0].overload_index, 1);
+        assert_eq!(signatures[0].overload_count, 2);
+        assert_eq!(signatures[1].overload_index, 0);
+        let start = label.rfind("参数😀").unwrap();
+        assert_eq!(
+            signatures[0].parameters[1].byte_range,
+            Some([start, start + "参数😀".len()])
+        );
+        let encoded = serde_json::to_value(&signatures[0]).unwrap();
+        assert_eq!(
+            encoded["parameters"][1]["byte_range"],
+            json!([start, start + "参数😀".len()])
+        );
     }
 
     #[test]
@@ -846,6 +920,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["界", "🦀", "é", "", "", "", "", "plain label"]
         );
+        for parameter in &signatures[0].parameters {
+            if let Some([start, end]) = parameter.byte_range {
+                assert_eq!(
+                    signatures[0].label.get(start..end),
+                    Some(parameter.label.as_str())
+                );
+            } else {
+                assert!(parameter.label.is_empty() || parameter.label == "plain label");
+            }
+        }
     }
 
     fn item(label: &str, sort_text: Option<&str>) -> lsp_types::CompletionItem {

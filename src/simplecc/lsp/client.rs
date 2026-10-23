@@ -325,6 +325,7 @@ fn parse_registrations(
 /// mutex before awaiting a slow language-server request.
 #[derive(Clone)]
 pub struct LspClient {
+    file_operation_root: String,
     transport: Arc<Mutex<LspTransport>>,
     next_id: Arc<AtomicI64>,
     /// Pending requests: jsonrpc id -> oneshot sender
@@ -515,6 +516,7 @@ impl LspClient {
         });
 
         let mut client = Self {
+            file_operation_root: root_uri.to_string(),
             transport,
             next_id: Arc::new(AtomicI64::new(1)),
             pending,
@@ -1360,6 +1362,75 @@ impl LspClient {
         Ok(actions)
     }
 
+    /// Saving must never run commands or edit another document. Ask only for
+    /// organizeImports and resolve a single, unambiguous edit-only action.
+    pub async fn organize_imports(&self, uri: &str) -> Result<Vec<types::TextEdit>> {
+        let result = self.request("textDocument/codeAction", json!({
+            "textDocument": {"uri": uri},
+            "range": {"start": {"line": 0, "character": 0},
+                      "end": {"line": 0, "character": 0}},
+            "context": {"diagnostics": [], "only": ["source.organizeImports"], "triggerKind": 1},
+        })).await?;
+        let actions: Vec<lsp_types::CodeActionOrCommand> = if result.is_null() {
+            vec![]
+        } else {
+            serde_json::from_value(result)?
+        };
+        let mut candidates = vec![];
+        for item in actions {
+            if matches!(&item, lsp_types::CodeActionOrCommand::Command(_)) {
+                bail!("save refuses command-only organizeImports; use CodeAction manually");
+            }
+            if let lsp_types::CodeActionOrCommand::CodeAction(action) = item {
+                let kind = action.kind.as_ref().map(|k| k.as_str()).unwrap_or("");
+                if (kind == "source.organizeImports" || kind.starts_with("source.organizeImports."))
+                    && action.disabled.is_none()
+                {
+                    candidates.push(action);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        if candidates.len() != 1 {
+            bail!("ambiguous organizeImports actions; use CodeAction manually");
+        }
+        let mut action = candidates.remove(0);
+        if action.edit.is_none() && action.command.is_none() {
+            action = serde_json::from_value(
+                self.request("codeAction/resolve", serde_json::to_value(&action)?)
+                    .await?,
+            )?;
+        }
+        let resolved_kind = action.kind.as_ref().map(|kind| kind.as_str()).unwrap_or("");
+        if action.disabled.is_some()
+            || !(resolved_kind == "source.organizeImports"
+                || resolved_kind.starts_with("source.organizeImports."))
+        {
+            bail!("resolved action is not an enabled organizeImports action");
+        }
+        if action.command.is_some() {
+            bail!("save refuses organizeImports server commands; use CodeAction manually");
+        }
+        let Some(edit) = action.edit else {
+            return Ok(vec![]);
+        };
+        let flat = types::from_lsp_workspace_edit(&edit);
+        if flat.operations.iter().any(|operation| {
+            !matches!(operation,
+            types::WorkspaceOperation::Edit { uri: target, .. } if target == uri)
+        }) || flat.changes.iter().any(|change| change.uri != uri)
+        {
+            bail!("save refuses cross-file organizeImports edits");
+        }
+        Ok(flat
+            .changes
+            .into_iter()
+            .flat_map(|change| change.edits)
+            .collect())
+    }
+
     pub async fn execute_code_action(
         &self,
         generation: u64,
@@ -1637,6 +1708,100 @@ impl LspClient {
             placeholder,
             default_behavior: false,
         }))
+    }
+
+    /// Static registration only: dynamicRegistration is explicitly false.
+    /// Match the old URI (including directory filters) before sending anything.
+    pub async fn matches_file_rename(&self, uri: &str, directory: bool, will: bool) -> bool {
+        let Ok(uri) = url::Url::parse(uri) else {
+            return false;
+        };
+        let Ok(root) = url::Url::parse(&self.file_operation_root) else {
+            return false;
+        };
+        if relative_uri_path(&root, &uri).is_none() {
+            return false;
+        }
+        let caps = self.capabilities.lock().await;
+        let value = serde_json::to_value(caps.as_ref()).unwrap_or_default();
+        let key = if will { "willRename" } else { "didRename" };
+        let Some(filters) = value
+            .pointer(&format!("/workspace/fileOperations/{key}/filters"))
+            .and_then(Value::as_array)
+        else {
+            return false;
+        };
+        filters.iter().any(|filter| {
+            if filter
+                .get("scheme")
+                .and_then(Value::as_str)
+                .is_some_and(|scheme| scheme != uri.scheme())
+            {
+                return false;
+            }
+            let pattern = &filter["pattern"];
+            if pattern["matches"]
+                .as_str()
+                .is_some_and(|kind| (kind == "folder") != directory)
+            {
+                return false;
+            }
+            let Some(glob) = pattern["glob"].as_str() else {
+                return false;
+            };
+            let mut builder = GlobBuilder::new(glob);
+            builder
+                .literal_separator(true)
+                .backslash_escape(false)
+                .case_insensitive(
+                    pattern
+                        .pointer("/options/ignoreCase")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                );
+            let path = uri
+                .to_file_path()
+                .ok()
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| uri.path().to_string());
+            builder
+                .build()
+                .is_ok_and(|glob| glob.compile_matcher().is_match(path))
+        })
+    }
+
+    pub async fn will_rename_files(
+        &self,
+        old: &str,
+        new: &str,
+    ) -> Result<Option<types::WorkspaceEdit>> {
+        let result = self
+            .request(
+                "workspace/willRenameFiles",
+                json!({"files": [{"oldUri": old, "newUri": new}]}),
+            )
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        // Versions must never be dropped by the normalized edit format.
+        if result
+            .get("documentChanges")
+            .and_then(Value::as_array)
+            .is_some_and(|ops| {
+                ops.iter().any(|op| {
+                    !op.pointer("/textDocument/version")
+                        .unwrap_or(&Value::Null)
+                        .is_null()
+                })
+            })
+        {
+            anyhow::bail!(
+                "versioned rename edits require a version-aware preview; operation canceled"
+            );
+        }
+        let edit: lsp_types::WorkspaceEdit = serde_json::from_value(result)?;
+        Ok(Some(types::from_lsp_workspace_edit(&edit)))
     }
 
     pub async fn rename(
@@ -3817,6 +3982,12 @@ fn client_capabilities() -> ClientCapabilities {
             show_document: Some(ShowDocumentClientCapabilities { support: true }),
         }),
         workspace: Some(WorkspaceClientCapabilities {
+            file_operations: Some(lsp_types::WorkspaceFileOperationsClientCapabilities {
+                dynamic_registration: Some(false),
+                will_rename: Some(true),
+                did_rename: Some(true),
+                ..Default::default()
+            }),
             apply_edit: Some(true),
             workspace_edit: Some(WorkspaceEditClientCapabilities {
                 document_changes: Some(true),
@@ -4446,6 +4617,193 @@ while True:
         assert_eq!(
             client.request("test/executions", json!({})).await.unwrap(),
             json!(0)
+        );
+        client.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod save_pipeline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn imports_are_filtered_edit_only_and_never_execute_commands() {
+        let server = r#"
+import json,sys
+executions=0
+def send(v):
+    body=json.dumps(dict(jsonrpc='2.0',**v)).encode()
+    sys.stdout.buffer.write(b'Content-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body);sys.stdout.buffer.flush()
+while True:
+    h={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if line in (b'\r\n',b'\n'): break
+        k,v=line.decode().split(':',1);h[k.lower()]=v.strip()
+    m=json.loads(sys.stdin.buffer.read(int(h['content-length'])));p=m.get('params',{});method=m.get('method')
+    if method=='initialize': send(dict(id=m['id'],result={'capabilities':{'codeActionProvider':{'resolveProvider':True}}}))
+    elif method=='textDocument/codeAction':
+        assert p['context']['only']==['source.organizeImports']
+        uri=p['textDocument']['uri']
+        action={'title':'Imports','kind':'source.organizeImports'}
+        if 'resolve' in uri: action['data']={'uri':uri}
+        elif 'command' in uri: action['command']={'title':'Run','command':'dangerous'}
+        else:
+            target='file:///other.rs' if 'cross' in uri else uri
+            action['edit']={'changes':{target:[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':0}},'newText':'use x;'}]}}
+        actions=[action,action] if 'ambiguous' in uri else [action]
+        send(dict(id=m['id'],result=actions))
+    elif method=='codeAction/resolve':
+        uri=p['data']['uri'];p['edit']={'changes':{uri:[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':0}},'newText':'resolved'}]}}
+        send(dict(id=m['id'],result=p))
+    elif method=='workspace/executeCommand': executions+=1;send(dict(id=m['id'],result=None))
+    elif method=='test/executions': send(dict(id=m['id'],result=executions))
+    elif method=='shutdown': send(dict(id=m['id'],result=None))
+    elif method=='exit': break
+"#;
+        let (client, _events) = LspClient::start(
+            "save-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.organize_imports("file:///normal.rs").await.unwrap()[0].new_text,
+            "use x;"
+        );
+        assert_eq!(
+            client.organize_imports("file:///resolve.rs").await.unwrap()[0].new_text,
+            "resolved"
+        );
+        for uri in [
+            "file:///command.rs",
+            "file:///cross.rs",
+            "file:///ambiguous.rs",
+        ] {
+            assert!(client.organize_imports(uri).await.is_err(), "{uri}");
+        }
+        assert_eq!(
+            client.request("test/executions", json!({})).await.unwrap(),
+            json!(0)
+        );
+        client.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod file_rename_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn file_rename_transport_filters_directories_and_previews_text_edits() {
+        let server = r#"
+import json,sys
+renamed=[]
+def send(v):
+    b=json.dumps(dict(jsonrpc='2.0',**v)).encode()
+    sys.stdout.buffer.write(b'Content-Length: '+str(len(b)).encode()+b'\r\n\r\n'+b);sys.stdout.buffer.flush()
+while True:
+    h={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if line in (b'\r\n',b'\n'): break
+        k,v=line.decode().split(':',1);h[k.lower()]=v.strip()
+    m=json.loads(sys.stdin.buffer.read(int(h['content-length'])))
+    method=m.get('method'); p=m.get('params',{})
+    if method=='initialize':
+        assert p['capabilities']['workspace']['fileOperations']['willRename']
+        assert not p['capabilities']['workspace']['fileOperations']['dynamicRegistration']
+        filters=[{'scheme':'file','pattern':{'glob':'**/*.py','matches':'file'}},{'scheme':'file','pattern':{'glob':'**/pkg','matches':'folder'}}]
+        send(dict(id=m['id'], result={'capabilities':{'workspace':{'fileOperations':{'willRename':{'filters':filters},'didRename':{'filters':filters}}}}}))
+    elif method=='workspace/willRenameFiles':
+        old=p['files'][0]['oldUri']
+        if old.endswith('versioned.py'):
+            result={'documentChanges':[{'textDocument':{'uri':old,'version':3},'edits':[]}]}
+        else:
+            result={'changes':{'file:///tmp/consumer.py':[{'range':{'start':{'line':0,'character':0},'end':{'line':0,'character':3}},'newText':'new'}]}}
+        send(dict(id=m['id'],result=result))
+    elif method=='workspace/didRenameFiles': renamed=p['files']
+    elif method=='test/renamed': send(dict(id=m['id'],result=renamed))
+    elif method=='shutdown': send(dict(id=m['id'],result=None))
+    elif method=='exit': break
+"#;
+        let (client, _events) = LspClient::start(
+            "rename-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            client
+                .matches_file_rename("file:///tmp/old.py", false, true)
+                .await
+        );
+        assert!(
+            client
+                .matches_file_rename("file:///tmp/pkg", true, true)
+                .await
+        );
+        assert!(
+            !client
+                .matches_file_rename("file:///tmp/pkg", false, true)
+                .await
+        );
+        assert!(
+            !client
+                .matches_file_rename("file:///tmp/old.py", true, true)
+                .await
+        );
+        assert!(
+            !client
+                .matches_file_rename("file:///elsewhere/old.py", false, true)
+                .await
+        );
+        assert!(
+            !client
+                .matches_file_rename("file:///tmp/old.rs", false, true)
+                .await
+        );
+        let edit = client
+            .will_rename_files("file:///tmp/old.py", "file:///tmp/new.py")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edit.changes[0].uri, "file:///tmp/consumer.py");
+        assert_eq!(edit.changes[0].edits[0].new_text, "new");
+        assert!(
+            client
+                .will_rename_files("file:///tmp/versioned.py", "file:///tmp/new.py")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("version-aware preview")
+        );
+        client
+            .notify(
+                "workspace/didRenameFiles",
+                json!({"files":[{"oldUri":"file:///tmp/old.py","newUri":"file:///tmp/new.py"}]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.request("test/renamed", Value::Null).await.unwrap()[0]["newUri"],
+            "file:///tmp/new.py"
         );
         client.shutdown().await.unwrap();
     }

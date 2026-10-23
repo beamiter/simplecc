@@ -178,7 +178,9 @@ var s_dochl_requests: dict<dict<any>> = {}
 var s_format_requests: dict<dict<any>> = {}
 var s_action_requests: dict<dict<any>> = {}
 var s_action_popup = 0
+var s_save_pipeline = false
 var s_action_identity = false
+var s_file_rename = false
 var s_action_executions: dict<dict<any>> = {}
 # Window/buffer context for asynchronous location requests.  LSP replies can
 # arrive after the user has moved to another split, so navigation must not use
@@ -312,6 +314,7 @@ def OnDaemonExit(code: number, restarting: bool)
   s_format_requests = {}
   s_action_requests = {}
   s_action_identity = false
+  s_file_rename = false
   s_action_executions = {}
   CloseActionMenu()
   # The replacement daemon has no open documents; the replay in the
@@ -402,7 +405,9 @@ def OnBackendEvent(ev: dict<any>)
   var id = get(ev, 'id', 0)
 
   if ev.type ==# 'initialized'
+    s_save_pipeline = get(get(ev, 'capabilities', {}), 'save_pipeline', false) == true
     s_action_identity = get(get(ev, 'capabilities', {}), 'code_action_identity', false) == true
+    s_file_rename = get(get(ev, 'capabilities', {}), 'file_rename', false) == true
     s_initialized = true
     s_initializing = false
     s_initialize_id = 0
@@ -1870,7 +1875,7 @@ def PopupCardLines(lines: list<string>, width: number): list<string>
 enddef
 
 def CreateTextPopup(lines: list<string>, options: dict<any>, kind: string,
-    atcursor: bool = true): number
+    atcursor: bool = true, spans: list<dict<any>> = []): number
   var rendered = lines
   if PopupCards()
     var width = max([1, min([get(options, 'maxwidth', 80), &columns - 5])])
@@ -1883,6 +1888,7 @@ def CreateTextPopup(lines: list<string>, options: dict<any>, kind: string,
   endif
   var winid = atcursor ? popup_atcursor(rendered, options) : popup_create(rendered, options)
   if winid > 0
+    simplecc#docs#Decorate(winid, lines, spans)
     setwinvar(winid, 'simplecc_popup_kind', kind)
     setwinvar(winid, 'jterm_native_popup', 1)
     if PopupCards()
@@ -1937,6 +1943,21 @@ export def PopupScroll(amount: number)
     popup_setoptions(id, {firstline: max([1, min([last, position.firstline + step])])})
   endfor
   NativePopupsChanged()
+enddef
+
+export def DocPin(): number
+  var windows = VisibleOwnedPopups()
+  if empty(windows)
+    echo 'No SimpleCC documentation is visible'
+    return 0
+  endif
+  # Signature takes priority when several passive cards coexist.
+  var id = index(windows, s_sig_popup) >= 0 ? s_sig_popup : windows[0]
+  var pinned = simplecc#docs#Pin(id)
+  if pinned > 0
+    PopupClose()
+  endif
+  return pinned
 enddef
 
 export def PopupClose()
@@ -3073,6 +3094,11 @@ enddef
 # Rename
 # ═════════════════════════════════════════════════════════
 
+# True only for the current initialized daemon, never guessed from version.
+export def FileRenameAvailable(): bool
+  return s_initialized && s_file_rename
+enddef
+
 export def Rename()
   if !s_initialized
     echom '[SimpleCC] not initialized'
@@ -3193,11 +3219,36 @@ def OnSignatureHelp(ev: dict<any>)
   var sig = sigs[0]
   var label = get(sig, 'label', '')
   var lines = [label]
+  var spans: list<dict<any>> = []
+  var overload_count = get(sig, 'overload_count', len(sigs))
+  if overload_count > 1
+    add(lines, printf('Overload %d / %d', get(sig, 'overload_index', 0) + 1, overload_count))
+  endif
 
   var params = get(sig, 'parameters', [])
   var active = get(sig, 'active_parameter', -1)
   if active >= 0 && active < len(params)
     var plabel = get(params[active], 'label', '')
+    var byte_range = get(params[active], 'byte_range', [])
+    if type(byte_range) == v:t_list && len(byte_range) == 2
+        && type(byte_range[0]) == v:t_number && type(byte_range[1]) == v:t_number
+        && byte_range[0] >= 0 && byte_range[1] > byte_range[0]
+        && strpart(label, byte_range[0], byte_range[1] - byte_range[0]) ==# plabel
+      add(spans, {line: 1, start: byte_range[0], end: byte_range[1]})
+    else
+      # Older daemons lack offsets. Resolve each repeated label in order.
+      var after = stridx(label, '(') + 1
+      for n in range(active + 1)
+        var parameter_label = get(params[n], 'label', '')
+        var at = parameter_label ==# '' ? -1 : stridx(label, parameter_label, after)
+        if at >= 0
+          after = at + strlen(parameter_label)
+          if n == active
+            add(spans, {line: 1, start: at, end: after})
+          endif
+        endif
+      endfor
+    endif
     var pdoc = get(params[active], 'documentation', '')
     if pdoc !=# ''
       add(lines, '')
@@ -3224,7 +3275,7 @@ def OnSignatureHelp(ev: dict<any>)
     moved: [0, 0, 0],
     close: 'none',
     callback: (id, result) => DocumentationPopupClosed('signature', id, result),
-  }, 'signature')
+  }, 'signature', true, spans)
   NativeTextPopup(s_sig_popup)
 enddef
 
@@ -8270,4 +8321,19 @@ def FindNearestJuliaEnvironment(): string
     dir = fnamemodify(dir, ':h')
   endwhile
   return ''
+enddef
+
+# Narrow callback interface: no normal formatting/action dispatcher can apply
+# these replies. The save controller alone owns their document/tick guards.
+export def SaveRequest(kind: string, Cb: func, timeout: number)
+  if !s_initialized || !s_save_pipeline
+    Cb({type: 'error', message: 'update/start SimpleCC daemon for save pipeline'})
+    return
+  endif
+  EnsureDocumentOpened()
+  OnTextChanged()
+  FlushDidChange(bufnr('%'))
+  simplecc#core#Request({type: 'textDocument/' .. kind, id: NextId(),
+    uri: BufUri(), languageId: BufFt(), tab_size: &tabstop,
+    insert_spaces: &expandtab}, Cb, timeout)
 enddef

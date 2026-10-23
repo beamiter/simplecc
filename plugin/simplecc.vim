@@ -109,6 +109,8 @@ command! -nargs=? -complete=dir SimpleCCJuliaActivate simplecc#JuliaActivateEnvi
 command! -nargs=0 SimpleCCJuliaRefresh  simplecc#JuliaRefreshLanguageServer()
 command! -nargs=1 SimpleCCPopupScroll simplecc#PopupScrollCommand(<q-args>)
 command! -nargs=0 SimpleCCPopupClose simplecc#PopupClose()
+command! -nargs=0 SimpleCCDocPin simplecc#DocPin()
+highlight default link SimpleCCActiveParameter IncSearch
 highlight default link SimpleCCPopupCard Pmenu
 command! -nargs=0 SimpleCCHover         simplecc#Hover()
 command! -nargs=0 SimpleCCDefinition    simplecc#Definition()

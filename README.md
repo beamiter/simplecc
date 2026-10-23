@@ -563,3 +563,32 @@ Malformed offsets that split a surrogate pair do not produce a partial label.
 For conditional mappings, `simplecc#PopupVisible()` is read-only, and
 `simplecc#PopupScrollKey(1, "\<C-f>")` returns a three-line scroll command when
 one is visible, or the supplied fallback key otherwise; use `-1` for backwards.
+
+Documentation can be pinned with `:SimpleCCDocPin` into a real read-only Vim
+split. It keeps the original unwrapped text, fenced code syntax and active
+parameter highlight; `/` searches and normal yank commands copy text. The
+source buffer and undo history stay intact; `:close` wipes the scratch viewer.
+Signature help shows the selected overload number and highlights its active
+parameter through `SimpleCCActiveParameter` (default: `IncSearch`). Known fenced
+languages use installed Vim syntax files; unsupported languages remain literal.
+### Explicit asynchronous save pipeline
+
+`call simplecc#save#Start({'format': v:true, 'imports': v:true, 'timeout_ms': 3000})`
+formats, requests `source.organizeImports`, then uses ordinary `:write` (including
+remote `BufWriteCmd`). This is an explicit normal-mode entry point, never a
+`BufWritePre` hook. Vimrc's `VimrcSave` supplies project/filetype opt-in policy.
+Each callback owns its buffer, window, name and changedtick; a newer save,
+new input, a focus change, a timeout or an LSP error stops the pipeline without
+writing. Already applied edits remain modified for inspection. Readonly,
+nonmodifiable, unnamed, special and protected large-file buffers are refused.
+Undo/view state is preserved; normal `:write` remains unchanged.
+
+Automatic imports accept a single edit-only action for the current document.
+The daemon sends `context.only = ['source.organizeImports']`; command-only,
+command-bearing, ambiguous, cross-file and resource operations fail visibly.
+Commands are never automatically run or retried. Deferred actions may resolve
+only into edits. The negotiated `save_pipeline` capability prevents older
+daemons from ignoring the restricted request. Remote transport reports actual
+write completion; the controller does not announce premature success.
+
+`make vim-check` also runs `python3 test/save_insert_pty.py`: a standard-library PTY regression for Insert Ctrl-S, completion preservation, deferred-save cleanup and typing races (Linux/macOS, Python 3 and Vim required).

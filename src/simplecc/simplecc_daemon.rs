@@ -188,6 +188,13 @@ enum Request {
         #[serde(default)]
         diagnostics: Value,
     },
+    #[serde(rename = "textDocument/organizeImports")]
+    OrganizeImports {
+        id: u64,
+        uri: String,
+        #[serde(rename = "languageId")]
+        language_id: String,
+    },
     #[serde(rename = "textDocument/executeAction")]
     ExecuteAction {
         id: u64,
@@ -224,6 +231,17 @@ enum Request {
         tab_size: u32,
         #[serde(default = "default_true")]
         insert_spaces: bool,
+    },
+    #[serde(rename = "workspace/fileRename")]
+    FileRename {
+        id: u64,
+        old: String,
+        new: String,
+        directory: bool,
+        #[serde(default)]
+        phase: String,
+        #[serde(default)]
+        identity: String,
     },
     #[serde(rename = "textDocument/prepareRename")]
     PrepareRename {
@@ -1076,7 +1094,7 @@ async fn handle_request(
 
             send_event!(
                 &out,
-                json!({"type": "initialized", "id": id, "capabilities": {"code_action_identity": true}})
+                json!({"type": "initialized", "id": id, "capabilities": {"code_action_identity": true, "save_pipeline": true, "file_rename": true}})
             );
         }
 
@@ -1526,6 +1544,25 @@ async fn handle_request(
             }
         }
 
+        Request::OrganizeImports {
+            id,
+            uri,
+            language_id,
+        } => {
+            if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
+                match client.organize_imports(&uri).await {
+                    Ok(edits) => send_event!(
+                        &out,
+                        json!({"type": "organizeImports", "id": id, "edits": edits})
+                    ),
+                    Err(e) => send_event!(
+                        &out,
+                        json!({"type": "error", "id": id, "message": e.to_string()})
+                    ),
+                }
+            }
+        }
+
         Request::ExecuteAction {
             id,
             generation,
@@ -1613,6 +1650,78 @@ async fn handle_request(
                     ),
                 }
             }
+        }
+
+        Request::FileRename {
+            id,
+            old,
+            new,
+            directory,
+            phase,
+            identity,
+        } => {
+            let clients = registry
+                .read()
+                .await
+                .as_ref()
+                .map(|r| r.active_clients())
+                .unwrap_or_default();
+            let mut keys: Vec<String> = clients
+                .iter()
+                .map(|c| format!("{:p}", Arc::as_ptr(c)))
+                .collect();
+            keys.sort();
+            let current = keys.join("|");
+            if phase != "prepare" && identity != current {
+                send_event!(
+                    &out,
+                    json!({"type":"error", "id":id, "message":"language-server connection changed; rename canceled"})
+                );
+                return;
+            }
+            let mut edits = Vec::new();
+            let mut supported = false;
+            for client in clients {
+                let will = client.matches_file_rename(&old, directory, true).await;
+                let did = client.matches_file_rename(&old, directory, false).await;
+                supported |= will || did;
+                if phase == "prepare" && will {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(4),
+                        client.will_rename_files(&old, &new),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(edit))) => edits.push(edit),
+                        Ok(Ok(None)) => {}
+                        other => {
+                            send_event!(
+                                &out,
+                                json!({"type":"error", "id":id, "message":format!("willRenameFiles failed: {other:?}; rename canceled")})
+                            );
+                            return;
+                        }
+                    }
+                } else if phase == "did"
+                    && did
+                    && let Err(error) = client
+                        .notify(
+                            "workspace/didRenameFiles",
+                            json!({"files":[{"oldUri":old,"newUri":new}]}),
+                        )
+                        .await
+                {
+                    send_event!(
+                        &out,
+                        json!({"type":"error", "id":id, "message":error.to_string()})
+                    );
+                    return;
+                }
+            }
+            send_event!(
+                &out,
+                json!({"type":"fileRename", "id":id, "identity":current, "supported":supported, "edits":edits})
+            );
         }
 
         Request::PrepareRename {

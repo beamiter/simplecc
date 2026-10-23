@@ -981,12 +981,24 @@ The SimpleCCPopupCard highlight defaults to Pmenu. To disable card styling:
 >
     let g:simplecc_popup_cards = 0
 <
-Markdown text is preserved; this option does not implement a Markdown renderer.
+Markdown text and fence delimiters are preserved. Supported fenced languages
+use installed Vim syntax files; unknown languages remain plain. Signature help
+shows the original overload number and highlights the active parameter through
+SimpleCCActiveParameter (defaults to IncSearch), including prewrapped text.
 Native cards expand tabs to spaces using source tab stops before wrapping.
 
 :SimpleCCPopupScroll {integer}                    *:SimpleCCPopupScroll*
         Scroll visible plugin text popups by a signed number of lines. Each
         request is clamped to -100..100 and the available content extent.
+:SimpleCCDocPin                                  *:SimpleCCDocPin*
+        Open the current documentation in a real, read-only scratch split.
+        Signature help takes priority if several cards are visible. The split
+        retains original unwrapped text, parameter highlights, fenced code
+        syntax and source buffer identity in b:simplecc_doc_origin. Use /, y
+        and normal Vim navigation; :close disposes the scratch buffer.
+        Source text, undo history and registers are preserved. This explicit
+        command focuses the split and closes passive documentation cards.
+        Unknown or unavailable fenced languages stay plain text.
 :SimpleCCPopupClose                              *:SimpleCCPopupClose*
         Close plugin text popups; leave workspace pickers and source untouched.
 

@@ -1,0 +1,3 @@
+# Legacy autoload functions require their matching runtime path (E746 in a temp copy).
+# Documentation-card runtime tests execute these functions in their real file.
+docs.vim

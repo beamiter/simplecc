@@ -16,6 +16,7 @@ test:
 	cargo test --locked
 
 vim-test:
+	vim -Nu NONE -n -i NONE -es -S test/file_rename.vim
 	vim -Nu NONE -n -i NONE -es -S test/vim9_smoke.vim
 	vim -Nu NONE -n -i NONE -es -S test/buffer_words.vim
 	vim -Nu NONE -n -i NONE -es -S test/completion_items.vim
@@ -24,11 +25,15 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/stale_props.vim
 	vim -Nu NONE -n -i NONE -es -S test/range_requests.vim
 	vim -Nu NONE -n -i NONE -es -S test/code_action_identity.vim
+	vim -Nu NONE -n -i NONE -es -S test/save_pipeline.vim
+	vim -Nu NONE -n -i NONE -es -S test/save_write_ack.vim
+	python3 test/save_insert_pty.py
 	vim -Nu NONE -n -i NONE -es -S test/resource_operations.vim
 	vim -Nu NONE -n -i NONE -es -S test/viewport_hints.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_options.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_popups.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_popup_cards.vim
+	vim -Nu NONE -n -i NONE -es -S test/documentation_viewer.vim
 	vim -Nu NONE -n -i NONE -es -S test/popup_request_lifecycle.vim
 	vim -Nu NONE -n -i NONE -es -S test/decorations.vim
 	vim -Nu NONE -n -i NONE -es -S test/health_doctor.vim
