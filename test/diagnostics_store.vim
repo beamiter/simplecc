@@ -233,6 +233,68 @@ augroup TestDiagnosticSnapshot
   autocmd!
 augroup END
 
+" Diagnostic motion opens its destination and behaves like a Vim jump.  Check
+" actual Ctrl-O navigation, rather than only inspecting the helper's calls.
+call setline(1, ['origin', 'two', 'three', 'four', '中😀target', 'six', 'seven', 'eight'])
+setlocal foldmethod=manual
+3,7fold
+call cursor(1, 2)
+clearjumps
+call setreg('"', 'diagnostic-motion-register')
+let s:text_before = getline(1, '$')
+let s:undo_before = undotree()
+let s:tags_before = gettagstack()
+let s:target = {'line': 4, 'character': 3, 'end_line': 4,
+      \ 'end_character': 4, 'severity': 1, 'message': 'folded Unicode target'}
+call s:Publish({'uri': s:file, 'server': 'motion', 'items': [s:target]})
+setlocal readonly nomodifiable buftype=acwrite
+call simplecc#DiagNext()
+call assert_equal([5, 8], [line('.'), col('.')], 'next uses UTF-16 columns')
+call assert_equal(-1, foldclosed(5), 'next exposes the folded diagnostic')
+execute "normal! \<C-O>"
+call assert_equal([1, 2], [line('.'), col('.')], 'Ctrl-O returns to diagnostic origin')
+" Next and previous wrapping use the same path, including an origin below
+" the only diagnostic. A same-position wrap does not create another jump.
+call cursor(8, 2)
+3,7fold
+clearjumps
+call simplecc#DiagNext()
+call assert_equal([5, 8], [line('.'), col('.')], 'next wraps to diagnostic')
+call assert_equal(-1, foldclosed(5), 'next wrap opens fold')
+execute "normal! \<C-O>"
+call assert_equal([8, 2], [line('.'), col('.')], 'next wrap preserves origin')
+call cursor(8, 2)
+3,7fold
+clearjumps
+call simplecc#DiagPrev()
+call assert_equal([5, 8], [line('.'), col('.')], 'previous uses UTF-16 columns')
+call assert_equal(-1, foldclosed(5), 'previous opens fold')
+execute "normal! \<C-O>"
+call assert_equal([8, 2], [line('.'), col('.')], 'previous preserves origin')
+call cursor(1, 2)
+3,7fold
+clearjumps
+call simplecc#DiagPrev()
+call assert_equal([5, 8], [line('.'), col('.')], 'previous wraps to diagnostic')
+call assert_equal(-1, foldclosed(5), 'previous wrap opens fold')
+execute "normal! \<C-O>"
+call assert_equal([1, 2], [line('.'), col('.')], 'previous wrap preserves origin')
+call cursor(5, 8)
+clearjumps
+let s:jumps_before = getjumplist()
+call simplecc#DiagNext()
+call simplecc#DiagPrev()
+call assert_equal(s:jumps_before, getjumplist(), 'same-position wrapping adds no history')
+call s:Publish({'uri': s:file, 'server': 'motion', 'items': []})
+call simplecc#DiagNext()
+call simplecc#DiagPrev()
+call assert_equal(s:jumps_before, getjumplist(), 'empty diagnostics add no history')
+call assert_equal(s:text_before, getline(1, '$'), 'navigation never edits text')
+call assert_equal(s:undo_before, undotree(), 'navigation preserves undo history')
+call assert_equal(s:tags_before, gettagstack(), 'diagnostics do not add symbol tags')
+call assert_equal('diagnostic-motion-register', getreg('"'), 'navigation preserves register')
+setlocal noreadonly modifiable buftype=
+
 " ------------------------------------------------------------------ cleanup ---
 
 " Closing the buffer drops its entire entry, whichever servers published it.

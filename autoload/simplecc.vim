@@ -3712,6 +3712,24 @@ def CompareDiagnosticNavigation(a: dict<any>, b: dict<any>): number
   return atext <# btext ? -1 : atext ==# btext ? 0 : 1
 enddef
 
+# Resolve through cursor() first so Vim clamps stale/out-of-range diagnostic
+# positions before deciding whether this is a real jump. Keep the tag stack
+# untouched: diagnostic motion is a context jump, not a symbol lookup.
+def JumpToDiagnostic(item: dict<any>)
+  var origin = getpos('.')
+  var target_line = get(item, 'line', 0) + 1
+  cursor(target_line,
+      Utf16LineColumn(getline(target_line), get(item, 'character', 0)))
+  var destination = getpos('.')
+  if destination != origin
+    setpos('.', origin)
+    normal! m'
+    setpos('.', destination)
+  endif
+  normal! zv
+  echo DiagMessage(item)
+enddef
+
 export def DiagNext(severity_name: string = '')
   if !ValidateNavigationSeverity(severity_name)
     return
@@ -3729,17 +3747,13 @@ export def DiagNext(severity_name: string = '')
     var item_line = get(item, 'line', 0)
     var item_character = get(item, 'character', 0)
     if item_line > cur_line || (item_line == cur_line && item_character > cur_character)
-      cursor(item.line + 1,
-          Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
-      echo DiagMessage(item)
+      JumpToDiagnostic(item)
       return
     endif
   endfor
   # Wrap around
   var first = sorted[0]
-  cursor(first.line + 1,
-      Utf16LineColumn(getline(first.line + 1), get(first, 'character', 0)))
-  echo DiagMessage(first)
+  JumpToDiagnostic(first)
 enddef
 
 export def DiagPrev(severity_name: string = '')
@@ -3759,17 +3773,13 @@ export def DiagPrev(severity_name: string = '')
     var item_line = get(item, 'line', 0)
     var item_character = get(item, 'character', 0)
     if item_line < cur_line || (item_line == cur_line && item_character < cur_character)
-      cursor(item.line + 1,
-          Utf16LineColumn(getline(item.line + 1), get(item, 'character', 0)))
-      echo DiagMessage(item)
+      JumpToDiagnostic(item)
       return
     endif
   endfor
   # Wrap around
   var last = sorted[0]
-  cursor(last.line + 1,
-      Utf16LineColumn(getline(last.line + 1), get(last, 'character', 0)))
-  echo DiagMessage(last)
+  JumpToDiagnostic(last)
 enddef
 
 def DiagnosticSource(item: dict<any>): string

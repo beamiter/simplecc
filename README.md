@@ -345,7 +345,9 @@ SimpleCC into the global quickfix list. The optional severity is one of
 example `:SimpleCCDiagnostics! error`. Both lists are sorted deterministically
 by path and position. `[d` and `]d` follow
 `g:simplecc_diag_min_severity`, including same-line diagnostics, and wrap in
-position order.
+position order. A diagnostic jump opens its destination fold and records the
+previous position for `Ctrl-O` / `Ctrl-I`, without changing the tag stack.
+An empty result or a diagnostic at the current position does not add a jump.
 
 The optional navigation severity is `all`, `error`, `warning`, `info`, or
 `hint`. With no argument, navigation keeps obeying
