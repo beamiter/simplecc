@@ -99,6 +99,67 @@ pub struct ParameterInfo {
     pub documentation: Option<String>,
 }
 
+/// Keep the selected overload first for the existing Vim wire format. Both old
+/// and current Vim clients display the first entry, so no protocol bump is
+/// needed to honor the server's activeSignature decision.
+pub(crate) fn from_lsp_signature_help(mut help: lsp_types::SignatureHelp) -> Vec<SignatureInfo> {
+    let active = help.active_signature.unwrap_or(0) as usize;
+    if active > 0 && active < help.signatures.len() {
+        let selected = help.signatures.remove(active);
+        help.signatures.insert(0, selected);
+    }
+    help.signatures
+        .into_iter()
+        .map(|sig| {
+            let parameters = sig
+                .parameters
+                .unwrap_or_default()
+                .into_iter()
+                .map(|parameter| {
+                    let label = match parameter.label {
+                        lsp_types::ParameterLabel::Simple(label) => label,
+                        lsp_types::ParameterLabel::LabelOffsets([start, end]) => {
+                            signature_label_slice(&sig.label, start, end)
+                                .unwrap_or_default()
+                                .to_owned()
+                        }
+                    };
+                    ParameterInfo {
+                        label,
+                        documentation: extract_doc(&parameter.documentation),
+                    }
+                })
+                .collect();
+            SignatureInfo {
+                label: sig.label,
+                documentation: extract_doc(&sig.documentation),
+                active_parameter: sig.active_parameter.or(help.active_parameter),
+                parameters,
+            }
+        })
+        .collect()
+}
+
+/// Parameter label offsets are UTF-16 units, even for a server that negotiates
+/// another document position encoding. Reject malformed surrogate boundaries
+/// instead of cutting a UTF-8 character or displaying unrelated bytes.
+fn signature_label_slice(label: &str, start: u32, end: u32) -> Option<&str> {
+    fn byte_offset(label: &str, offset: u32) -> Option<usize> {
+        let mut units = 0;
+        for (byte, ch) in label.char_indices() {
+            if units == offset as usize {
+                return Some(byte);
+            }
+            units += ch.len_utf16();
+            if units > offset as usize {
+                return None;
+            }
+        }
+        (units == offset as usize).then_some(label.len())
+    }
+    label.get(byte_offset(label, start)?..byte_offset(label, end)?)
+}
+
 /// Workspace edit for multi-file changes.
 ///
 /// `changes` is the flat text-edit view every release so far has sent, kept so
@@ -716,6 +777,76 @@ pub(crate) fn decode_uri(uri: &str) -> String {
 mod tests {
     use super::{decode_uri, parse_context_diagnostics, rank_completion_items};
     use serde_json::json;
+
+    #[test]
+    fn signature_help_selects_the_active_overload_and_its_parameter() {
+        let help = serde_json::from_value(json!({
+            "signatures": [
+                {"label": "first(a)", "parameters": [{"label": "a"}]},
+                {"label": "selected(x, y)", "activeParameter": 1,
+                 "documentation": "selected overload",
+                 "parameters": [{"label": "x"}, {"label": "y", "documentation": "right parameter"}]},
+                {"label": "third(z)"}
+            ],
+            "activeSignature": 1,
+            "activeParameter": 0
+        })).unwrap();
+        let signatures = super::from_lsp_signature_help(help);
+        assert_eq!(
+            signatures
+                .iter()
+                .map(|sig| sig.label.as_str())
+                .collect::<Vec<_>>(),
+            ["selected(x, y)", "first(a)", "third(z)"]
+        );
+        assert_eq!(signatures[0].active_parameter, Some(1));
+        assert_eq!(
+            signatures[0].documentation.as_deref(),
+            Some("selected overload")
+        );
+        assert_eq!(
+            signatures[0].parameters[1].documentation.as_deref(),
+            Some("right parameter")
+        );
+        assert_eq!(signatures[1].active_parameter, Some(0));
+    }
+
+    #[test]
+    fn signature_help_defaults_invalid_or_missing_active_signature_to_first() {
+        for active in [serde_json::Value::Null, json!(0), json!(99)] {
+            let help = serde_json::from_value(json!({
+                "signatures": [{"label": "first(a)"}, {"label": "second(b)"}],
+                "activeSignature": active
+            }))
+            .unwrap();
+            assert_eq!(super::from_lsp_signature_help(help)[0].label, "first(a)");
+        }
+        let empty =
+            serde_json::from_value(json!({"signatures": [], "activeSignature": 1})).unwrap();
+        assert!(super::from_lsp_signature_help(empty).is_empty());
+    }
+
+    #[test]
+    fn signature_help_parameter_offsets_use_utf16_not_utf8_bytes() {
+        let help = serde_json::from_value(json!({
+            "signatures": [{"label": "f(界, 🦀, é)", "parameters": [
+                {"label": [2, 3]}, {"label": [5, 7]}, {"label": [9, 11]},
+                {"label": [6, 7]}, {"label": [5, 6]},
+                {"label": [11, 9]}, {"label": [99, 100]},
+                {"label": "plain label"}
+            ]}]
+        }))
+        .unwrap();
+        let signatures = super::from_lsp_signature_help(help);
+        assert_eq!(
+            signatures[0]
+                .parameters
+                .iter()
+                .map(|parameter| parameter.label.as_str())
+                .collect::<Vec<_>>(),
+            ["界", "🦀", "é", "", "", "", "", "plain label"]
+        );
+    }
 
     fn item(label: &str, sort_text: Option<&str>) -> lsp_types::CompletionItem {
         lsp_types::CompletionItem {

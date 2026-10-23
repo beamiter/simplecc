@@ -298,6 +298,7 @@ augroup simplecc
   autocmd BufWritePost * simplecc#OnBufSave()
   autocmd BufUnload * simplecc#OnBufClose(str2nr(expand('<abuf>')))
   autocmd BufLeave * simplecc#OnBufLeave()
+  autocmd WinLeave * simplecc#OnPopupContextLeave()
   autocmd TextChanged,TextChangedI * simplecc#OnTextChanged()
   autocmd CursorMovedI * simplecc#OnCursorMovedI()
   autocmd CursorMoved * simplecc#OnCursorMoved()

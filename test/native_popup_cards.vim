@@ -13,6 +13,12 @@ runtime autoload/simplecc.vim
 let s:sid = getscriptinfo({'name': 'autoload/simplecc.vim'})[0].sid
 
 function! s:Call(name, ...) abort
+  if index(['OnHover', 'OnSignatureHelp'], a:name) >= 0
+    let s:request_id = get(s:, 'request_id', 0) + 1
+    let kind = a:name ==# 'OnHover' ? 'hover' : 'signature'
+    call call(function(printf('<SNR>%d_RememberPopupRequest', s:sid)), [kind, s:request_id])
+    let a:1.id = s:request_id
+  endif
   return call(function(printf('<SNR>%d_%s', s:sid, a:name)), a:000)
 endfunction
 

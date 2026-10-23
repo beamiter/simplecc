@@ -543,6 +543,14 @@ cards expand to spaces using the source buffer’s tab stops before wrapping.
 text popups; input is an integer and each step is limited to 100 lines.
 `:SimpleCCPopupClose` closes those text popups. Neither command changes the
 source buffer, focus or workspace-symbol picker. No default mappings are added.
+Pending hover and signature replies are tied to their source window, cursor and
+text snapshot. Moving, editing, leaving the window or insert mode, or closing a
+card cancels stale replies instead of reopening documentation at a new location.
+
+Signature help displays the server-selected overload. Parameter labels supplied
+as offsets use UTF-16 units, including CJK, emoji and combining text, as required
+by the [LSP signature-help contract](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#signatureHelp).
+Malformed offsets that split a surrogate pair do not produce a partial label.
 For conditional mappings, `simplecc#PopupVisible()` is read-only, and
 `simplecc#PopupScrollKey(1, "\<C-f>")` returns a three-line scroll command when
 one is visible, or the supplied fallback key otherwise; use `-1` for backwards.

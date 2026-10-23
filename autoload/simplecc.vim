@@ -127,6 +127,10 @@ var s_comp_resolved_items: dict<dict<any>> = {}
 var s_sig_popup: number = 0
 # Hover popup
 var s_hover_popup: number = 0
+# Only the newest request of each kind is retained. Replies belong to the
+# source snapshot, never to whichever window happens to be current later.
+var s_popup_requests: dict<dict<any>> = {}
+var s_closing_documentation_popup: bool = false
 # Diagnostics float popup
 var s_diag_popup: number = 0
 # Progress tracking
@@ -296,6 +300,7 @@ def OnDaemonExit(code: number, restarting: bool)
   s_stopping = false
   s_initialize_id = 0
   s_navigation_contexts = {}
+  s_popup_requests = {}
   s_inlay_requests = {}
   s_semtok_requests = {}
   s_codelens_requests = {}
@@ -536,6 +541,11 @@ def OnBackendEvent(ev: dict<any>)
     Log('[' .. get(ev, 'server', '') .. '] ' .. get(ev, 'message', ''))
 
   elseif ev.type ==# 'error'
+    for kind in keys(s_popup_requests)
+      if get(s_popup_requests[kind], 'id', 0) == id
+        remove(s_popup_requests, kind)
+      endif
+    endfor
     if id > 0 && id == s_initialize_id
       s_initializing = false
       s_initialize_id = 0
@@ -1620,6 +1630,7 @@ export def OnBufClose(buffer: number = 0)
 enddef
 
 export def OnTextChanged()
+  PrunePopupRequests()
   var pending_lens = !empty(filter(copy(s_codelens_executions),
     (_, execution) => execution.context.bufnr == bufnr('%')))
   # Text properties move with edits, but a moved hint/lens still describes an
@@ -1651,6 +1662,7 @@ enddef
 # ═════════════════════════════════════════════════════════
 
 export def OnCursorMovedI()
+  PrunePopupRequests()
   SnippetCheckRange()
   if !s_initialized || !g:simplecc_auto_complete
     return
@@ -1666,6 +1678,7 @@ enddef
 # insert mode and navigates away from it, and drop stale document highlights.
 # Cheap no-op otherwise.
 export def OnCursorMoved()
+  PrunePopupRequests()
   SnippetCheckRange()
   DocumentHighlightClear()
 enddef
@@ -1673,6 +1686,7 @@ enddef
 # Document highlights belong to the cursor position that requested them; leaving
 # the buffer makes them stale.
 export def OnBufLeave()
+  OnPopupContextLeave()
   # Leaving a buffer inside the debounce window is exactly when its edits used
   # to be dropped; flush them while this buffer is still the current one.
   FlushDidChange(bufnr('%'))
@@ -1680,6 +1694,7 @@ export def OnBufLeave()
 enddef
 
 export def OnInsertLeave()
+  s_popup_requests = {}
   CloseCompletionDocumentation()
   if s_comp_timer > 0
     timer_stop(s_comp_timer)
@@ -1907,9 +1922,10 @@ export def PopupScroll(amount: number)
 enddef
 
 export def PopupClose()
+  OnPopupContextLeave()
   for id in [s_hover_popup, s_sig_popup, s_diag_popup]
     if id > 0 && !empty(popup_getpos(id))
-      popup_close(id)
+      CloseDocumentationPopup(id)
     endif
   endfor
   s_hover_popup = 0
@@ -1928,7 +1944,7 @@ def ShowCompletionDocumentation(item: dict<any>)
 
   var closed = s_hover_popup > 0
   if closed
-    popup_close(s_hover_popup)
+    CloseDocumentationPopup(s_hover_popup)
     s_hover_popup = 0
   endif
   if text ==# '' || !pumvisible()
@@ -1957,7 +1973,7 @@ enddef
 # Completion documentation shares the hover slot; retire only its own kind.
 def CloseCompletionDocumentation()
   if s_hover_popup > 0 && getwinvar(s_hover_popup, 'simplecc_popup_kind', '') ==# 'completion_documentation'
-    popup_close(s_hover_popup)
+    CloseDocumentationPopup(s_hover_popup)
     s_hover_popup = 0
     NativePopupsChanged()
   endif
@@ -2543,6 +2559,79 @@ enddef
 # Hover
 # ═════════════════════════════════════════════════════════
 
+# Kept separate from sending so the same snapshot rules apply to manual and
+# debounced requests. A replacement overwrites the previous kind in constant space.
+def RememberPopupRequest(kind: string, id: number)
+  s_popup_requests[kind] = {
+    id: id, bufnr: bufnr('%'), winid: win_getid(),
+    tick: b:changedtick, position: getcurpos()[1 : 2],
+    insert: mode() =~# '^i',
+  }
+enddef
+
+def PopupRequestCurrent(context: dict<any>): bool
+  return !empty(context) && get(context, 'bufnr', -1) == bufnr('%')
+    && get(context, 'winid', -1) == win_getid()
+    && get(context, 'tick', -1) == b:changedtick
+    && get(context, 'position', []) == getcurpos()[1 : 2]
+    && get(context, 'insert', false) == (mode() =~# '^i')
+enddef
+
+def PrunePopupRequests()
+  for kind in keys(s_popup_requests)
+    if !PopupRequestCurrent(s_popup_requests[kind])
+      remove(s_popup_requests, kind)
+    endif
+  endfor
+enddef
+
+def TakePopupRequest(kind: string, ev: dict<any>): bool
+  var context = get(s_popup_requests, kind, {})
+  # A late older response must not consume the newest request.
+  if empty(context) || get(ev, 'id', 0) != context.id
+    return false
+  endif
+  remove(s_popup_requests, kind)
+  return PopupRequestCurrent(context)
+enddef
+
+# Also used for WinLeave: even another split of the same buffer owns a
+# different popup anchor. Cancel a debounce before it can request in that split.
+export def OnPopupContextLeave()
+  s_popup_requests = {}
+  if s_sig_timer > 0
+    timer_stop(s_sig_timer)
+    s_sig_timer = 0
+  endif
+enddef
+
+# Internal replacement/closure sends its own single ready notification.
+def CloseDocumentationPopup(id: number)
+  s_closing_documentation_popup = true
+  try
+    popup_close(id)
+  finally
+    s_closing_documentation_popup = false
+  endtry
+enddef
+
+def DocumentationPopupClosed(kind: string, id: number, result: any)
+  if s_closing_documentation_popup
+    return
+  endif
+  if kind ==# 'hover' && s_hover_popup == id
+    s_hover_popup = 0
+  elseif kind ==# 'signature' && s_sig_popup == id
+    s_sig_popup = 0
+  else
+    return
+  endif
+  if has_key(s_popup_requests, kind)
+    remove(s_popup_requests, kind)
+  endif
+  NativePopupsChanged()
+enddef
+
 export def Hover()
   if !s_initialized
     echom '[SimpleCC] not initialized'
@@ -2550,6 +2639,7 @@ export def Hover()
   endif
 
   var id = NextId()
+  RememberPopupRequest('hover', id)
   Send({
     type: 'textDocument/hover',
     id: id,
@@ -2561,15 +2651,25 @@ export def Hover()
 enddef
 
 def OnHover(ev: dict<any>)
+  if !TakePopupRequest('hover', ev)
+    return
+  endif
   var contents = get(ev, 'contents', '')
   if contents ==# '' || type(contents) == v:t_none
+    # The shared slot may now hold completion documentation. An empty hover
+    # refresh retires only the hover it replaces, after request validation.
+    if s_hover_popup > 0 && getwinvar(s_hover_popup, 'simplecc_popup_kind', '') ==# 'hover'
+      CloseDocumentationPopup(s_hover_popup)
+      s_hover_popup = 0
+      NativePopupsChanged()
+    endif
     echo 'No hover information'
     return
   endif
 
   # Close previous
   if s_hover_popup > 0
-    popup_close(s_hover_popup)
+    CloseDocumentationPopup(s_hover_popup)
   endif
 
   var lines = split(contents, "\n", true)
@@ -2581,6 +2681,7 @@ def OnHover(ev: dict<any>)
     maxheight: 20,
     close: 'click',
     moved: 'any',
+    callback: (id, result) => DocumentationPopupClosed('hover', id, result),
   }, 'hover')
 
   # Markdown-like syntax for the popup buffer
@@ -2996,6 +3097,7 @@ export def SignatureHelp()
   endif
 
   var id = NextId()
+  RememberPopupRequest('signature', id)
   Send({
     type: 'textDocument/signatureHelp',
     id: id,
@@ -3007,6 +3109,9 @@ export def SignatureHelp()
 enddef
 
 def OnSignatureHelp(ev: dict<any>)
+  if !TakePopupRequest('signature', ev)
+    return
+  endif
   var sigs = get(ev, 'signatures', [])
   if type(sigs) != v:t_list || empty(sigs)
     CloseSignaturePopup()
@@ -3046,13 +3151,17 @@ def OnSignatureHelp(ev: dict<any>)
     line: 'cursor-1',
     moved: [0, 0, 0],
     close: 'none',
+    callback: (id, result) => DocumentationPopupClosed('signature', id, result),
   }, 'signature')
   NativeTextPopup(s_sig_popup)
 enddef
 
 def CloseSignaturePopup(notify_native: bool = true)
+  if has_key(s_popup_requests, 'signature')
+    remove(s_popup_requests, 'signature')
+  endif
   if s_sig_popup > 0
-    popup_close(s_sig_popup)
+    CloseDocumentationPopup(s_sig_popup)
     s_sig_popup = 0
     if notify_native
       NativePopupsChanged()

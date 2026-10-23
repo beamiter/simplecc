@@ -1583,43 +1583,7 @@ impl LspClient {
         }
 
         let sh: SignatureHelp = serde_json::from_value(result)?;
-        if sh.signatures.is_empty() {
-            return Ok(Some(vec![]));
-        }
-
-        let sigs: Vec<types::SignatureInfo> = sh
-            .signatures
-            .into_iter()
-            .map(|sig| {
-                let params: Vec<types::ParameterInfo> = sig
-                    .parameters
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| {
-                        let label = match p.label {
-                            ParameterLabel::Simple(s) => s,
-                            ParameterLabel::LabelOffsets([start, end]) => sig
-                                .label
-                                .get(start as usize..end as usize)
-                                .unwrap_or("")
-                                .to_string(),
-                        };
-                        types::ParameterInfo {
-                            label,
-                            documentation: types::extract_doc(&p.documentation),
-                        }
-                    })
-                    .collect();
-                types::SignatureInfo {
-                    label: sig.label,
-                    documentation: types::extract_doc(&sig.documentation),
-                    active_parameter: sig.active_parameter.or(sh.active_parameter),
-                    parameters: params,
-                }
-            })
-            .collect();
-
-        Ok(Some(sigs))
+        Ok(Some(types::from_lsp_signature_help(sh)))
     }
 
     pub async fn implementation(
