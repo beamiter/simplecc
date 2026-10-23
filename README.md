@@ -527,3 +527,22 @@ vim -Nu NONE -n -i NONE -es -S test/vim9_smoke.vim
 ~~~
 
 Run <code>:help simplecc</code> inside Vim for the concise reference.
+
+### Native documentation cards
+
+Authenticated jterm hosts using render protocol 7 can display hover, signature,
+current-line diagnostics and completion documentation as native cards. Vim owns
+all text, wrapping, scrolling and popup lifetime. The card uses your `Pmenu`
+colors through `SimpleCCPopupCard`; override that highlight to customize it.
+Set `g:simplecc_popup_cards = 0` before loading the plugin to retain classic
+popup styling. Ordinary Vim and older hosts retain the existing popup options.
+Markdown text is preserved, including fences and emphasis markers. Tabs in native
+cards expand to spaces using the source buffer’s tab stops before wrapping.
+
+`:SimpleCCPopupScroll 3` and `:SimpleCCPopupScroll -3` scroll visible SimpleCC
+text popups; input is an integer and each step is limited to 100 lines.
+`:SimpleCCPopupClose` closes those text popups. Neither command changes the
+source buffer, focus or workspace-symbol picker. No default mappings are added.
+For conditional mappings, `simplecc#PopupVisible()` is read-only, and
+`simplecc#PopupScrollKey(1, "\<C-f>")` returns a three-line scroll command when
+one is visible, or the supplied fallback key otherwise; use `-1` for backwards.

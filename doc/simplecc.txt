@@ -971,3 +971,29 @@ supervisor, clone it beside the plugins, edit it there, and re-vendor: >
 <
 
 vim:tw=78:ts=8:noet:ft=help:norl:
+
+NATIVE DOCUMENTATION CARDS                       *simplecc-popup-cards*
+
+Protocol 7 authenticated jterm hosts may draw hover, signature, diagnostics and
+completion documentation as native cards. Vim provides prewrapped text and owns
+scrolling/lifetime. Ordinary Vim and older hosts retain classic popup options.
+The SimpleCCPopupCard highlight defaults to Pmenu. To disable card styling:
+>
+    let g:simplecc_popup_cards = 0
+<
+Markdown text is preserved; this option does not implement a Markdown renderer.
+Native cards expand tabs to spaces using source tab stops before wrapping.
+
+:SimpleCCPopupScroll {integer}                    *:SimpleCCPopupScroll*
+        Scroll visible plugin text popups by a signed number of lines. Each
+        request is clamped to -100..100 and the available content extent.
+:SimpleCCPopupClose                              *:SimpleCCPopupClose*
+        Close plugin text popups; leave workspace pickers and source untouched.
+
+simplecc#PopupVisible()                          *simplecc#PopupVisible()*
+        Read-only: whether a plugin text popup is visible.
+simplecc#PopupScrollKey(direction, fallback)      *simplecc#PopupScrollKey()*
+        Read-only expression mapping helper. Positive direction returns a
+        three-line forward scroll command, negative returns backwards, zero
+        returns fallback. Without a visible popup returns fallback unchanged.
+        No default mappings are installed.

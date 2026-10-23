@@ -1680,6 +1680,7 @@ export def OnBufLeave()
 enddef
 
 export def OnInsertLeave()
+  CloseCompletionDocumentation()
   if s_comp_timer > 0
     timer_stop(s_comp_timer)
     s_comp_timer = 0
@@ -1791,11 +1792,129 @@ def DecorationsChanged()
   endif
 enddef
 
+def PopupCards(): bool
+  var protocol: any = get(g:, 'jterm_vim9_render_protocol', 0)
+  return type(protocol) == v:t_number && protocol >= 7
+    && get(g:, 'jterm_vim9_popup_cards', false) == true
+    && get(g:, 'simplecc_popup_cards', 1) != 0
+enddef
+
+# Wrap only authenticated native cards. Vim remains the sole layout authority.
+# strcharpart(..., true) keeps a base character and its combining marks together.
+def PopupCardLines(lines: list<string>, width: number): list<string>
+  var result: list<string> = []
+  for text in lines
+    # Expand tabs using the source's display columns before wrapping. This
+    # honors both tabstop and vartabstop and permits a tab to span wraps.
+    var expanded = ''
+    var source_index = 0
+    while true
+      var source_character = strcharpart(text, source_index, 1, true)
+      if source_character ==# ''
+        break
+      endif
+      if source_character ==# "\t"
+        var before = strdisplaywidth(expanded)
+        expanded ..= repeat(' ', strdisplaywidth(expanded .. "\t") - before)
+      else
+        expanded ..= source_character
+      endif
+      source_index += 1
+    endwhile
+    var current = ''
+    var index = 0
+    while true
+      var character = strcharpart(expanded, index, 1, true)
+      if character ==# ''
+        break
+      endif
+      if current !=# '' && strdisplaywidth(current .. character) > width
+        add(result, current)
+        current = ''
+      endif
+      current ..= character
+      index += 1
+    endwhile
+    add(result, current)
+  endfor
+  return result
+enddef
+
+def CreateTextPopup(lines: list<string>, options: dict<any>, kind: string,
+    atcursor: bool = true): number
+  var rendered = lines
+  if PopupCards()
+    var width = max([1, min([get(options, 'maxwidth', 80), &columns - 5])])
+    rendered = PopupCardLines(lines, width)
+    options.border = [0, 0, 0, 0]
+    options.padding = [1, 2, 1, 2]
+    options.wrap = 0
+    options.maxwidth = width
+    options.highlight = 'SimpleCCPopupCard'
+  endif
+  var winid = atcursor ? popup_atcursor(rendered, options) : popup_create(rendered, options)
+  if winid > 0
+    setwinvar(winid, 'simplecc_popup_kind', kind)
+    setwinvar(winid, 'jterm_native_popup', 1)
+    if PopupCards()
+      setwinvar(winid, 'jterm_native_popup_kind', kind)
+    endif
+  endif
+  return winid
+enddef
+
 def NativeTextPopup(winid: number)
-  if winid <= 0
+  if winid > 0
+    NativePopupsChanged()
+  endif
+enddef
+
+def VisibleOwnedPopups(): list<number>
+  return filter([s_hover_popup, s_sig_popup, s_diag_popup], (_, id) =>
+    id > 0 && !empty(popup_getpos(id)) && get(popup_getpos(id), 'visible', 0))
+enddef
+
+export def PopupVisible(): bool
+  return !empty(VisibleOwnedPopups())
+enddef
+
+# This expression helper never mutates Vim state or consumes an absent popup's key.
+export def PopupScrollKey(direction: number, fallback: string): string
+  if !PopupVisible() || direction == 0
+    return fallback
+  endif
+  return direction > 0 ? "\<Cmd>SimpleCCPopupScroll 3\<CR>"
+    : "\<Cmd>SimpleCCPopupScroll -3\<CR>"
+enddef
+
+export def PopupScrollCommand(argument: string)
+  if argument !~# '^[+-]\=\d\{1,6}$'
+    echoerr 'SimpleCCPopupScroll requires an integer between -100 and 100'
     return
   endif
-  setwinvar(winid, 'jterm_native_popup', 1)
+  PopupScroll(str2nr(argument))
+enddef
+
+export def PopupScroll(amount: number)
+  var step = max([-100, min([100, amount])])
+  for id in VisibleOwnedPopups()
+    var position = popup_getpos(id)
+    var total = len(getbufline(winbufnr(id), 1, '$'))
+    var last = max([1, total - get(position, 'core_height', 1) + 1])
+    popup_setoptions(id, {firstline: max([1, min([last, position.firstline + step])])})
+  endfor
+  NativePopupsChanged()
+enddef
+
+export def PopupClose()
+  for id in [s_hover_popup, s_sig_popup, s_diag_popup]
+    if id > 0 && !empty(popup_getpos(id))
+      popup_close(id)
+    endif
+  endfor
+  s_hover_popup = 0
+  s_sig_popup = 0
+  s_diag_popup = 0
   NativePopupsChanged()
 enddef
 
@@ -1819,7 +1938,7 @@ def ShowCompletionDocumentation(item: dict<any>)
     return
   endif
 
-  s_hover_popup = popup_create(split(text, "\n"), {
+  s_hover_popup = CreateTextPopup(split(text, "\n", true), {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
     padding: [0, 1, 0, 1],
@@ -1831,8 +1950,17 @@ def ShowCompletionDocumentation(item: dict<any>)
     moved: 'any',
     highlight: 'Normal',
     borderhighlight: ['SimpleCCFloatBorder'],
-  })
+  }, 'completion_documentation', false)
   NativeTextPopup(s_hover_popup)
+enddef
+
+# Completion documentation shares the hover slot; retire only its own kind.
+def CloseCompletionDocumentation()
+  if s_hover_popup > 0 && getwinvar(s_hover_popup, 'simplecc_popup_kind', '') ==# 'completion_documentation'
+    popup_close(s_hover_popup)
+    s_hover_popup = 0
+    NativePopupsChanged()
+  endif
 enddef
 
 export def OnCompleteChanged()
@@ -1848,6 +1976,7 @@ export def OnCompleteChanged()
   var info = complete_info(['selected', 'items'])
   var sel = get(info, 'selected', -1)
   if sel < 0
+    CloseCompletionDocumentation()
     s_comp_resolve_key = ''
     return
   endif
@@ -2443,8 +2572,8 @@ def OnHover(ev: dict<any>)
     popup_close(s_hover_popup)
   endif
 
-  var lines = split(contents, "\n")
-  s_hover_popup = popup_atcursor(lines, {
+  var lines = split(contents, "\n", true)
+  s_hover_popup = CreateTextPopup(lines, {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
     padding: [0, 1, 0, 1],
@@ -2452,11 +2581,12 @@ def OnHover(ev: dict<any>)
     maxheight: 20,
     close: 'click',
     moved: 'any',
-  })
+  }, 'hover')
 
   # Markdown-like syntax for the popup buffer
   var winbuf = winbufnr(s_hover_popup)
   setbufvar(winbuf, '&filetype', 'markdown')
+  setbufvar(winbuf, '&syntax', 'markdown')
   NativeTextPopup(s_hover_popup)
 enddef
 
@@ -2906,7 +3036,7 @@ def OnSignatureHelp(ev: dict<any>)
 
   # The replacement's registration sends one refresh after it is ready.
   CloseSignaturePopup(false)
-  s_sig_popup = popup_atcursor(lines, {
+  s_sig_popup = CreateTextPopup(lines, {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
     padding: [0, 1, 0, 1],
@@ -2916,7 +3046,7 @@ def OnSignatureHelp(ev: dict<any>)
     line: 'cursor-1',
     moved: [0, 0, 0],
     close: 'none',
-  })
+  }, 'signature')
   NativeTextPopup(s_sig_popup)
 enddef
 
@@ -6719,7 +6849,7 @@ def ShowDiagFloat(notify_empty: bool)
     echo join(lines, ' | ')
     return
   endif
-  s_diag_popup = popup_atcursor(lines, {
+  s_diag_popup = CreateTextPopup(lines, {
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
     padding: [0, 1, 0, 1],
@@ -6727,7 +6857,7 @@ def ShowDiagFloat(notify_empty: bool)
     maxwidth: 80,
     highlight: 'Normal',
     borderhighlight: ['SimpleCCFloatBorder'],
-  })
+  }, 'diagnostic')
   NativeTextPopup(s_diag_popup)
 enddef
 
@@ -7335,6 +7465,7 @@ def ApplyCompletionAdditionalEdits(edits: list<dict<any>>)
 enddef
 
 export def OnCompleteDone()
+  CloseCompletionDocumentation()
   if !s_initialized
     return
   endif
