@@ -51,7 +51,7 @@ call writefile([
       \ '  case "$line" in',
       \ '    *''"type":"initialize"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',
-      \ '      printf ''{"type":"initialized","id":%s}\n'' "$id"',
+      \ '      printf ''{"type":"initialized","id":%s,"capabilities":{"code_action_identity":true}}\n'' "$id"',
       \ '      ;;',
       \ '    *''"type":"shutdown"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',
@@ -162,8 +162,10 @@ let s:md = tempname() .. '.md'
 call writefile(['hello'], s:md)
 execute 'edit! ' .. fnameescape(s:md)
 setfiletype markdown
-call assert_equal('rust', s:Call('PendingActionFiletype', s:act_id),
-      \ 'code-action execute must keep the filetype of the requesting buffer')
+call s:Call('OnCodeAction', {'id': s:act_id, 'generation': s:act_id,
+      \ 'actions': [{'title': 'stale action', 'index': 0}]})
+call assert_equal([], popup_list(),
+      \ 'code-action reply must be retired when leaving its requesting buffer')
 execute 'buffer ' .. s:src_buf
 call delete(s:md)
 

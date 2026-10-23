@@ -23,6 +23,12 @@ const EXECUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const SEMTOK_CACHE_LIMIT: usize = 64;
 const WATCHED_FILES_METHOD: &str = "workspace/didChangeWatchedFiles";
 
+#[derive(Clone, Copy)]
+enum ExecutionIdentity<'a> {
+    CodeLens(u64, &'a str),
+    CodeAction(u64, &'a str),
+}
+
 #[derive(Default)]
 struct CompletionCache {
     generation: u64,
@@ -83,6 +89,70 @@ impl CodeLensCache {
             .get(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("invalid code lens index; refresh code lenses"))
+    }
+}
+
+#[derive(Default)]
+struct CodeActionCache {
+    generation: u64,
+    uri: String,
+    items: Vec<lsp_types::CodeActionOrCommand>,
+}
+
+impl CodeActionCache {
+    fn begin(&mut self, generation: u64, uri: &str) -> bool {
+        if generation <= self.generation || uri.is_empty() {
+            return false;
+        }
+        self.generation = generation;
+        self.uri = uri.to_owned();
+        self.items.clear();
+        true
+    }
+
+    fn matches(&self, generation: u64, uri: &str) -> bool {
+        generation > 0 && !uri.is_empty() && self.generation == generation && self.uri == uri
+    }
+
+    fn replace(
+        &mut self,
+        generation: u64,
+        uri: &str,
+        items: Vec<lsp_types::CodeActionOrCommand>,
+    ) -> bool {
+        if !self.matches(generation, uri) {
+            return false;
+        }
+        self.items = items;
+        true
+    }
+
+    fn invalidate(&mut self) {
+        // Keep the request watermark: an already-spawned old task must not
+        // re-open this generation after a document or server refresh edge.
+        self.uri.clear();
+        self.items.clear();
+    }
+
+    fn invalidate_uri(&mut self, uri: &str) {
+        if self.uri == uri {
+            self.invalidate();
+        }
+    }
+
+    fn action(
+        &self,
+        generation: u64,
+        uri: &str,
+        index: usize,
+    ) -> Result<lsp_types::CodeActionOrCommand> {
+        if !self.matches(generation, uri) {
+            bail!("stale code action identity; refresh code actiones for this document");
+        }
+        self.items
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("invalid code action index; refresh code actiones"))
     }
 }
 
@@ -266,7 +336,7 @@ pub struct LspClient {
     /// Server capabilities after initialize
     pub capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     /// Cached code actions for execute
-    pub cached_actions: Arc<Mutex<Vec<lsp_types::CodeActionOrCommand>>>,
+    cached_actions: Arc<Mutex<CodeActionCache>>,
     /// Latest completion generation and its raw items for resolve.
     cached_completions: Arc<Mutex<CompletionCache>>,
     completion_generation: Arc<AtomicU64>,
@@ -450,7 +520,7 @@ impl LspClient {
             pending,
             latest_requests: Arc::new(Mutex::new(HashMap::new())),
             capabilities,
-            cached_actions: Arc::new(Mutex::new(Vec::new())),
+            cached_actions: Arc::new(Mutex::new(CodeActionCache::default())),
             cached_completions: Arc::new(Mutex::new(CompletionCache::default())),
             completion_generation: Arc::new(AtomicU64::new(0)),
             cached_code_lenses,
@@ -493,6 +563,7 @@ impl LspClient {
     async fn mark_dead(&self) {
         self.alive.store(false, Ordering::Release);
         self.pending.lock().await.clear();
+        self.cached_actions.lock().await.invalidate();
     }
 
     async fn terminate_transport(&self) -> Result<()> {
@@ -555,23 +626,38 @@ impl LspClient {
         result
     }
 
-    /// Validate immediately before writing a CodeLens command, after all
+    /// Validate immediately before writing a CodeLens or code-action command, after all
     /// pending-map and transport waits. The transport is acquired first so a
     /// document change can invalidate the cache while a busy transport is
     /// delaying us. Keep the cache guard only until the write completes, never
     /// while awaiting the server response. Lifecycle paths release their cache
     /// guard before taking the transport, so they cannot reverse this order.
-    async fn send_code_lens_message(&self, msg: &Value, generation: u64, uri: &str) -> Result<()> {
+    async fn send_execution_message(
+        &self,
+        msg: &Value,
+        identity: ExecutionIdentity<'_>,
+    ) -> Result<()> {
         if !self.is_alive() {
             bail!("language server {} is not running", self.server_name);
         }
         let result = {
             let mut transport = self.transport.lock().await;
-            let cache = self.cached_code_lenses.lock().await;
-            if !cache.matches(generation, uri) {
-                bail!("code lenses changed before execution; refresh code lenses");
+            match identity {
+                ExecutionIdentity::CodeAction(generation, uri) => {
+                    let cache = self.cached_actions.lock().await;
+                    if !cache.matches(generation, uri) {
+                        bail!("code actions changed before execution; request code actions again");
+                    }
+                    transport.send(msg).await
+                }
+                ExecutionIdentity::CodeLens(generation, uri) => {
+                    let cache = self.cached_code_lenses.lock().await;
+                    if !cache.matches(generation, uri) {
+                        bail!("code lenses changed before execution; refresh code lenses");
+                    }
+                    transport.send(msg).await
+                }
             }
-            transport.send(msg).await
         };
         if result.is_err() {
             self.mark_dead().await;
@@ -608,7 +694,7 @@ impl LspClient {
     async fn request_with_timeout_inner(
         &self,
         latest_key: Option<(&str, u64)>,
-        code_lens_identity: Option<(u64, &str)>,
+        execution_identity: Option<ExecutionIdentity<'_>>,
         method: &str,
         params: Value,
         timeout: Duration,
@@ -650,8 +736,8 @@ impl LspClient {
                 latest.remove(key);
             }
             result
-        } else if let Some((generation, uri)) = code_lens_identity {
-            self.send_code_lens_message(&msg, generation, uri).await
+        } else if let Some(identity) = execution_identity {
+            self.send_execution_message(&msg, identity).await
         } else {
             self.send_message(&msg).await
         };
@@ -825,6 +911,7 @@ impl LspClient {
     /// Replace values returned by `workspace/configuration`, then notify the
     /// server so it can request and apply the new values.
     pub async fn did_change_configuration(&self, settings: Option<Value>) -> Result<()> {
+        self.cached_actions.lock().await.invalidate();
         let settings = settings.unwrap_or_else(|| json!({}));
         *self.settings.write().await = settings.clone();
         self.notify(
@@ -842,6 +929,7 @@ impl LspClient {
         text: &str,
     ) -> Result<()> {
         self.cached_code_lenses.lock().await.invalidate_uri(uri);
+        self.cached_actions.lock().await.invalidate_uri(uri);
         self.notify(
             "textDocument/didOpen",
             json!({
@@ -866,6 +954,7 @@ impl LspClient {
         // Text can change while codeLens/resolve is in flight. An editor-side
         // changedtick check at the original click cannot protect that await.
         self.cached_code_lenses.lock().await.invalidate_uri(uri);
+        self.cached_actions.lock().await.invalidate_uri(uri);
         let content_changes = if let Some(changes) = changes {
             if self.incremental_sync.load(Ordering::Acquire) {
                 json!(changes)
@@ -946,6 +1035,7 @@ impl LspClient {
 
     pub async fn did_close(&self, uri: &str) -> Result<()> {
         self.cached_code_lenses.lock().await.invalidate_uri(uri);
+        self.cached_actions.lock().await.invalidate_uri(uri);
         let uri_lock = self.semantic_token_uri_lock(uri).await;
         let _guard = uri_lock.lock().await;
         self.semtok_cache.lock().await.remove(uri);
@@ -1204,13 +1294,15 @@ impl LspClient {
 
     pub async fn code_action(
         &self,
+        generation: u64,
         uri: &str,
-        line: u32,
-        character: u32,
-        end_line: u32,
-        end_character: u32,
+        range: (u32, u32, u32, u32),
         diag_json: Value,
     ) -> Result<Vec<types::CodeAction>> {
+        if !self.cached_actions.lock().await.begin(generation, uri) {
+            bail!("stale code action request identity");
+        }
+        let (line, character, end_line, end_character) = range;
         // The editor sends its own flat diagnostic shape, not
         // `lsp_types::Diagnostic`; converting it is what makes
         // diagnostic-bound quickfix actions reachable at all. The failure is
@@ -1235,11 +1327,11 @@ impl LspClient {
             )
             .await?;
 
-        if result.is_null() {
-            return Ok(vec![]);
-        }
-
-        let cached: Vec<lsp_types::CodeActionOrCommand> = serde_json::from_value(result)?;
+        let cached: Vec<lsp_types::CodeActionOrCommand> = if result.is_null() {
+            vec![]
+        } else {
+            serde_json::from_value(result)?
+        };
         let actions = cached
             .iter()
             .enumerate()
@@ -1257,20 +1349,33 @@ impl LspClient {
             })
             .collect();
 
-        *self.cached_actions.lock().await = cached;
+        if !self
+            .cached_actions
+            .lock()
+            .await
+            .replace(generation, uri, cached)
+        {
+            bail!("code actions changed while awaiting reply");
+        }
         Ok(actions)
     }
 
-    pub async fn execute_code_action(&self, index: usize) -> Result<Option<types::WorkspaceEdit>> {
+    pub async fn execute_code_action(
+        &self,
+        generation: u64,
+        uri: &str,
+        index: usize,
+    ) -> Result<Option<types::WorkspaceEdit>> {
+        if !self.is_alive() {
+            bail!("language server is not running; request code actions again");
+        }
         // Clone before awaiting so a slow command never holds the cache mutex
         // or blocks a newer code-action response.
         let action = self
             .cached_actions
             .lock()
             .await
-            .get(index)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("invalid action index"))?;
+            .action(generation, uri, index)?;
 
         let (workspace_edit, command) = match action {
             lsp_types::CodeActionOrCommand::Command(command) => (None, Some(command)),
@@ -1300,9 +1405,14 @@ impl LspClient {
             }
         };
 
+        if !self.is_alive() || !self.cached_actions.lock().await.matches(generation, uri) {
+            bail!("code actions changed while resolving; request code actions again");
+        }
         if let Some(command) = command {
             let result = self
-                .request_with_timeout(
+                .request_with_timeout_inner(
+                    None,
+                    Some(ExecutionIdentity::CodeAction(generation, uri)),
                     "workspace/executeCommand",
                     json!({
                         "command": command.command,
@@ -1310,7 +1420,11 @@ impl LspClient {
                     }),
                     EXECUTE_COMMAND_TIMEOUT,
                 )
-                .await?;
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("code action execution was cancelled"))?;
+            if !self.is_alive() || !self.cached_actions.lock().await.matches(generation, uri) {
+                bail!("code actions changed during execution");
+            }
             if workspace_edit.is_none()
                 && let Ok(edit) = serde_json::from_value::<lsp_types::WorkspaceEdit>(result)
             {
@@ -2332,7 +2446,7 @@ impl LspClient {
             let result = self
                 .request_with_timeout_inner(
                     None,
-                    Some((generation, uri)),
+                    Some(ExecutionIdentity::CodeLens(generation, uri)),
                     "workspace/executeCommand",
                     json!({
                         "command": cmd.command,
@@ -4128,6 +4242,210 @@ while True:
                 .await
                 .unwrap(),
             json!(1)
+        );
+        client.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod code_action_identity_tests {
+    use super::*;
+
+    #[test]
+    fn action_watermark_survives_empty_error_and_document_invalidation() {
+        let mut cache = CodeActionCache::default();
+        let uri = "file:///first.rs";
+        let action =
+            lsp_types::CodeActionOrCommand::Command(Command::new("Run".into(), "run".into(), None));
+        assert!(!cache.begin(0, uri));
+        assert!(cache.begin(10, uri));
+        assert!(cache.replace(10, uri, vec![action.clone()]));
+        assert!(cache.action(10, uri, 0).is_ok());
+        assert!(cache.action(10, "file:///other.rs", 0).is_err());
+        assert!(cache.action(0, "", 0).is_err());
+        assert!(cache.begin(11, uri)); // A pending or failed request clears old actions.
+        assert!(cache.action(10, uri, 0).is_err());
+        assert!(cache.action(11, uri, 0).is_err());
+        assert!(!cache.replace(10, uri, vec![action.clone()]));
+        assert!(cache.replace(11, uri, vec![]));
+        assert!(cache.action(11, uri, 0).is_err());
+        cache.invalidate_uri(uri);
+        assert!(!cache.begin(11, uri));
+        assert!(!cache.replace(11, uri, vec![action]));
+        assert!(cache.begin(12, uri));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_transport_rejects_reordered_null_error_and_resolved_stale_actions() {
+        let server = r#"
+import json,sys
+pending=None
+executions=0
+def send(v):
+    body=json.dumps(dict(jsonrpc='2.0',**v)).encode()
+    sys.stdout.buffer.write(b'Content-Length: '+str(len(body)).encode()+b'\r\n\r\n'+body);sys.stdout.buffer.flush()
+while True:
+    h={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if line in (b'\r\n',b'\n'): break
+        k,v=line.decode().split(':',1);h[k.lower()]=v.strip()
+    m=json.loads(sys.stdin.buffer.read(int(h['content-length'])))
+    method=m.get('method');p=m.get('params',{})
+    if method=='initialize': send(dict(id=m['id'],result={'capabilities':{'codeActionProvider':{'resolveProvider':True}}}))
+    elif method=='textDocument/codeAction':
+        line=p['range']['start']['line']
+        if line==0:
+            pending=m;send(dict(method='window/logMessage',params={'type':3,'message':'pending'}))
+        elif line==2: send(dict(id=m['id'],result=None))
+        elif line==3: send(dict(id=m['id'],error={'code':-32603,'message':'test error'}))
+        else: send(dict(id=m['id'],result=[{'title':'Fresh','kind':'quickfix','data':{'uri':p['textDocument']['uri']}}]))
+    elif method=='codeAction/resolve':
+        pending=m;send(dict(method='window/logMessage',params={'type':3,'message':'pending'}))
+    elif method=='test/release':
+        if pending['method']=='codeAction/resolve':
+            result=pending['params'];result['command']={'title':'Run','command':'test.run'}
+        else: result=[{'title':'Old','command':'test.old'}]
+        send(dict(id=pending['id'],result=result));pending=None
+    elif method=='workspace/executeCommand':
+        executions+=1;send(dict(id=m['id'],result=None))
+    elif method=='test/executions': send(dict(id=m['id'],result=executions))
+    elif method=='shutdown': send(dict(id=m['id'],result=None))
+    elif method=='exit': break
+"#;
+        let (client, mut events) = LspClient::start(
+            "action-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        let uri = "file:///tmp/first.rs";
+        let old_client = client.clone();
+        let old = tokio::spawn(async move {
+            old_client
+                .code_action(1, uri, (0, 0, 0, 0), json!([]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh = client
+            .code_action(2, "file:///tmp/other.rs", (1, 0, 1, 0), json!([]))
+            .await
+            .unwrap();
+        assert_eq!(fresh[0].title, "Fresh");
+        client.notify("test/release", json!({})).await.unwrap();
+        assert!(old.await.unwrap().is_err());
+        assert!(client.execute_code_action(1, uri, 0).await.is_err());
+        assert!(client.execute_code_action(2, uri, 0).await.is_err());
+        assert!(
+            client
+                .code_action(3, uri, (2, 0, 2, 0), json!([]))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            client
+                .execute_code_action(2, "file:///tmp/other.rs", 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .code_action(4, uri, (3, 0, 3, 0), json!([]))
+                .await
+                .is_err()
+        );
+        assert!(client.execute_code_action(3, uri, 0).await.is_err());
+        for (offset, lifecycle) in ["open", "change", "close", "configuration"]
+            .iter()
+            .enumerate()
+        {
+            let generation = offset as u64 + 5;
+            client
+                .code_action(generation, uri, (1, 0, 1, 0), json!([]))
+                .await
+                .unwrap();
+            let executing = client.clone();
+            let task =
+                tokio::spawn(
+                    async move { executing.execute_code_action(generation, uri, 0).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            // Changes in an unrelated document must preserve this identity.
+            client
+                .did_change("file:///tmp/unrelated.rs", 2, Some("new"), None)
+                .await
+                .unwrap();
+            assert!(client.cached_actions.lock().await.matches(generation, uri));
+            match *lifecycle {
+                "open" => client.did_open(uri, "rust", 2, "new").await.unwrap(),
+                "change" => client.did_change(uri, 2, Some("new"), None).await.unwrap(),
+                "close" => client.did_close(uri).await.unwrap(),
+                _ => client.did_change_configuration(None).await.unwrap(),
+            }
+            client.notify("test/release", json!({})).await.unwrap();
+            assert!(task.await.unwrap().is_err(), "{lifecycle}");
+        }
+        assert_eq!(
+            client.request("test/executions", json!({})).await.unwrap(),
+            json!(0)
+        );
+        // A document change while the command is waiting for a busy
+        // transport must win before any execution bytes are written.
+        {
+            let mut cache = client.cached_actions.lock().await;
+            assert!(cache.begin(20, uri));
+            assert!(cache.replace(
+                20,
+                uri,
+                vec![lsp_types::CodeActionOrCommand::Command(Command::new(
+                    "Run".into(),
+                    "run".into(),
+                    None
+                ))]
+            ));
+        }
+        let transport = client.transport.lock().await;
+        let executing = client.clone();
+        let task = tokio::spawn(async move { executing.execute_code_action(20, uri, 0).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.pending.lock().await.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let changing = client.clone();
+        let change =
+            tokio::spawn(async move { changing.did_change(uri, 3, Some("later"), None).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.cached_actions.lock().await.matches(20, uri) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(transport);
+        assert!(task.await.unwrap().is_err());
+        change.await.unwrap().unwrap();
+        assert_eq!(
+            client.request("test/executions", json!({})).await.unwrap(),
+            json!(0)
         );
         client.shutdown().await.unwrap();
     }

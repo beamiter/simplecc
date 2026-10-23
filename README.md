@@ -319,6 +319,13 @@ behavior, or pass explicit interpreter and LSP paths for a custom setup.
 | <code>:SimpleCCCodeLensRun</code> | Execute a code lens |
 | <code>:SimpleCCFold</code> | Apply server-provided folding ranges |
 
+Code-action menus stay bound to the requesting file, window, cursor, selection,
+and document revision. Late replies are discarded, and selecting an action
+executes the exact action set shown in that menu. This requires a matching
+`simplecc-daemon` advertising `code_action_identity`; update the daemon if Vim
+reports that safe code actions are unavailable. Other language features remain
+available with older daemons.
+
 ### Diagnostics and Julia
 
 | Command | Action |

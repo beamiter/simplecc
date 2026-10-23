@@ -177,6 +177,9 @@ const MAX_CODE_LENS_EXECUTIONS = 16
 var s_dochl_requests: dict<dict<any>> = {}
 var s_format_requests: dict<dict<any>> = {}
 var s_action_requests: dict<dict<any>> = {}
+var s_action_popup = 0
+var s_action_identity = false
+var s_action_executions: dict<dict<any>> = {}
 # Window/buffer context for asynchronous location requests.  LSP replies can
 # arrive after the user has moved to another split, so navigation must not use
 # whichever window happens to be current when the reply is handled.
@@ -308,6 +311,9 @@ def OnDaemonExit(code: number, restarting: bool)
   s_dochl_requests = {}
   s_format_requests = {}
   s_action_requests = {}
+  s_action_identity = false
+  s_action_executions = {}
+  CloseActionMenu()
   # The replacement daemon has no open documents; the replay in the
   # `initialized` handler is what re-opens them, and a stale pending delta is
   # expressed against a version no server ever saw.
@@ -396,6 +402,7 @@ def OnBackendEvent(ev: dict<any>)
   var id = get(ev, 'id', 0)
 
   if ev.type ==# 'initialized'
+    s_action_identity = get(get(ev, 'capabilities', {}), 'code_action_identity', false) == true
     s_initialized = true
     s_initializing = false
     s_initialize_id = 0
@@ -540,7 +547,14 @@ def OnBackendEvent(ev: dict<any>)
   elseif ev.type ==# 'log'
     Log('[' .. get(ev, 'server', '') .. '] ' .. get(ev, 'message', ''))
 
+  elseif ev.type ==# 'executeAction'
+    OnExecuteAction(ev)
+
   elseif ev.type ==# 'error'
+    var action_key = string(id)
+    if has_key(s_action_executions, action_key)
+      remove(s_action_executions, action_key)
+    endif
     for kind in keys(s_popup_requests)
       if get(s_popup_requests[kind], 'id', 0) == id
         remove(s_popup_requests, kind)
@@ -1902,6 +1916,10 @@ export def PopupScrollKey(direction: number, fallback: string): string
     : "\<Cmd>SimpleCCPopupScroll -3\<CR>"
 enddef
 
+export def PopupCloseKey(fallback: string): string
+  return PopupVisible() ? "\<Cmd>SimpleCCPopupClose\<CR>" : fallback
+enddef
+
 export def PopupScrollCommand(argument: string)
   if argument !~# '^[+-]\=\d\{1,6}$'
     echoerr 'SimpleCCPopupScroll requires an integer between -100 and 100'
@@ -2598,6 +2616,9 @@ enddef
 # Also used for WinLeave: even another split of the same buffer owns a
 # different popup anchor. Cancel a debounce before it can request in that split.
 export def OnPopupContextLeave()
+  CloseActionMenu()
+  s_action_requests = {}
+  s_action_executions = {}
   s_popup_requests = {}
   if s_sig_timer > 0
     timer_stop(s_sig_timer)
@@ -2834,6 +2855,11 @@ export def CodeAction(range_given: bool = false, line1: number = 0, line2: numbe
     return
   endif
 
+  if !s_action_identity
+    echom '[SimpleCC] update simplecc-daemon for safe code actions'
+    return
+  endif
+
   var id = NextId()
   var ft = BufFt()
   var range: dict<number>
@@ -2844,7 +2870,14 @@ export def CodeAction(range_given: bool = false, line1: number = 0, line2: numbe
     var cchar = CursorUtf16()
     range = {line: lnum, character: cchar, end_line: lnum, end_character: cchar}
   endif
-  s_action_requests = {[string(id)]: {ft: ft, bufnr: bufnr('%')}}
+  CloseActionMenu()
+  s_action_requests = {[string(id)]: {
+    ft: ft, bufnr: bufnr('%'), winid: win_getid(), uri: BufUri(),
+    tick: b:changedtick, position: getcurpos()[1 : 2], generation: id,
+    epoch: s_daemon_generation,
+    range: range, range_given: range_given,
+    selection: [getpos("'<"), getpos("'>")],
+  }}
   Send({
     type: 'textDocument/codeAction',
     id: id,
@@ -2858,65 +2891,104 @@ export def CodeAction(range_given: bool = false, line1: number = 0, line2: numbe
   })
 enddef
 
-var s_pending_actions: list<dict<any>> = []
-var s_action_ft: string = ''
+# Every menu owns its request context and immutable action snapshot. A newer
+# response can never change what an older popup's callback would execute.
+def CloseActionMenu()
+  if s_action_popup > 0 && !empty(popup_getpos(s_action_popup))
+    popup_close(s_action_popup)
+  endif
+  s_action_popup = 0
+enddef
 
-def PendingActionFiletype(id: number): string
-  return get(get(s_action_requests, string(id), {}), 'ft', '')
+def ActionContextCurrent(context: dict<any>): bool
+  return !empty(context) && context.epoch == s_daemon_generation
+    && context.bufnr == bufnr('%')
+    && context.winid == win_getid() && context.uri == BufUri()
+    && context.ft ==# BufFt()
+    && context.tick == b:changedtick
+    && context.position == getcurpos()[1 : 2]
+    && (!context.range_given
+      || context.selection == [getpos("'<"), getpos("'>")])
 enddef
 
 def OnCodeAction(ev: dict<any>)
-  var actions = get(ev, 'actions', [])
+  var key = string(get(ev, 'id', 0))
+  var context = get(s_action_requests, key, {})
+  if empty(context) || get(ev, 'generation', 0) != context.generation
+    return
+  endif
+  remove(s_action_requests, key)
+  if !ActionContextCurrent(context)
+    return
+  endif
+  var actions = deepcopy(get(ev, 'actions', []))
   if empty(actions)
     echo 'No code actions available'
     return
   endif
 
-  s_pending_actions = actions
-  var key = string(get(ev, 'id', 0))
-  var req = get(s_action_requests, key, {})
-  if has_key(s_action_requests, key)
-    remove(s_action_requests, key)
-  endif
-  s_action_ft = get(req, 'ft', BufFt())
-
-  # Show in popup menu
   var items: list<string> = []
-  for a in actions
-    var kind = get(a, 'kind', '')
-    var title = get(a, 'title', '')
-    if kind !=# ''
-      add(items, '[' .. kind .. '] ' .. title)
-    else
-      add(items, title)
+  for action in actions
+    var kind: any = get(action, 'kind', '')
+    if type(kind) != v:t_string
+      kind = ''
     endif
+    var title = get(action, 'title', '')
+    add(items, kind !=# '' ? '[' .. kind .. '] ' .. title : title)
   endfor
 
-  popup_menu(items, {
+  CloseActionMenu()
+  s_action_popup = popup_menu(items, {
     title: ' Code Actions ',
     border: [1, 1, 1, 1],
     borderchars: ['─', '│', '─', '│', '╭', '╮', '╯', '╰'],
     padding: [0, 1, 0, 1],
-    callback: OnActionSelected,
+    callback: (id, result) => OnActionSelected(id, result, context, actions),
   })
 enddef
 
-def OnActionSelected(id: number, result: number)
-  if result <= 0
+def OnActionSelected(id: number, result: number, context: dict<any>,
+    actions: list<dict<any>>)
+  if id != s_action_popup
     return
   endif
-  var idx = result - 1
-  if idx >= len(s_pending_actions)
+  s_action_popup = 0
+  if result <= 0 || result > len(actions) || !ActionContextCurrent(context)
     return
   endif
 
-  var action = s_pending_actions[idx]
+  var action_index: any = get(actions[result - 1], 'index', -1)
+  if type(action_index) != v:t_number || action_index < 0
+    return
+  endif
+  var execution_id = NextId()
+  s_action_executions = {[string(execution_id)]: deepcopy(context)}
   Send({
     type: 'textDocument/executeAction',
-    id: NextId(),
-    languageId: s_action_ft,
-    index: get(action, 'index', 0),
+    id: execution_id,
+    languageId: context.ft,
+    generation: context.generation,
+    uri: context.uri,
+    index: action_index,
   })
+enddef
+
+# A returned edit must still belong to the document that the user selected.
+# Server-initiated edits and other feature replies use their existing handlers.
+def OnExecuteAction(ev: dict<any>)
+  if TakeActionExecution(ev) && has_key(ev, 'edit')
+    OnApplyEdit(ev)
+  endif
+enddef
+
+def TakeActionExecution(ev: dict<any>): bool
+  var key = string(get(ev, 'id', 0))
+  if !has_key(s_action_executions, key)
+    return false
+  endif
+  var context = remove(s_action_executions, key)
+  return get(ev, 'generation', 0) == context.generation
+    && get(ev, 'uri', '') ==# context.uri && ActionContextCurrent(context)
 enddef
 
 # ═════════════════════════════════════════════════════════

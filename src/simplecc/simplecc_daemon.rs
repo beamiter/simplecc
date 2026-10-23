@@ -191,6 +191,10 @@ enum Request {
     #[serde(rename = "textDocument/executeAction")]
     ExecuteAction {
         id: u64,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default)]
+        uri: String,
         #[serde(rename = "languageId")]
         language_id: String,
         index: usize,
@@ -1070,7 +1074,10 @@ async fn handle_request(
                 eprintln!("[simplecc] remote workspace: {root}");
             }
 
-            send_event!(&out, json!({"type": "initialized", "id": id}));
+            send_event!(
+                &out,
+                json!({"type": "initialized", "id": id, "capabilities": {"code_action_identity": true}})
+            );
         }
 
         Request::Shutdown { id } => {
@@ -1504,12 +1511,12 @@ async fn handle_request(
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
                 match c
-                    .code_action(&uri, line, character, el, ec, diagnostics)
+                    .code_action(id, &uri, (line, character, el, ec), diagnostics)
                     .await
                 {
                     Ok(actions) => send_event!(
                         &out,
-                        json!({"type": "codeAction", "id": id, "actions": actions}),
+                        json!({"type": "codeAction", "id": id, "generation": id, "actions": actions}),
                     ),
                     Err(e) => send_event!(
                         &out,
@@ -1521,16 +1528,24 @@ async fn handle_request(
 
         Request::ExecuteAction {
             id,
+            generation,
+            uri,
             language_id,
             index,
         } => {
             if let Some(client) = primary_client_or_error(&registry, &out, id, &language_id).await {
                 let c = client;
-                match c.execute_code_action(index).await {
+                match c.execute_code_action(generation, &uri, index).await {
                     Ok(Some(edit)) => {
-                        send_event!(&out, json!({"type": "applyEdit", "id": id, "edit": edit}))
+                        send_event!(
+                            &out,
+                            json!({"type": "executeAction", "id": id, "generation": generation, "uri": uri, "edit": edit})
+                        )
                     }
-                    Ok(None) => send_event!(&out, json!({"type": "executeAction", "id": id})),
+                    Ok(None) => send_event!(
+                        &out,
+                        json!({"type": "executeAction", "id": id, "generation": generation, "uri": uri})
+                    ),
                     Err(e) => send_event!(
                         &out,
                         json!({"type": "error", "id": id, "message": e.to_string()}),

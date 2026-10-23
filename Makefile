@@ -23,6 +23,7 @@ vim-test:
 	vim -Nu NONE -n -i NONE -es -S test/daemon_restart.vim
 	vim -Nu NONE -n -i NONE -es -S test/stale_props.vim
 	vim -Nu NONE -n -i NONE -es -S test/range_requests.vim
+	vim -Nu NONE -n -i NONE -es -S test/code_action_identity.vim
 	vim -Nu NONE -n -i NONE -es -S test/resource_operations.vim
 	vim -Nu NONE -n -i NONE -es -S test/viewport_hints.vim
 	vim -Nu NONE -n -i NONE -es -S test/native_options.vim
