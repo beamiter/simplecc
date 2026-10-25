@@ -8067,6 +8067,19 @@ def ServerSupports(feature: string, ft: string): bool
   return false
 enddef
 
+# Native workbench reads only the running-server tables for this filetype.
+# Unknown feature keys retain the provider's existing old-daemon policy;
+# an explicit false, a stopped daemon or an unrelated filetype never claims it.
+export def WorkbenchSupports(feature: string): bool
+  if feature ==# 'clear_highlights'
+    return s_dochighlight_bufnr == bufnr() && bufexists(s_dochighlight_bufnr)
+  endif
+  if index(['document_highlight', 'diagnostics'], feature) < 0
+    return false
+  endif
+  return s_initialized && ServerSupports(feature, BufFt())
+enddef
+
 # Point a buffer the daemon has just been told about at the hooks above.
 #   0  never
 #   1  only where the buffer has no value of its own (the default)

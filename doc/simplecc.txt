@@ -970,7 +970,6 @@ supervisor, clone it beside the plugins, edit it there, and re-vendor: >
   ../.simplecore/vendor.sh
 <
 
-vim:tw=78:ts=8:noet:ft=help:norl:
 
 NATIVE DOCUMENTATION CARDS                       *simplecc-popup-cards*
 
@@ -1009,3 +1008,16 @@ simplecc#PopupScrollKey(direction, fallback)      *simplecc#PopupScrollKey()*
         three-line forward scroll command, negative returns backwards, zero
         returns fallback. Without a visible popup returns fallback unchanged.
         No default mappings are installed.
+
+NATIVE WORKBENCH SUPPORT                         *simplecc-workbench-support*
+
+simplecc#WorkbenchSupports(feature) reads only existing daemon/server tables.
+The closed feature vocabulary is document_highlight, diagnostics and
+clear_highlights. Request features require an initialized daemon and a server
+serving the current filetype. Explicit false capabilities are unavailable;
+missing keys retain the same legacy-daemon policy as the plugin's native Vim
+hooks. clear_highlights refers only to the current buffer's owned highlights.
+No server is started or queried by this hook. Native actions keep Vim's actual
+source window, buffer, changedtick and UTF-8 cursor coordinates.
+
+vim:tw=78:ts=8:noet:ft=help:norl:
