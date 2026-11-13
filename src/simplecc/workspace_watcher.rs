@@ -272,12 +272,12 @@ mod tests {
     async fn closed_batch_preserves_save_and_rename_semantics() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Err(notify::Error::generic("test error"))).unwrap();
-        tx.send(Ok(
-            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
-                .add_path("temp.rs".into())
-                .add_path("saved.rs".into()),
-        ))
-        .unwrap();
+        tx.send(Ok(Event::new(EventKind::Modify(ModifyKind::Name(
+            RenameMode::Both,
+        )))
+        .add_path("temp.rs".into())
+        .add_path("saved.rs".into())))
+            .unwrap();
         tx.send(Ok(change("saved.rs"))).unwrap();
         drop(tx);
         let pending = collect_batch(change("temp.rs"), &mut rx).await;
