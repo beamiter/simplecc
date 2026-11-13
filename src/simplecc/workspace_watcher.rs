@@ -13,6 +13,37 @@ const CREATED: u32 = 1;
 const CHANGED: u32 = 2;
 const DELETED: u32 = 3;
 
+const BATCH_IDLE: Duration = Duration::from_millis(120);
+const BATCH_MAX_AGE: Duration = Duration::from_millis(500);
+const BATCH_MAX_EVENTS: usize = 1024;
+
+// Cap both elapsed coalescing time and work per batch. The input queue remains
+// lossless: stopping a batch leaves later events for the next notification.
+// This is not a queue-memory bound or a bound on slow language-server writes.
+async fn collect_batch(
+    first: Event,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<notify::Result<Event>>,
+) -> HashMap<PathBuf, u32> {
+    let deadline = tokio::time::Instant::now() + BATCH_MAX_AGE;
+    let mut pending = HashMap::new();
+    merge_event(&mut pending, first);
+    for _ in 1..BATCH_MAX_EVENTS {
+        let now = tokio::time::Instant::now();
+        // A ready receiver may win a timeout even after its deadline. Check
+        // explicitly so a continuously nonempty queue cannot starve delivery.
+        if now >= deadline {
+            break;
+        }
+        let wait = BATCH_IDLE.min(deadline - now);
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Some(Ok(event))) => merge_event(&mut pending, event),
+            Ok(Some(Err(err))) => eprintln!("[simplecc] workspace watcher error: {err}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    pending
+}
+
 /// Keeps the platform watcher and its async event-forwarding task alive for
 /// the lifetime of one initialized workspace.
 pub struct WorkspaceWatcher {
@@ -37,26 +68,17 @@ impl WorkspaceWatcher {
         let task = tokio::spawn(async move {
             let mut last_julia_refresh: Option<Instant> = None;
             while let Some(result) = rx.recv().await {
-                let mut pending = HashMap::<PathBuf, u32>::new();
-                match result {
-                    Ok(event) => merge_event(&mut pending, event),
+                let first = match result {
+                    Ok(event) => event,
                     Err(err) => {
                         eprintln!("[simplecc] workspace watcher error: {err}");
                         continue;
                     }
-                }
+                };
 
-                // Editors commonly produce a burst of write/rename events for
-                // one logical save. Coalesce a short batch before notifying LSPs.
-                loop {
-                    match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
-                        Ok(Some(Ok(event))) => merge_event(&mut pending, event),
-                        Ok(Some(Err(err))) => {
-                            eprintln!("[simplecc] workspace watcher error: {err}")
-                        }
-                        Ok(None) | Err(_) => break,
-                    }
-                }
+                // Coalesce save bursts without waiting forever for a busy
+                // workspace to become quiet.
+                let pending = collect_batch(first, &mut rx).await;
 
                 let manifest_changed = pending.keys().any(|path| is_julia_manifest(path));
                 // Each language server supplies its own dynamic watcher globs.
@@ -204,6 +226,64 @@ fn is_julia_manifest(path: &Path) -> bool {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, RemoveKind};
+
+    fn change(path: &str) -> Event {
+        Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.into())
+    }
+
+    #[tokio::test]
+    async fn continuous_events_do_not_wait_for_quiet() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let producer = tokio::spawn(async move {
+            loop {
+                if tx.send(Ok(change("busy.rs"))).is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            collect_batch(change("first.rs"), &mut rx),
+        )
+        .await;
+        producer.abort();
+        let pending = result.expect("continuous events must not starve dispatch");
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn backlog_is_split_without_dropping_events() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for i in 1..=BATCH_MAX_EVENTS {
+            tx.send(Ok(change(&format!("{i}.rs")))).unwrap();
+        }
+        drop(tx);
+        let first = collect_batch(change("0.rs"), &mut rx).await;
+        assert_eq!(first.len(), BATCH_MAX_EVENTS);
+        let remaining = rx.recv().await.unwrap().unwrap();
+        let second = collect_batch(remaining, &mut rx).await;
+        assert_eq!(second.len(), 1);
+        assert!(second.contains_key(&PathBuf::from(format!("{BATCH_MAX_EVENTS}.rs"))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_batch_preserves_save_and_rename_semantics() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Err(notify::Error::generic("test error"))).unwrap();
+        tx.send(Ok(
+            Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                .add_path("temp.rs".into())
+                .add_path("saved.rs".into()),
+        ))
+        .unwrap();
+        tx.send(Ok(change("saved.rs"))).unwrap();
+        drop(tx);
+        let pending = collect_batch(change("temp.rs"), &mut rx).await;
+        assert_eq!(pending[Path::new("temp.rs")], DELETED);
+        assert_eq!(pending[Path::new("saved.rs")], CREATED);
+    }
 
     #[test]
     fn forwards_all_workspace_extensions_for_per_server_glob_matching() {
