@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use super::config::{Config, RemoteConfig};
+use super::config::{Config, ProjectApproval, RemoteConfig};
 use super::lsp::client::{LspClient, ServerEvent};
 
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(2);
@@ -354,12 +354,16 @@ impl Registry {
         &mut self,
         config_path: Option<&str>,
         remote_config: Option<&str>,
+        approval: Option<&ProjectApproval>,
     ) -> Result<usize> {
         self.prune_dead_clients();
-        let config = match remote_config {
-            Some(content) => Config::parse(content)?,
-            None => Config::load_selected(&self.root_dir, config_path)?,
-        };
+        let config = Config::load_workspace(
+            &self.root_dir,
+            config_path,
+            self.remote.as_ref(),
+            remote_config,
+            approval,
+        )?;
         let updates: Vec<_> = self
             .clients
             .iter()

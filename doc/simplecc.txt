@@ -1020,4 +1020,29 @@ hooks. clear_highlights refers only to the current buffer's owned highlights.
 No server is started or queried by this hook. Native actions keep Vim's actual
 source window, buffer, changedtick and UTF-8 cursor coordinates.
 
+PROJECT CONFIGURATION TRUST                     *simplecc-project-trust*
+
+Discovered project simplecc.json / .simplecc.json and fetched remote project
+configuration are denied by default before parsing or launching their language
+servers. Review the configuration, then run :SimpleCCTrustProject to display
+its source, exact text and SHA-256 and explicitly approve it. Approval is kept
+only in this Vim session, bound to canonical local workspace/config paths (or
+remote kind/target/root/runtime) and exact configuration bytes. Editing the
+configuration requires fresh approval, including on live reload.
+
+:SimpleCCUntrustProject clears the approval and stops current language servers.
+An unsuccessful reload retains the previous approved configuration; it never
+adopts the unapproved text. Initialization fails closed; use ordinary Vim
+editing until the project is approved. Existing explicit g:simplecc_config_path
+and ~/.config/simplecc/simplecc.json remain trusted user configuration. Do not
+set that global option from untrusted project vimrc files.
+
+This is not a sandbox for language servers or project code. Built-in/global
+servers may themselves run project tools or read project settings. Remote server
+PATH also prioritizes the project .venv/bin directory. This approval gate does
+not govern that existing executable lookup behavior. Approval is
+not persistent, and remote identity binds the selected endpoint, not a server
+host key. The local editor-to-daemon channel is trusted; clients must not send
+project_approval without user confirmation.
+
 vim:tw=78:ts=8:noet:ft=help:norl:

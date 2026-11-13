@@ -37,7 +37,7 @@ call writefile([
       \ '    with open(' .. json_encode(s:trace) .. ', "a") as out:',
       \ '        out.write(json.dumps(msg) + "\n")',
       \ '    if msg["type"] == "initialize":',
-      \ '        print(json.dumps({"type":"initialized", "id":msg["id"]}), flush=True)',
+      \ '        print(json.dumps({"type":"initialized", "id":msg["id"], "capabilities":{"project_trust":1}}), flush=True)',
       \ '    elif msg["type"] == "shutdown":',
       \ '        print(json.dumps({"type":"shutdown", "id":msg["id"]}), flush=True)',
       \ '        break',

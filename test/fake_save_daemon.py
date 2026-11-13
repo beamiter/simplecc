@@ -12,7 +12,7 @@ for line in sys.stdin:
         stream.write(json.dumps(request) + '\n')
     reply = None
     if kind == 'initialize':
-        reply = {'type': 'initialized', 'capabilities': {'save_pipeline': True}}
+        reply = {'type': 'initialized', 'capabilities': {'project_trust': 1, 'save_pipeline': True}}
     elif kind == 'shutdown':
         break
     elif kind in ('textDocument/formatting', 'textDocument/organizeImports'):

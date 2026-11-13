@@ -334,3 +334,61 @@ fn stdout_stall_interrupts_an_open_idle_stdin() {
     drop(stdin);
     assert!(status.success(), "daemon exited unsuccessfully: {status}");
 }
+
+#[test]
+fn discovered_project_config_is_rejected_before_initialization() {
+    let workspace = temporary_workspace("trust-denial");
+    let config = workspace.join("simplecc.json");
+    // The text is not even parsed before the trust check.
+    std::fs::write(&config, "untrusted invalid config").unwrap();
+    let events = run_daemon(&[
+        json!({"type":"initialize", "id":1, "root":workspace.to_string_lossy()}),
+        json!({"type":"shutdown", "id":2}),
+    ]);
+    assert!(
+        events.iter().any(|e| e["type"] == "error"
+            && e["message"].as_str().unwrap_or("").contains("not approved"))
+    );
+    assert!(!events.iter().any(|e| e["type"] == "initialized"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn approved_project_initializes_but_unapproved_reload_is_rejected() {
+    use sha2::{Digest, Sha256};
+    let workspace = std::fs::canonicalize(temporary_workspace("trust-reload")).unwrap();
+    let config = workspace.join("simplecc.json");
+    let content = r#"{"languageServers":{}}"#;
+    std::fs::write(&config, content).unwrap();
+    let approval = json!({"root":workspace.to_string_lossy(), "path":config.to_string_lossy(),
+        "sha256":format!("{:x}", Sha256::digest(content)), "remote":null});
+    let events = run_daemon(&[
+        json!({"type":"initialize", "id":1, "root":workspace.to_string_lossy(), "project_approval":approval}),
+        json!({"type":"workspace/reloadConfiguration", "id":2}),
+        json!({"type":"shutdown", "id":3}),
+    ]);
+    assert!(events.iter().any(|e| e["type"] == "initialized"));
+    assert!(events.iter().any(|e| e["id"] == 2 && e["type"] == "error"));
+    assert!(!events.iter().any(|e| e["type"] == "configurationReloaded"));
+    std::fs::remove_dir_all(workspace).unwrap();
+}
+
+#[test]
+fn remote_project_reload_rejects_changed_bytes_with_old_approval() {
+    use sha2::{Digest, Sha256};
+    let content = r#"{"languageServers":{}}"#;
+    let remote =
+        json!({"kind":"ssh", "target":"example.invalid", "root":"/workspace", "runtime":""});
+    let approval = json!({"root":"/workspace", "path":"",
+        "sha256":format!("{:x}", Sha256::digest(content)), "remote":remote});
+    let events = run_daemon(&[
+        json!({"type":"initialize", "id":1, "root":"/workspace", "remote":remote,
+            "remote_config":content, "project_approval":approval}),
+        json!({"type":"workspace/reloadConfiguration", "id":2,
+            "remoteConfig":format!("{content}\n"), "project_approval":approval}),
+        json!({"type":"shutdown", "id":3}),
+    ]);
+    assert!(events.iter().any(|e| e["type"] == "initialized"));
+    assert!(events.iter().any(|e| e["id"] == 2 && e["type"] == "error"));
+    assert!(!events.iter().any(|e| e["type"] == "configurationReloaded"));
+}

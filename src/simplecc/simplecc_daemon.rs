@@ -45,6 +45,8 @@ enum Request {
         #[serde(default)]
         config_path: Option<String>,
         #[serde(default)]
+        project_approval: Option<config::ProjectApproval>,
+        #[serde(default)]
         remote: Option<config::RemoteConfig>,
         #[serde(default)]
         remote_config: Option<String>,
@@ -76,6 +78,8 @@ enum Request {
         id: u64,
         #[serde(rename = "configPath", default)]
         config_path: Option<String>,
+        #[serde(default)]
+        project_approval: Option<config::ProjectApproval>,
         /// The remote workspace's simplecc.json, verbatim, when SimpleRemote
         /// is connected — the same text `initialize` carries in
         /// `remote_config`.  Without it a reload would search the local
@@ -1030,6 +1034,7 @@ async fn handle_request(
             id,
             root,
             config_path,
+            project_approval,
             remote,
             remote_config,
             python_path,
@@ -1040,9 +1045,15 @@ async fn handle_request(
             let load_result = tokio::task::spawn_blocking({
                 let root = root.clone();
                 let config_path = config_path.clone();
-                move || match remote_config.as_deref() {
-                    Some(content) => config::Config::parse(content),
-                    None => config::Config::load_selected(&root, config_path.as_deref()),
+                let remote = remote.clone();
+                move || {
+                    config::Config::load_workspace(
+                        &root,
+                        config_path.as_deref(),
+                        remote.as_ref(),
+                        remote_config.as_deref(),
+                        project_approval.as_ref(),
+                    )
                 }
             })
             .await
@@ -1094,7 +1105,7 @@ async fn handle_request(
 
             send_event!(
                 &out,
-                json!({"type": "initialized", "id": id, "capabilities": {"code_action_identity": true, "save_pipeline": true, "file_rename": true}})
+                json!({"type": "initialized", "id": id, "capabilities": {"project_trust": 1, "code_action_identity": true, "save_pipeline": true, "file_rename": true}})
             );
         }
 
@@ -1202,13 +1213,18 @@ async fn handle_request(
             id,
             config_path,
             remote_config,
+            project_approval,
         } => {
             let result = {
                 let mut registry = registry.write().await;
                 match registry.as_mut() {
                     Some(registry) => {
                         registry
-                            .reload_configuration(config_path.as_deref(), remote_config.as_deref())
+                            .reload_configuration(
+                                config_path.as_deref(),
+                                remote_config.as_deref(),
+                                project_approval.as_ref(),
+                            )
                             .await
                     }
                     None => Err(anyhow::anyhow!("SimpleCC is not initialized")),
@@ -2498,6 +2514,7 @@ mod request_tests {
             id: 1,
             root: "/tmp/project".to_string(),
             config_path: None,
+            project_approval: None,
             remote: None,
             remote_config: None,
             python_path: String::new(),
@@ -2660,6 +2677,7 @@ mod request_tests {
                 id,
                 config_path,
                 remote_config,
+                ..
             } => {
                 assert_eq!(id, 9);
                 assert_eq!(config_path.as_deref(), Some("/tmp/simplecc.json"));
@@ -2684,6 +2702,7 @@ mod request_tests {
                 id,
                 config_path,
                 remote_config,
+                ..
             } => {
                 assert_eq!(id, 10);
                 assert_eq!(config_path.as_deref(), Some(""));

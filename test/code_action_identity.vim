@@ -41,7 +41,7 @@ call writefile([
       \ '  case "$line" in',
       \ '    *''"type":"initialize"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',
-      \ '      printf ''{"type":"initialized","id":%s,"capabilities":{"code_action_identity":true}}\n'' "$id"',
+      \ '      printf ''{"type":"initialized","id":%s,"capabilities":{"project_trust":1,"code_action_identity":true}}\n'' "$id"',
       \ '      ;;',
       \ '    *''"type":"shutdown"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',

@@ -6,7 +6,7 @@ while IFS= read -r line; do
   id="$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')"
   case "$line" in
     *'"type":"initialize"'*)
-      printf '{"type":"initialized","id":%s}\n' "$id"
+      printf '{"type":"initialized","id":%s,"capabilities":{"project_trust":1}}\n' "$id"
       ;;
     *'"type":"textDocument/definition"'*)
       uri="$(printf '%s\n' "$line" | sed -n 's/.*"uri":"\([^"]*\)".*/\1/p')"

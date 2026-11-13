@@ -12,6 +12,7 @@ name = "simplecc-daemon"
 path = "src/simplecc/simplecc_daemon.rs"
 
 [dependencies]
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "process", "fs", "time"] }

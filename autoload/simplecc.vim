@@ -405,6 +405,14 @@ def OnBackendEvent(ev: dict<any>)
   var id = get(ev, 'id', 0)
 
   if ev.type ==# 'initialized'
+    s_project_trust_protocol = get(get(ev, 'capabilities', {}), 'project_trust', 0) == 1
+    if s_requires_project_trust && !s_project_trust_protocol
+      Stop()
+      echohl ErrorMsg
+      echom '[SimpleCC] Rebuild simplecc-daemon: project trust protocol is required'
+      echohl None
+      return
+    endif
     s_save_pipeline = get(get(ev, 'capabilities', {}), 'save_pipeline', false) == true
     s_action_identity = get(get(ev, 'capabilities', {}), 'code_action_identity', false) == true
     s_file_rename = get(get(ev, 'capabilities', {}), 'file_rename', false) == true
@@ -4822,6 +4830,69 @@ enddef
 # Public API
 # ═════════════════════════════════════════════════════════
 
+# Approvals are editor-session state, never loaded from the repository. The
+# daemon checks the exact bytes and source identity again before parsing.
+var s_project_approval: any = v:null
+var s_requires_project_trust = false
+var s_project_trust_protocol = false
+
+export def TrustProject()
+  var root = FindProjectRoot()
+  var remote = RemoteWorkspace()
+  var path = ''
+  var content = ''
+  var identity: any = v:null
+  if empty(remote)
+    if get(g:, 'simplecc_config_path', '') !=# ''
+      echom '[SimpleCC] Explicit user configuration does not require project approval'
+      return
+    endif
+    root = substitute(resolve(fnamemodify(root, ':p')), '/$', '', '')
+    if root ==# '' | root = '/' | endif
+    for name in ['simplecc.json', '.simplecc.json']
+      var candidate = root .. '/' .. name
+      if filereadable(candidate)
+        path = resolve(fnamemodify(candidate, ':p'))
+        content = join(readfile(path, 'b'), "\n")
+        break
+      endif
+    endfor
+    if path ==# ''
+      echom '[SimpleCC] No project configuration to approve'
+      return
+    endif
+  else
+    root = remote.root
+    identity = {kind: remote.kind, target: remote.target, root: remote.root,
+      runtime: get(remote, 'runtime', '')}
+    var fetched = get(g:, 'vimrc_remote_simplecc_config', v:null)
+    if type(fetched) != v:t_string
+      echom '[SimpleCC] No fetched remote project configuration to approve'
+      return
+    endif
+    content = fetched
+  endif
+  # Confirmation must show the actual executable configuration, not just a
+  # repository-supplied friendly label. Nothing starts on an automatic prompt.
+  var hash = sha256(content)
+  var location = empty(remote) ? path : string(identity)
+  if confirm('Allow this SimpleCC project configuration to launch programs?'
+      .. "\nSource: " .. location .. "\nSHA256: " .. hash
+      .. "\nReview the complete configuration:\n" .. content
+      .. "\nApproval lasts only for this Vim session and these exact bytes.",
+      "&Cancel\n&Allow", 1) != 2
+    return
+  endif
+  s_project_approval = {root: root, path: path, sha256: hash, remote: identity}
+  Restart()
+enddef
+
+export def UntrustProject()
+  s_project_approval = v:null
+  Stop()
+  echom '[SimpleCC] Project approval cleared; language servers stopped'
+enddef
+
 # Hand the daemon the project root and the config path.  Called once per live
 # daemon, from OnDaemonReady — including after an automatic crash restart, so
 # the whole LSP session is rebuilt without the user asking.
@@ -4849,11 +4920,15 @@ def SendInitialize()
   # meaningless to the remote side, so let it discover remote simplecc.json.
   var config_path = !empty(remote) ? ''
         : configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
+  # Discovery can change between this request and the daemon's read. Require
+  # the enforcing protocol even when no project file exists at this instant.
+  s_requires_project_trust = !empty(remote) || config_path ==# ''
   Send({
     type: 'initialize',
     id: id,
     root: s_root,
     config_path: config_path,
+    project_approval: s_project_approval,
     remote: empty(remote) ? v:null : {
       kind: remote.kind,
       target: remote.target,
@@ -5733,10 +5808,16 @@ export def ReloadConfiguration()
   # path would make the daemon read this machine's config for that host.
   var config_path = !empty(remote) ? ''
         : configured ==# '' ? '' : fnamemodify(expand(configured), ':p')
+  var project_selected = !empty(remote) || config_path ==# ''
+  if project_selected && !s_project_trust_protocol
+    echom '[SimpleCC] Rebuild simplecc-daemon before loading project configuration'
+    return
+  endif
   var request = {
     type: 'workspace/reloadConfiguration',
     id: NextId(),
     configPath: config_path,
+    project_approval: s_project_approval,
   }
   if !empty(remote)
     var config = get(g:, 'vimrc_remote_simplecc_config', v:null)

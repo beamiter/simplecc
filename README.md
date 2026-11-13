@@ -114,6 +114,16 @@ Without an explicit path, SimpleCC searches in this order:
 3. <code>~/.config/simplecc/simplecc.json</code>.
 4. Built-in defaults when no file exists.
 
+Discovered local and fetched remote project configurations are **blocked by
+default** because they can launch arbitrary server commands. Run
+`:SimpleCCTrustProject`, review the displayed source and complete configuration,
+and choose Allow to approve those exact bytes for this Vim session. Changing
+the file requires approval again. `:SimpleCCUntrustProject` clears approval and
+stops the servers. Explicit user configuration and the global config stay
+trusted; never set `g:simplecc_config_path` from an untrusted project vimrc.
+This is not a sandbox for language servers or the tools they invoke. Rebuild
+the daemon when upgrading: project configuration requires the trust protocol.
+
 Open or create the active project configuration with
 <code>:SimpleCCConfig</code>. <code>:SimpleCCReloadConfig</code> validates the
 replacement file and hot-pushes <code>settings</code> to servers that are
@@ -218,8 +228,8 @@ happens when SimpleRemote is not installed.
   answered once at the end.
 - **Configuration.** The daemon receives the text of the *remote*
   `simplecc.json` rather than a local path. `:SimpleCCConfig` opens that file
-  (creating it on the host if needed) and saving it hot-reloads the running
-  servers through `SimpleRemoteConfigChanged`.
+  (creating it on the host if needed). Saving attempts a reload through
+  `SimpleRemoteConfigChanged`; changed bytes require fresh project approval.
 - **Watched files.** Files created, renamed or deleted outside a buffer write —
   the remote tree, uploads — arrive as `SimpleRemoteFilesChanged` and are
   forwarded to every server as `workspace/didChangeWatchedFiles`. The daemon

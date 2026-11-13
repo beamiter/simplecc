@@ -58,7 +58,7 @@ call writefile([
       \ '  case "$line" in',
       \ '    *''"type":"initialize"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',
-      \ '      printf ''{"type":"initialized","id":%s}\n'' "$id"',
+      \ '      printf ''{"type":"initialized","id":%s,"capabilities":{"project_trust":1}}\n'' "$id"',
       \ '      ;;',
       \ '    *''"type":"workspace/reloadConfiguration"''*)',
       \ '      id="$(printf ''%s\n'' "$line" | sed -n ''s/.*"id":\([0-9][0-9]*\).*/\1/p'')"',

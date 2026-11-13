@@ -325,3 +325,6 @@ augroup simplecc
   autocmd User SimpleRemoteFilesChanged simplecc#OnRemoteFilesChanged()
   autocmd User SimpleRemoteRuntimeReady simplecc#OnRemoteRuntimeReady()
 augroup END
+
+command! -nargs=0 SimpleCCTrustProject simplecc#TrustProject()
+command! -nargs=0 SimpleCCUntrustProject simplecc#UntrustProject()

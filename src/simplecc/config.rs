@@ -1,16 +1,27 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct RemoteConfig {
     pub kind: String,
     pub target: String,
     pub root: String,
     #[serde(default)]
     pub runtime: Option<String>,
+}
+
+/// Session-only approval supplied by the trusted editor after an explicit user
+/// confirmation. This is not an authentication secret or a sandbox for LSPs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectApproval {
+    pub root: String,
+    pub path: String,
+    pub sha256: String,
+    pub remote: Option<RemoteConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -202,31 +213,80 @@ impl Config {
     /// Load the currently selected configuration without hiding parse or I/O
     /// errors. Used by live reload so an invalid edit never silently replaces
     /// the running settings with defaults.
+    #[cfg(test)]
     pub fn load_selected(project_root: &str, explicit_path: Option<&str>) -> Result<Self> {
+        Self::load_workspace(project_root, explicit_path, None, None, None)
+    }
+
+    pub fn load_workspace(
+        project_root: &str,
+        explicit_path: Option<&str>,
+        remote: Option<&RemoteConfig>,
+        remote_content: Option<&str>,
+        approval: Option<&ProjectApproval>,
+    ) -> Result<Self> {
+        if let Some(remote) = remote {
+            // Never discover a remote workspace's configuration on the local disk.
+            if let Some(content) = remote_content {
+                Self::check_approval(project_root, "", Some(remote), content, approval)?;
+                return Self::parse(content);
+            }
+            return Self::load_global();
+        }
+        if remote_content.is_some() {
+            bail!("remote configuration requires a remote workspace identity");
+        }
+        // This path is an explicit user/editor override, not project discovery.
         if let Some(path) = explicit_path.filter(|path| !path.is_empty()) {
             return Self::load(Path::new(path));
         }
-        if let Some(path) = Self::find_path(project_root) {
-            return Self::load(&path);
+        for name in ["simplecc.json", ".simplecc.json"] {
+            let path = Path::new(project_root).join(name);
+            if path.exists() {
+                let root = std::fs::canonicalize(project_root)?;
+                let path = std::fs::canonicalize(path)?;
+                let content = std::fs::read_to_string(&path)?;
+                Self::check_approval(
+                    &root.to_string_lossy(),
+                    &path.to_string_lossy(),
+                    None,
+                    &content,
+                    approval,
+                )?;
+                // Parse precisely the bytes checked above; never reopen after approval.
+                return Self::parse(&content);
+            }
         }
-        Ok(Self::default())
+        Self::load_global()
     }
 
-    fn find_path(project_root: &str) -> Option<PathBuf> {
-        let project_config = Path::new(project_root).join("simplecc.json");
-        if project_config.exists() {
-            return Some(project_config);
+    fn check_approval(
+        root: &str,
+        path: &str,
+        remote: Option<&RemoteConfig>,
+        content: &str,
+        approval: Option<&ProjectApproval>,
+    ) -> Result<()> {
+        let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        if approval.is_some_and(|a| {
+            a.root == root && a.path == path && a.remote.as_ref() == remote && a.sha256 == digest
+        }) {
+            return Ok(());
         }
+        bail!(
+            "project configuration is not approved or has changed; review it and run :SimpleCCTrustProject (session-only)"
+        )
+    }
 
-        let dot_config = Path::new(project_root).join(".simplecc.json");
-        if dot_config.exists() {
-            return Some(dot_config);
-        }
-
-        std::env::var_os("HOME")
+    fn load_global() -> Result<Self> {
+        if let Some(path) = std::env::var_os("HOME")
             .map(PathBuf::from)
             .map(|home| home.join(".config/simplecc/simplecc.json"))
             .filter(|path| path.exists())
+        {
+            return Self::load(&path);
+        }
+        Ok(Self::default())
     }
 
     /// Find the deterministic primary server for a filetype. Higher explicit
@@ -369,6 +429,130 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workspace(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simplecc-trust-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    fn approval(root: &Path, path: &Path, content: &str) -> ProjectApproval {
+        ProjectApproval {
+            root: root.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            sha256: format!("{:x}", Sha256::digest(content.as_bytes())),
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn project_requires_exact_content_source_and_workspace_approval() {
+        let root = workspace("exact");
+        let path = root.join("simplecc.json");
+        let content = r#"{"languageServers":{}}"#;
+        std::fs::write(&path, content).unwrap();
+        let load = |a: Option<&ProjectApproval>| {
+            Config::load_workspace(root.to_str().unwrap(), None, None, None, a)
+        };
+        assert!(load(None).unwrap_err().to_string().contains("not approved"));
+        let good = approval(&root, &path, content);
+        assert!(load(Some(&good)).unwrap().language_servers.is_empty());
+        for changed in [
+            ProjectApproval {
+                root: "/other".into(),
+                ..good.clone()
+            },
+            ProjectApproval {
+                path: "/other/simplecc.json".into(),
+                ..good.clone()
+            },
+            ProjectApproval {
+                sha256: "".into(),
+                ..good.clone()
+            },
+        ] {
+            assert!(load(Some(&changed)).is_err());
+        }
+        std::fs::write(&path, format!("{content} ")).unwrap();
+        assert!(load(Some(&good)).is_err());
+        // An explicit editor/user override intentionally keeps its old behavior.
+        assert!(
+            Config::load_workspace(root.to_str().unwrap(), path.to_str(), None, None, None).is_ok()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_does_not_follow_project_symlink_retargeting() {
+        let root = workspace("symlink");
+        let a = root.join("a.json");
+        let b = root.join("b.json");
+        let selected = root.join("simplecc.json");
+        let content = r#"{"languageServers":{}}"#;
+        std::fs::write(&a, content).unwrap();
+        std::fs::write(&b, content).unwrap();
+        std::os::unix::fs::symlink(&a, &selected).unwrap();
+        let approved = approval(&root, &a, content);
+        assert!(
+            Config::load_workspace(root.to_str().unwrap(), None, None, None, Some(&approved))
+                .is_ok()
+        );
+        std::fs::remove_file(&selected).unwrap();
+        std::os::unix::fs::symlink(&b, &selected).unwrap();
+        assert!(
+            Config::load_workspace(root.to_str().unwrap(), None, None, None, Some(&approved))
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_approval_is_bound_to_host_runtime_root_and_bytes() {
+        let content = r#"{"languageServers":{}}"#;
+        let remote = RemoteConfig {
+            kind: "ssh".into(),
+            target: "host-a".into(),
+            root: "/project".into(),
+            runtime: Some("".into()),
+        };
+        let a = ProjectApproval {
+            root: "/project".into(),
+            path: "".into(),
+            sha256: format!("{:x}", Sha256::digest(content)),
+            remote: Some(remote.clone()),
+        };
+        let load = |r: &RemoteConfig, c: &str, a| {
+            Config::load_workspace("/project", None, Some(r), Some(c), a)
+        };
+        assert!(load(&remote, content, None).is_err());
+        assert!(load(&remote, content, Some(&a)).is_ok());
+        for changed in [
+            RemoteConfig {
+                target: "host-b".into(),
+                ..remote.clone()
+            },
+            RemoteConfig {
+                runtime: Some("other".into()),
+                ..remote.clone()
+            },
+            RemoteConfig {
+                root: "/elsewhere".into(),
+                ..remote.clone()
+            },
+        ] {
+            assert!(load(&changed, content, Some(&a)).is_err());
+        }
+        assert!(load(&remote, "{}", Some(&a)).is_err());
+        assert!(Config::load_workspace("/project", None, None, Some(content), Some(&a)).is_err());
+    }
 
     #[test]
     fn julia_defaults_are_merged_with_user_overrides() {
