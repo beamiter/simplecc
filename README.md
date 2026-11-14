@@ -603,11 +603,21 @@ write completion; the controller does not announce premature success.
 
 `make vim-check` also runs `python3 test/save_insert_pty.py`: a standard-library PTY regression for Insert Ctrl-S, completion preservation, deferred-save cleanup and typing races (Linux/macOS, Python 3 and Vim required).
 
-### Workspace watcher event loss
+### Workspace watcher limits and event loss
 
-If the operating-system watcher reports lost events or an error, SimpleCC emits
-one persistent error message per watcher lifetime. File-state consistency is
-then unknown even if later events arrive. Automatic rescan/reconciliation is not
-implemented: run `:SimpleCCRestart` to reinitialize language servers and watching,
-and inspect diagnostics before relying on them. The input event queue remains
-unbounded; batch size and age limits are not a queue-memory bound.
+The watcher input queue admits up to 16,384 events and 16 MiB of path bytes.
+Individual events are limited to 256 paths and 64 KiB of path bytes. These are
+input-queue limits, not a whole-daemon memory bound. Ordinary access noise is
+ignored; queued changes retain the existing 1,024-event/500 ms batch limits.
+
+If an input limit is exceeded, or the platform watcher reports lost events or
+an error, SimpleCC disables further watcher forwarding and emits one persistent
+error message. A write already in progress may complete; it is not canceled
+mid-JSON. Reporting runs independently so a slow language server cannot hide
+the failure. It does not silently discard events and continue claiming health.
+
+Automatic rescan/reconciliation is not implemented. Run `:SimpleCCRestart` to
+reinitialize language servers and watching, then inspect diagnostics before
+relying on them. This explicit restart creates a fresh input queue; ordinary
+subsequent events and Julia environment switches cannot silently re-enable a
+failed watcher. No synthetic deletions are inferred from a partial scan.
