@@ -621,3 +621,16 @@ reinitialize language servers and watching, then inspect diagnostics before
 relying on them. This explicit restart creates a fresh input queue; ordinary
 subsequent events and Julia environment switches cannot silently re-enable a
 failed watcher. No synthetic deletions are inferred from a partial scan.
+
+### Symlink bases in watched-file registrations
+
+For local language servers, an existing `RelativePattern.baseUri` also matches
+notifications under its canonical filesystem path. The original lexical URI
+matching remains available. Resolution runs once at registration, outside async
+workers, not for every event; deletions still match after files or directories
+have disappeared. A retargeted symlink needs re-registration to refresh the
+canonical base. Unresolvable bases retain lexical matching only. Resolution has
+a 500 ms deadline and at most four outstanding workers; timeout or saturation
+also keeps lexical matching, and late results cannot change the registration.
+Remote server registrations never resolve paths using the local filesystem.
+Notification URIs are not rewritten.

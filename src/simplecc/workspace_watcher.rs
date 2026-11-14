@@ -730,6 +730,22 @@ mod tests {
 
     #[tokio::test]
     async fn recreated_watcher_delivers_real_create_and_delete_to_lsp() {
+        watcher_lifecycle_with_base(false, false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_relative_registration_delivers_real_create_and_delete_to_lsp() {
+        watcher_lifecycle_with_base(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_workspace_with_string_glob_remains_compatible() {
+        watcher_lifecycle_with_base(true, false).await;
+    }
+
+    async fn watcher_lifecycle_with_base(alias_root: bool, explicit_base: bool) {
         use serde_json::{Value, json};
         let root = std::env::temp_dir().join(format!(
             "simplecc-watcher-restart-{}-{}",
@@ -743,6 +759,17 @@ mod tests {
         // macOS temp paths may be aliases under /private; match the watcher's
         // canonical root for both dynamic registration and expected URIs.
         let root = std::fs::canonicalize(root).unwrap();
+        let alias = root.with_extension("alias");
+        if alias_root {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+        }
+        let requested_root = if alias_root { &alias } else { &root };
+        let base_uri = if explicit_base {
+            url::Url::from_directory_path(&alias).unwrap().to_string()
+        } else {
+            String::new()
+        };
         let server = r#"
 import json, sys
 changes, waiting = [], []
@@ -766,7 +793,7 @@ while True:
     elif method == 'initialized':
         send(dict(id=999, method='client/registerCapability', params={'registrations': [{
             'id': 'files', 'method': 'workspace/didChangeWatchedFiles',
-            'registerOptions': {'watchers': [{'globPattern': '**/*.rs', 'kind': 7}]}
+            'registerOptions': {'watchers': [{'globPattern': ({'baseUri': sys.argv[1], 'pattern': '**/*.rs'} if sys.argv[1] else '**/*.rs'), 'kind': 7}]}
         }]}))
     elif method == 'test/ready':
         if registered: send(dict(id=msg['id'], result=True))
@@ -784,14 +811,14 @@ while True:
     elif method == 'exit': break
 "#;
         let config = serde_json::from_value(json!({"languageServers": {"watcher-test": {
-            "command": "python3", "args": ["-u", "-c", server], "filetypes": ["testwatch"]
+            "command": "python3", "args": ["-u", "-c", server, base_uri], "filetypes": ["testwatch"]
         }}}))
         .unwrap();
         let (sender, mut output) = tokio::sync::mpsc::channel(64);
         let out = EventTx::new(sender);
         let mut reg = Registry::new(
             config,
-            root.to_string_lossy().into_owned(),
+            requested_root.to_string_lossy().into_owned(),
             None,
             out.clone(),
         );
@@ -805,8 +832,12 @@ while True:
             json!(true)
         );
         let registry = Arc::new(RwLock::new(Some(reg)));
-        let mut old =
-            WorkspaceWatcher::start(root.to_str().unwrap(), registry.clone(), out.clone()).unwrap();
+        let mut old = WorkspaceWatcher::start(
+            requested_root.to_str().unwrap(),
+            registry.clone(),
+            out.clone(),
+        )
+        .unwrap();
         old.input_state.fail();
         assert!(old.watch_julia_environment(root.to_str().unwrap()).is_err());
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -820,7 +851,8 @@ while True:
         .unwrap();
         drop(old);
         let mut fresh =
-            WorkspaceWatcher::start(root.to_str().unwrap(), registry.clone(), out).unwrap();
+            WorkspaceWatcher::start(requested_root.to_str().unwrap(), registry.clone(), out)
+                .unwrap();
         fresh
             .watch_julia_environment(root.to_str().unwrap())
             .unwrap();
@@ -856,6 +888,9 @@ while True:
             .unwrap()
             .shutdown_all()
             .await;
+        if alias_root {
+            std::fs::remove_file(alias).unwrap();
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

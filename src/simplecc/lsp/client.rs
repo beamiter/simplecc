@@ -166,6 +166,9 @@ struct SemanticTokenCache {
 #[derive(Clone)]
 struct WatchedFilePattern {
     base_uri: url::Url,
+    // Registration-time snapshot for local symlink/alias bases. No per-event
+    // filesystem lookup: deleted files and removed base directories still match.
+    canonical_base_uri: Option<url::Url>,
     matcher: GlobMatcher,
     kind: u8,
 }
@@ -196,6 +199,9 @@ impl WatchedFilePattern {
             return false;
         };
         relative_uri_path(&self.base_uri, &uri).is_some_and(|path| self.matcher.is_match(path))
+            || self.canonical_base_uri.as_ref().is_some_and(|base| {
+                relative_uri_path(base, &uri).is_some_and(|path| self.matcher.is_match(path))
+            })
     }
 }
 
@@ -277,6 +283,7 @@ fn compile_watched_file_pattern(
         .compile_matcher();
     Ok(WatchedFilePattern {
         base_uri,
+        canonical_base_uri: None,
         matcher,
         kind: watcher.kind.map_or(7, |kind| kind.bits()),
     })
@@ -316,6 +323,72 @@ fn parse_registrations(
             ))
         })
         .collect()
+}
+
+type ParsedRegistrations = Vec<(String, RegisteredCapability)>;
+
+const WATCH_BASE_RESOLUTION_TIMEOUT: Duration = Duration::from_millis(500);
+// A timed-out filesystem syscall cannot be canceled. Keep its permit until it
+// actually returns, so unresponsive FUSE/NFS paths cannot pile up worker threads.
+static WATCH_BASE_RESOLUTION_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+
+async fn try_resolve_registration_bases(
+    registrations: ParsedRegistrations,
+    slots: Arc<tokio::sync::Semaphore>,
+    deadline: Duration,
+    resolve: impl FnOnce(ParsedRegistrations) -> ParsedRegistrations + Send + 'static,
+) -> ParsedRegistrations {
+    let Ok(permit) = slots.try_acquire_owned() else {
+        return registrations;
+    };
+    let candidate = registrations.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        resolve(candidate)
+    });
+    match tokio::time::timeout(deadline, job).await {
+        Ok(Ok(resolved)) => resolved,
+        // Fallback is the original lexical registration. A detached worker has
+        // only private data and can never publish stale bases after timeout.
+        _ => registrations,
+    }
+}
+
+// Only local language servers may interpret file:// bases on this machine.
+// A remote root with the same spelling must never resolve through local links.
+async fn parse_server_registrations(
+    params: Option<Value>,
+    workspace_root_uri: String,
+    local_filesystem: bool,
+) -> std::result::Result<ParsedRegistrations, String> {
+    let registrations = parse_registrations(params.as_ref(), &workspace_root_uri)?;
+    if !local_filesystem
+        || !registrations
+            .iter()
+            .any(|(_, cap)| cap.watched_files.is_some())
+    {
+        return Ok(registrations);
+    }
+    Ok(try_resolve_registration_bases(
+        registrations,
+        WATCH_BASE_RESOLUTION_SLOTS.clone(),
+        WATCH_BASE_RESOLUTION_TIMEOUT,
+        |mut registrations| {
+            for (_, capability) in &mut registrations {
+                for watcher in capability.watched_files.iter_mut().flatten() {
+                    watcher.canonical_base_uri = watcher
+                        .base_uri
+                        .to_file_path()
+                        .ok()
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                        .and_then(|path| url::Url::from_file_path(path).ok());
+                }
+            }
+            registrations
+        },
+    )
+    .await)
 }
 
 /// A single LSP server client.
@@ -483,6 +556,7 @@ impl LspClient {
                             &dynamic_registrations_clone,
                             &workspace_root,
                             &editor_ready_clone,
+                            client_process_id.is_some(),
                         )
                         .await;
                     } else {
@@ -3195,6 +3269,7 @@ async fn handle_server_request(
     dynamic_registrations: &Arc<Mutex<DynamicRegistrations>>,
     workspace_root: &Arc<(String, String)>,
     editor_ready: &Arc<AtomicBool>,
+    local_filesystem: bool,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
@@ -3383,7 +3458,13 @@ async fn handle_server_request(
         }
         "client/registerCapability" => {
             let root_uri = &workspace_root.0;
-            let resp = match parse_registrations(msg.get("params"), root_uri) {
+            let resp = match parse_server_registrations(
+                msg.get("params").cloned(),
+                root_uri.clone(),
+                local_filesystem,
+            )
+            .await
+            {
                 Ok(registrations) => {
                     dynamic_registrations.lock().await.register(registrations);
                     json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null })
@@ -3787,6 +3868,182 @@ mod configuration_tests {
             !registrations.matches_watched_file("file:///workspace/config/nested/rustfmt.toml", 3)
         );
         assert!(!registrations.matches_watched_file("file:///workspace/config/rustfmt.toml", 2));
+    }
+
+    #[tokio::test]
+    async fn stalled_base_resolution_keeps_lexical_registration_and_bounded_workers() {
+        let params = json!({"registrations": [{
+            "id": "files", "method": WATCHED_FILES_METHOD,
+            "registerOptions": {"watchers": [{"globPattern": "*.rs"}]}
+        }]});
+        let registrations = parse_registrations(Some(&params), "file:///workspace/").unwrap();
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = tokio::spawn(try_resolve_registration_bases(
+            registrations.clone(),
+            slots.clone(),
+            Duration::from_millis(20),
+            move |mut candidate| {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+                candidate[0].1.watched_files.as_mut().unwrap()[0].canonical_base_uri =
+                    Some(url::Url::parse("file:///late/").unwrap());
+                candidate
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let fallback = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let pattern = &fallback[0].1.watched_files.as_ref().unwrap()[0];
+        assert!(pattern.canonical_base_uri.is_none());
+        assert!(pattern.matches("file:///workspace/file.rs", 3));
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "timed-out syscall still owns its worker slot"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = ran.clone();
+        let second = try_resolve_registration_bases(
+            registrations,
+            slots.clone(),
+            Duration::from_secs(1),
+            move |candidate| {
+                observed.store(true, Ordering::Release);
+                candidate
+            },
+        )
+        .await;
+        assert!(
+            !ran.load(Ordering::Acquire),
+            "no worker may start while the slots are occupied"
+        );
+        assert!(
+            second[0].1.watched_files.as_ref().unwrap()[0]
+                .canonical_base_uri
+                .is_none()
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slots.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            pattern.canonical_base_uri.is_none(),
+            "late completion cannot mutate the installed fallback"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_watched_aliases_keep_delete_matching_and_remote_isolation() {
+        let root = std::env::temp_dir().join(format!(
+            "simplecc-base #别名-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let first = root.join("first");
+        let second = root.join("second");
+        let alias = root.join("alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let uri = |path: &std::path::Path| url::Url::from_file_path(path).unwrap().to_string();
+        let alias_uri = uri(&alias);
+        let first_deleted = uri(&first.join("already-deleted.rs"));
+        let second_deleted = uri(&second.join("already-deleted.rs"));
+        let lexical_deleted = uri(&alias.join("already-deleted.rs"));
+        let params = |base| {
+            json!({"registrations": [{
+                "id": "alias", "method": WATCHED_FILES_METHOD,
+                "registerOptions": {"watchers": [{
+                    "globPattern": {"baseUri": base, "pattern": "*.rs"}, "kind": 4
+                }]}
+            }]})
+        };
+        // Both RelativePattern baseUri shapes must preserve the same behavior.
+        for base in [json!(alias_uri), json!({"uri": alias_uri, "name": "alias"})] {
+            let local = parse_server_registrations(Some(params(base.clone())), uri(&root), true)
+                .await
+                .unwrap();
+            let pattern = &local[0].1.watched_files.as_ref().unwrap()[0];
+            assert!(pattern.matches(&first_deleted, 3));
+            assert!(pattern.matches(&lexical_deleted, 3));
+            assert!(
+                !pattern.matches(&first_deleted, 1),
+                "keep event-kind filtering"
+            );
+            assert!(
+                !pattern.matches(&uri(&first.join("nested/file.rs")), 3),
+                "keep glob depth"
+            );
+            assert!(
+                !pattern.matches(&uri(&root.join("first-other/file.rs")), 3),
+                "keep directory boundaries"
+            );
+            assert!(
+                !pattern.matches(&uri(&first.join("file.py")), 3),
+                "keep extension filtering"
+            );
+            let remote = parse_server_registrations(Some(params(base)), uri(&root), false)
+                .await
+                .unwrap();
+            let remote_pattern = &remote[0].1.watched_files.as_ref().unwrap()[0];
+            assert!(remote_pattern.canonical_base_uri.is_none());
+            assert!(
+                !remote_pattern.matches(&first_deleted, 3),
+                "remote URIs must not resolve through a coincident local symlink"
+            );
+            assert!(remote_pattern.matches(&lexical_deleted, 3));
+        }
+        let registered =
+            parse_server_registrations(Some(params(json!(alias_uri))), uri(&root), true)
+                .await
+                .unwrap();
+        let old = &registered[0].1.watched_files.as_ref().unwrap()[0];
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        assert!(
+            old.matches(&first_deleted, 3),
+            "existing registration pins its resolved base"
+        );
+        assert!(!old.matches(&second_deleted, 3));
+        let replaced = parse_server_registrations(Some(params(json!(alias_uri))), uri(&root), true)
+            .await
+            .unwrap();
+        let new = &replaced[0].1.watched_files.as_ref().unwrap()[0];
+        assert!(new.matches(&second_deleted, 3));
+        assert!(!new.matches(&first_deleted, 3));
+        std::fs::remove_dir(&first).unwrap();
+        assert!(
+            old.matches(&first_deleted, 3),
+            "deletion must still match after even the base directory is gone"
+        );
+        std::fs::remove_file(&alias).unwrap();
+        let missing = parse_server_registrations(Some(params(json!(alias_uri))), uri(&root), true)
+            .await
+            .unwrap();
+        let missing = &missing[0].1.watched_files.as_ref().unwrap()[0];
+        assert!(missing.canonical_base_uri.is_none());
+        assert!(
+            missing.matches(&lexical_deleted, 3),
+            "unresolvable local bases retain lexical semantics"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
