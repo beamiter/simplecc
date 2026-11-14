@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased - 2026-11-14
+
+### 文件快速删除与重建不再被 watched-file 去重吞掉
+
+- 仅对重复的 Changed 通知保留原有 250ms 去重；Created/Deleted 始终按序转发，
+  避免快速创建、删除、再创建后语言服务器仍认为文件不存在。
+- 创建/删除在按服务器 watcher glob 和事件掩码过滤前清除该 URI 的 Changed
+  缓存；只订阅 Changed 的服务器也能收到文件重建后的写入。
+- 新增真实 LSP stdio 回归，覆盖同批与跨批重建、被事件掩码过滤的生命周期，以及
+  仍然生效的按 URI 写入去重和 glob/工作区边界过滤。
+
 ## Unreleased - 2026-10-22
 
 ### 原生行末提示与 CodeLens 生命周期

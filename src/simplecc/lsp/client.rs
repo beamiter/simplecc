@@ -358,9 +358,10 @@ pub struct LspClient {
     /// Settings served through `workspace/configuration`. Kept mutable so a
     /// config reload can update a running language server.
     settings: Arc<RwLock<Value>>,
-    /// Recent watched-file notifications, used to collapse the duplicate
-    /// event commonly produced by Vim's save hook and the platform watcher.
-    watched_file_notifications: Arc<Mutex<HashMap<(String, u32), Instant>>>,
+    /// Recent change notifications, used to collapse duplicate writes from
+    /// Vim's save hook and the platform watcher. Create/delete edges invalidate
+    /// this cache even when the server's registration filters them out.
+    watched_file_notifications: Arc<Mutex<HashMap<String, Instant>>>,
     alive: Arc<AtomicBool>,
     server_name: String,
 }
@@ -996,34 +997,34 @@ impl LspClient {
     pub async fn did_change_watched_files(&self, changes: &[(String, u32)]) -> Result<()> {
         let changes: Vec<_> = {
             let registrations = self.dynamic_registrations.lock().await;
+            let mut recent = self.watched_file_notifications.lock().await;
+            let now = Instant::now();
+            recent.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(2));
             changes
                 .iter()
-                .filter(|(uri, change_type)| registrations.matches_watched_file(uri, *change_type))
-                .cloned()
+                .filter_map(|(uri, change_type)| {
+                    // A recreated file is a new incarnation of the URI. Never
+                    // debounce lifecycle edges, and invalidate writes before
+                    // filtering: change-only registrations still need the next
+                    // write after a delete/create that they did not subscribe to.
+                    if *change_type != 2 {
+                        recent.remove(uri);
+                    }
+                    if !registrations.matches_watched_file(uri, *change_type) {
+                        return None;
+                    }
+                    if *change_type == 2 {
+                        if recent.get(uri).is_some_and(|seen| {
+                            now.duration_since(*seen) < Duration::from_millis(250)
+                        }) {
+                            return None;
+                        }
+                        recent.insert(uri.clone(), now);
+                    }
+                    Some(json!({ "uri": uri, "type": change_type }))
+                })
                 .collect()
         };
-        if changes.is_empty() {
-            return Ok(());
-        }
-
-        let now = Instant::now();
-        let mut recent = self.watched_file_notifications.lock().await;
-        recent.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(2));
-        let changes: Vec<_> = changes
-            .into_iter()
-            .filter_map(|(uri, change_type)| {
-                let key = (uri.clone(), change_type);
-                if recent
-                    .get(&key)
-                    .is_some_and(|seen| now.duration_since(*seen) < Duration::from_millis(250))
-                {
-                    return None;
-                }
-                recent.insert(key, now);
-                Some(json!({ "uri": uri, "type": change_type }))
-            })
-            .collect();
-        drop(recent);
         if changes.is_empty() {
             return Ok(());
         }
@@ -3553,6 +3554,144 @@ fn configuration_response(params: Option<&Value>, settings: &Value) -> Vec<Value
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(all(test, unix))]
+mod watched_file_tests {
+    use super::*;
+
+    // Capture notifications through a real framed LSP transport. The request
+    // after the batches is an ordering barrier, with no sleeps or OS watcher
+    // timing involved in the assertions.
+    async fn capture(kind: u32, batches: &[&[(&str, u32)]]) -> Value {
+        let server = r#"
+import json, sys
+changes = []
+def send(value):
+    body = json.dumps(dict(jsonrpc='2.0', **value)).encode()
+    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+    sys.stdout.buffer.flush()
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b'\r\n', b'\n'):
+            break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    msg = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method = msg.get('method')
+    if method == 'initialize':
+        send(dict(id=msg['id'], result={'capabilities': {}}))
+    elif method == 'workspace/didChangeWatchedFiles':
+        changes.extend(msg['params']['changes'])
+    elif method == 'test/changes':
+        send(dict(id=msg['id'], result=changes))
+    elif method == 'shutdown':
+        send(dict(id=msg['id'], result=None))
+    elif method == 'exit':
+        break
+"#;
+        let (client, _events) = LspClient::start(
+            "watched-files-test",
+            "python3",
+            &["-u".into(), "-c".into(), server.into()],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+        .unwrap();
+        let registrations = json!({ "registrations": [{
+            "id": "sources",
+            "method": WATCHED_FILES_METHOD,
+            "registerOptions": { "watchers": [{ "globPattern": "**/*.rs", "kind": kind }] }
+        }] });
+        client
+            .dynamic_registrations
+            .lock()
+            .await
+            .register(parse_registrations(Some(&registrations), "file:///tmp/").unwrap());
+        for batch in batches {
+            let changes: Vec<_> = batch
+                .iter()
+                .map(|(uri, kind)| (uri.to_string(), *kind))
+                .collect();
+            client.did_change_watched_files(&changes).await.unwrap();
+        }
+        let captured = client.request("test/changes", Value::Null).await.unwrap();
+        client.shutdown().await.unwrap();
+        captured
+    }
+
+    #[tokio::test]
+    async fn repeated_create_delete_transitions_reach_the_server() {
+        let uri = "file:///tmp/recreated.rs";
+        let captured = capture(7, &[&[(uri, 1), (uri, 3), (uri, 1), (uri, 3)]]).await;
+        assert_eq!(
+            captured,
+            json!([
+                { "uri": uri, "type": 1 }, { "uri": uri, "type": 3 },
+                { "uri": uri, "type": 1 }, { "uri": uri, "type": 3 }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_transitions_survive_across_batches() {
+        let uri = "file:///tmp/recreated.rs";
+        let captured = capture(7, &[&[(uri, 1)], &[(uri, 3)], &[(uri, 1)], &[(uri, 3)]]).await;
+        assert_eq!(
+            captured,
+            json!([
+                { "uri": uri, "type": 1 }, { "uri": uri, "type": 3 },
+                { "uri": uri, "type": 1 }, { "uri": uri, "type": 3 }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_lifecycle_transition_invalidates_changed_deduplication() {
+        let uri = "file:///tmp/recreated.rs";
+        // This server watches changes only. The filtered delete/create must
+        // still separate writes to two different incarnations of the file.
+        let captured = capture(2, &[&[(uri, 2), (uri, 3), (uri, 1), (uri, 2)]]).await;
+        assert_eq!(
+            captured,
+            json!([
+                { "uri": uri, "type": 2 }, { "uri": uri, "type": 2 }
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_changes_still_coalesce_per_uri_with_registration_filters() {
+        let first = "file:///tmp/first.rs";
+        let second = "file:///tmp/second.rs";
+        let captured = capture(
+            2,
+            &[&[
+                (first, 2),
+                (first, 2),
+                (second, 2),
+                (second, 2),
+                ("file:///tmp/unwatched.py", 2),
+                ("file:///elsewhere/outside.rs", 2),
+            ]],
+        )
+        .await;
+        assert_eq!(
+            captured,
+            json!([
+                { "uri": first, "type": 2 }, { "uri": second, "type": 2 }
+            ])
+        );
+    }
 }
 
 fn configuration_value(settings: &Value, section: &str) -> Value {
