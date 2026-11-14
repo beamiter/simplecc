@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-11-14
 
+### LSP transport 结束时取消管道读取任务
+
+- 显式终止或释放 transport 时取消其 stdout/stderr 读取任务，避免语言服务器
+  已退出但后代进程仍持有管道时，旧读取任务和消息通道继续存活。
+- 保留现有关闭 stdin、等待及杀死直接子进程的行为；不声称终止服务器的全部
+  后代进程，也不改变客户端自动恢复或 watcher 重新扫描策略。
+- 新增真实 shell 子进程回归，验证后代仍持有管道时 terminate/drop 能释放
+  stdout 通道并结束两项读取任务。
+
+
 ### 文件快速删除与重建不再被 watched-file 去重吞掉
 
 - 仅对重复的 Changed 通知保留原有 250ms 去重；Created/Deleted 始终按序转发，

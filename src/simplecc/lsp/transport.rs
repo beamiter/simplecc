@@ -14,6 +14,7 @@ pub struct LspTransport {
     writer: Option<ChildStdin>,
     child: Child,
     terminated: bool,
+    io_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl LspTransport {
@@ -45,16 +46,18 @@ impl LspTransport {
 
         let (tx, rx) = mpsc::channel::<Value>(256);
 
-        // Spawn reader task
-        tokio::spawn(async move {
+        // Own both reader tasks: child descendants may inherit their pipes, so
+        // process exit alone is not enough to release these tasks.
+        let mut io_tasks = Vec::with_capacity(2);
+        io_tasks.push(tokio::spawn(async move {
             if let Err(e) = read_loop(stdout, tx).await {
                 eprintln!("[lsp-transport] read_loop error: {e}");
             }
-        });
+        }));
 
         // Spawn stderr drain
         if let Some(mut stderr) = child.stderr.take() {
-            tokio::spawn(async move {
+            io_tasks.push(tokio::spawn(async move {
                 // Read bounded chunks: `read_line` can grow without limit if a
                 // broken server writes an endless line to stderr.
                 let mut chunk = [0u8; STDERR_CHUNK_BYTES];
@@ -67,7 +70,7 @@ impl LspTransport {
                         ),
                     }
                 }
-            });
+            }));
         }
 
         Ok((
@@ -75,9 +78,16 @@ impl LspTransport {
                 writer: Some(writer),
                 child,
                 terminated: false,
+                io_tasks,
             },
             rx,
         ))
+    }
+
+    fn abort_io_tasks(&self) {
+        for task in &self.io_tasks {
+            task.abort();
+        }
     }
 
     /// Send a JSON-RPC message with Content-Length header.
@@ -108,6 +118,10 @@ impl LspTransport {
         // Closing stdin also lets a server whose stdout already disappeared
         // observe the disconnect and exit without being killed.
         self.writer.take();
+        // Schedule cancellation without waiting for external diagnostic output
+        // or a descendant to close inherited pipes.
+        self.abort_io_tasks();
+        self.io_tasks.clear();
 
         match tokio::time::timeout(std::time::Duration::from_secs(2), self.child.wait()).await {
             Ok(status) => {
@@ -122,6 +136,12 @@ impl LspTransport {
         }
         self.terminated = true;
         Ok(())
+    }
+}
+
+impl Drop for LspTransport {
+    fn drop(&mut self) {
+        self.abort_io_tasks();
     }
 }
 
@@ -272,5 +292,90 @@ mod tests {
         assert!(transport.terminated);
         assert!(transport.writer.is_none());
         assert!(transport.child.try_wait().unwrap().is_some());
+    }
+    // The helper leaves a descendant holding both pipes after the actual server
+    // exits. It is deliberately cleaned up even if a regression assertion fails.
+    #[cfg(unix)]
+    struct PipeHolder(i32);
+
+    #[cfg(unix)]
+    impl Drop for PipeHolder {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGTERM);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn exited_server_with_inherited_pipes()
+    -> (LspTransport, mpsc::Receiver<Value>, PipeHolder) {
+        let script = r#"sleep 30 &
+body="{\"pid\":$!}"
+printf 'Content-Length: %s\r\n\r\n%s' "${#body}" "$body"
+"#;
+        let (mut transport, mut incoming) =
+            LspTransport::spawn("sh", &["-c".into(), script.into()], None).unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let holder = PipeHolder(message["pid"].as_i64().unwrap() as i32);
+        tokio::time::timeout(std::time::Duration::from_secs(5), transport.child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        (transport, incoming, holder)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminate_reclaims_readers_when_descendant_holds_pipes() {
+        let (mut transport, mut incoming, _holder) = exited_server_with_inherited_pipes().await;
+        let readers: Vec<_> = transport
+            .io_tasks
+            .iter()
+            .map(|task| task.abort_handle())
+            .collect();
+        transport.terminate().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.recv())
+                .await
+                .expect("stdout reader retained after transport termination")
+                .is_none()
+        );
+        assert_readers_finished(&readers).await;
+        transport.terminate().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drop_reclaims_readers_when_descendant_holds_pipes() {
+        let (transport, mut incoming, _holder) = exited_server_with_inherited_pipes().await;
+        let readers: Vec<_> = transport
+            .io_tasks
+            .iter()
+            .map(|task| task.abort_handle())
+            .collect();
+        drop(transport);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), incoming.recv())
+                .await
+                .expect("stdout reader retained after transport drop")
+                .is_none()
+        );
+        assert_readers_finished(&readers).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_readers_finished(readers: &[tokio::task::AbortHandle]) {
+        assert_eq!(readers.len(), 2, "both stdout and stderr must be owned");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while readers.iter().any(|reader| !reader.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pipe reader task was not reclaimed");
     }
 }
