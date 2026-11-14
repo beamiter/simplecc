@@ -391,6 +391,19 @@ async fn parse_server_registrations(
     .await)
 }
 
+// Shared only by client clones, never by the dispatcher itself. Cancellation
+// asks the dispatcher to leave its loop and run the same cleanup/Stopped path
+// as EOF; aborting the task here could discard the final status notification.
+struct DispatcherLifetime(Option<oneshot::Sender<()>>);
+
+impl Drop for DispatcherLifetime {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
 /// A single LSP server client.
 ///
 /// The client is cheaply cloneable: all mutable protocol state is already
@@ -399,6 +412,7 @@ async fn parse_server_registrations(
 #[derive(Clone)]
 pub struct LspClient {
     file_operation_root: String,
+    _dispatcher: Arc<DispatcherLifetime>,
     transport: Arc<Mutex<LspTransport>>,
     next_id: Arc<AtomicI64>,
     /// Pending requests: jsonrpc id -> oneshot sender
@@ -534,43 +548,50 @@ impl LspClient {
         // blocks initialize on the answer deadlocks startup.
         let editor_ready = Arc::new(AtomicBool::new(false));
         let editor_ready_clone = editor_ready.clone();
+        let (cancel_dispatcher, cancelled) = oneshot::channel();
         tokio::spawn(async move {
-            while let Some(msg) = incoming.recv().await {
-                // Is it a response?
-                if let Some(id) = msg.get("id") {
-                    if msg.get("method").is_some() {
-                        // Retire executable lenses before forwarding the refresh
-                        // or acknowledging it. A pending resolve can resume as
-                        // soon as the dispatcher reads its next response.
-                        if msg.get("method").and_then(Value::as_str)
-                            == Some("workspace/codeLens/refresh")
-                        {
-                            code_lenses_clone.lock().await.invalidate();
+            let dispatch = async {
+                while let Some(msg) = incoming.recv().await {
+                    // Is it a response?
+                    if let Some(id) = msg.get("id") {
+                        if msg.get("method").is_some() {
+                            // Retire executable lenses before forwarding the refresh
+                            // or acknowledging it. A pending resolve can resume as
+                            // soon as the dispatcher reads its next response.
+                            if msg.get("method").and_then(Value::as_str)
+                                == Some("workspace/codeLens/refresh")
+                            {
+                                code_lenses_clone.lock().await.invalidate();
+                            }
+                            // Server request (e.g. workspace/applyEdit)
+                            handle_server_request(
+                                &msg,
+                                &transport_clone,
+                                &event_tx_clone,
+                                &settings_clone,
+                                &dynamic_registrations_clone,
+                                &workspace_root,
+                                &editor_ready_clone,
+                                client_process_id.is_some(),
+                            )
+                            .await;
+                        } else {
+                            // Response to our request
+                            let id = id.as_i64().unwrap_or(0);
+                            let mut map = pending_clone.lock().await;
+                            if let Some(tx) = map.remove(&id) {
+                                let _ = tx.send(msg);
+                            }
                         }
-                        // Server request (e.g. workspace/applyEdit)
-                        handle_server_request(
-                            &msg,
-                            &transport_clone,
-                            &event_tx_clone,
-                            &settings_clone,
-                            &dynamic_registrations_clone,
-                            &workspace_root,
-                            &editor_ready_clone,
-                            client_process_id.is_some(),
-                        )
-                        .await;
-                    } else {
-                        // Response to our request
-                        let id = id.as_i64().unwrap_or(0);
-                        let mut map = pending_clone.lock().await;
-                        if let Some(tx) = map.remove(&id) {
-                            let _ = tx.send(msg);
-                        }
+                    } else if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+                        // Server notification
+                        handle_server_notification(method, &msg, &event_tx_clone).await;
                     }
-                } else if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
-                    // Server notification
-                    handle_server_notification(method, &msg, &event_tx_clone).await;
                 }
+            };
+            tokio::select! {
+                _ = cancelled => {},
+                _ = dispatch => {},
             }
 
             alive_clone.store(false, Ordering::Release);
@@ -583,6 +604,10 @@ impl LspClient {
                     eprintln!("[simplecc] failed to reap disconnected language server: {error}");
                 }
             }
+            // A slow editor must not keep the server/pipe resources alive
+            // while waiting to deliver its final status.
+            drop(transport_clone);
+            drop(incoming);
             let _ = event_tx_clone
                 .send(ServerEvent::Stopped {
                     message: "language server connection closed".to_string(),
@@ -592,6 +617,7 @@ impl LspClient {
 
         let mut client = Self {
             file_operation_root: root_uri.to_string(),
+            _dispatcher: Arc::new(DispatcherLifetime(Some(cancel_dispatcher))),
             transport,
             next_id: Arc::new(AtomicI64::new(1)),
             pending,
@@ -5202,5 +5228,212 @@ while True:
             "file:///tmp/new.py"
         );
         client.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod client_lifetime_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    const SERVER: &str = r#"
+import json, os, sys, time
+
+def send(value):
+    body = json.dumps(dict(jsonrpc='2.0', **value)).encode()
+    sys.stdout.buffer.write(b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
+    sys.stdout.buffer.flush()
+
+while True:
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            # Deliberately ignore EOF: cleanup must actually release and kill
+            # the process, not merely rely on a cooperative language server.
+            time.sleep(30)
+            sys.exit(0)
+        if line in (b'\r\n', b'\n'):
+            break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    msg = json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method = msg.get('method')
+    if method == 'initialize':
+        with open(sys.argv[1], 'w') as f:
+            f.write(str(os.getpid()))
+        if sys.argv[2] == 'stall':
+            time.sleep(30)
+            sys.exit(0)
+        send(dict(id=msg['id'], result={'capabilities': {}}))
+    elif method == 'test/ping':
+        send(dict(id=msg['id'], result='alive'))
+    elif method == 'test/flood':
+        for i in range(300):
+            send(dict(method='window/logMessage', params={'type': 3, 'message': str(i)}))
+    elif method == 'shutdown':
+        send(dict(id=msg['id'], result=None))
+    elif method == 'exit':
+        break
+"#;
+
+    struct ServerFixture(std::path::PathBuf);
+
+    impl ServerFixture {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "simplecc-client-lifetime-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+
+        fn pid_file(&self) -> String {
+            self.0.join("server.pid").to_string_lossy().into_owned()
+        }
+
+        async fn wait_started(&self) -> i32 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(self.pid_file())
+                        && let Ok(pid) = text.parse()
+                    {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("test server did not receive initialize")
+        }
+    }
+
+    impl Drop for ServerFixture {
+        fn drop(&mut self) {
+            if let Ok(text) = std::fs::read_to_string(self.pid_file())
+                && let Ok(pid) = text.parse::<i32>()
+            {
+                // Best-effort test cleanup if an old implementation leaks.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn start_server(
+        pid_file: String,
+        stall: bool,
+    ) -> Result<(LspClient, mpsc::Receiver<ServerEvent>)> {
+        LspClient::start(
+            "lifetime-test",
+            "python3",
+            &[
+                "-u".into(),
+                "-c".into(),
+                SERVER.into(),
+                pid_file,
+                if stall { "stall" } else { "ready" }.into(),
+            ],
+            "file:///tmp/",
+            "/tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(std::process::id()),
+        )
+        .await
+    }
+
+    async fn assert_reaped(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("language server outlived its last client owner");
+    }
+
+    #[tokio::test]
+    async fn cancelled_initialize_releases_dispatcher_and_server() {
+        let fixture = ServerFixture::new();
+        let start = tokio::spawn(start_server(fixture.pid_file(), true));
+        let pid = fixture.wait_started().await;
+        start.abort();
+        assert!(matches!(start.await, Err(error) if error.is_cancelled()));
+        assert_reaped(pid).await;
+    }
+
+    #[tokio::test]
+    async fn last_client_drop_releases_server_but_other_clones_keep_it_usable() {
+        let fixture = ServerFixture::new();
+        let (client, mut events) = start_server(fixture.pid_file(), false).await.unwrap();
+        let pid = fixture.wait_started().await;
+        let survivor = client.clone();
+        drop(client);
+        assert_eq!(
+            survivor.request("test/ping", Value::Null).await.unwrap(),
+            "alive"
+        );
+        drop(survivor);
+        assert_reaped(pid).await;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("dispatcher lost its final status"),
+            Some(ServerEvent::Stopped { .. })
+        ));
+        assert!(events.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_shutdown_remains_usable_with_multiple_client_clones() {
+        let fixture = ServerFixture::new();
+        let (client, _events) = start_server(fixture.pid_file(), false).await.unwrap();
+        let pid = fixture.wait_started().await;
+        let other = client.clone();
+        client.shutdown().await.unwrap();
+        assert!(!other.is_alive());
+        other.shutdown().await.unwrap();
+        assert_reaped(pid).await;
+    }
+
+    #[tokio::test]
+    async fn last_client_drop_reaps_server_even_when_editor_event_queue_is_full() {
+        let fixture = ServerFixture::new();
+        let (client, mut events) = start_server(fixture.pid_file(), false).await.unwrap();
+        let pid = fixture.wait_started().await;
+        client.notify("test/flood", Value::Null).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while events.len() < 256 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test server did not fill event queue");
+        drop(client);
+        assert_reaped(pid).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut stopped = 0;
+            while let Some(event) = events.recv().await {
+                if matches!(event, ServerEvent::Stopped { .. }) {
+                    stopped += 1;
+                }
+            }
+            stopped
+        })
+        .await
+        .expect("dispatcher did not close after draining events");
+        assert_eq!(stopped, 1);
     }
 }

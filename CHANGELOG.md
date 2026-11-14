@@ -2,6 +2,16 @@
 
 ## Unreleased - 2026-11-14
 
+### 取消初始化与最后一个 LSP client 的清理
+
+- dispatcher 的任务所有权随 client clones 共享；取消初始化或丢弃最后一个
+  client 时取消 dispatcher，解除其对 transport 的强引用并清理直接子进程。
+- 其他 client clone 仍存活时不会提前终止服务器，正常 shutdown 行为不变。
+- 新增真实 Python LSP 回归：初始化取消、最后一个 clone 释放，以及多 clone
+  下的正常/重复 shutdown，以及编辑器事件队列满时仍回收进程、保留最终
+  Stopped 状态。自动 watcher 扫描恢复不受此变更影响，仍未实现。
+
+
 ### LSP transport 结束时取消管道读取任务
 
 - 显式终止或释放 transport 时取消其 stdout/stderr 读取任务，避免语言服务器
