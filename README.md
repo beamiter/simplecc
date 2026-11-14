@@ -602,3 +602,12 @@ daemons from ignoring the restricted request. Remote transport reports actual
 write completion; the controller does not announce premature success.
 
 `make vim-check` also runs `python3 test/save_insert_pty.py`: a standard-library PTY regression for Insert Ctrl-S, completion preservation, deferred-save cleanup and typing races (Linux/macOS, Python 3 and Vim required).
+
+### Workspace watcher event loss
+
+If the operating-system watcher reports lost events or an error, SimpleCC emits
+one persistent error message per watcher lifetime. File-state consistency is
+then unknown even if later events arrive. Automatic rescan/reconciliation is not
+implemented: run `:SimpleCCRestart` to reinitialize language servers and watching,
+and inspect diagnostics before relying on them. The input event queue remains
+unbounded; batch size and age limits are not a queue-memory bound.

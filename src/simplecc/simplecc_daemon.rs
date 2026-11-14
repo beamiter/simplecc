@@ -1090,7 +1090,7 @@ async fn handle_request(
             *registry.write().await = Some(reg);
 
             if remote.is_none() {
-                match WorkspaceWatcher::start(&root, registry.clone()) {
+                match WorkspaceWatcher::start(&root, registry.clone(), out.clone()) {
                     Ok(watcher) => {
                         *workspace_watcher.lock().await = Some(watcher);
                         eprintln!("[simplecc] watching workspace: {root}");

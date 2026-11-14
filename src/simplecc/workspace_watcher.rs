@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
-use super::registry::Registry;
+use super::registry::{EventTx, Registry};
 
 const CREATED: u32 = 1;
 const CHANGED: u32 = 2;
@@ -17,16 +17,29 @@ const BATCH_IDLE: Duration = Duration::from_millis(120);
 const BATCH_MAX_AGE: Duration = Duration::from_millis(500);
 const BATCH_MAX_EVENTS: usize = 1024;
 
+#[derive(Default)]
+struct FileBatch {
+    pending: HashMap<PathBuf, u32>,
+    rescan_required: bool,
+}
+
+impl FileBatch {
+    fn merge(&mut self, event: Event) {
+        self.rescan_required |= event.need_rescan();
+        merge_event(&mut self.pending, event);
+    }
+}
+
 // Cap both elapsed coalescing time and work per batch. The input queue remains
 // lossless: stopping a batch leaves later events for the next notification.
 // This is not a queue-memory bound or a bound on slow language-server writes.
 async fn collect_batch(
     first: Event,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<notify::Result<Event>>,
-) -> HashMap<PathBuf, u32> {
+) -> FileBatch {
     let deadline = tokio::time::Instant::now() + BATCH_MAX_AGE;
-    let mut pending = HashMap::new();
-    merge_event(&mut pending, first);
+    let mut batch = FileBatch::default();
+    batch.merge(first);
     for _ in 1..BATCH_MAX_EVENTS {
         let now = tokio::time::Instant::now();
         // A ready receiver may win a timeout even after its deadline. Check
@@ -36,12 +49,15 @@ async fn collect_batch(
         }
         let wait = BATCH_IDLE.min(deadline - now);
         match tokio::time::timeout(wait, rx.recv()).await {
-            Ok(Some(Ok(event))) => merge_event(&mut pending, event),
-            Ok(Some(Err(err))) => eprintln!("[simplecc] workspace watcher error: {err}"),
+            Ok(Some(Ok(event))) => batch.merge(event),
+            Ok(Some(Err(err))) => {
+                eprintln!("[simplecc] workspace watcher error: {err}");
+                batch.rescan_required = true;
+            }
             Ok(None) | Err(_) => break,
         }
     }
-    pending
+    batch
 }
 
 /// Keeps the platform watcher and its async event-forwarding task alive for
@@ -54,8 +70,12 @@ pub struct WorkspaceWatcher {
 }
 
 impl WorkspaceWatcher {
-    pub fn start(root: &str, registry: Arc<RwLock<Option<Registry>>>) -> Result<Self> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    pub fn start(
+        root: &str,
+        registry: Arc<RwLock<Option<Registry>>>,
+        out: EventTx,
+    ) -> Result<Self> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = tx.send(event);
         })
@@ -65,59 +85,7 @@ impl WorkspaceWatcher {
             .watch(&root_path, RecursiveMode::Recursive)
             .with_context(|| format!("failed to watch workspace {root}"))?;
 
-        let task = tokio::spawn(async move {
-            let mut last_julia_refresh: Option<Instant> = None;
-            while let Some(result) = rx.recv().await {
-                let first = match result {
-                    Ok(event) => event,
-                    Err(err) => {
-                        eprintln!("[simplecc] workspace watcher error: {err}");
-                        continue;
-                    }
-                };
-
-                // Coalesce save bursts without waiting forever for a busy
-                // workspace to become quiet.
-                let pending = collect_batch(first, &mut rx).await;
-
-                let manifest_changed = pending.keys().any(|path| is_julia_manifest(path));
-                // Each language server supplies its own dynamic watcher globs.
-                // Forward the complete coalesced batch and let the client-side
-                // registration matcher select the events for that server.
-                let changes = workspace_file_changes(pending);
-                if changes.is_empty() {
-                    continue;
-                }
-
-                let clients = registry
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(Registry::active_clients)
-                    .unwrap_or_default();
-                let should_refresh_julia = manifest_changed
-                    && last_julia_refresh
-                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
-                let mut refreshed_julia = false;
-                for client in clients {
-                    if let Err(err) = client.did_change_watched_files(&changes).await {
-                        eprintln!("[simplecc] watched-file notification failed: {err}");
-                    }
-                    if should_refresh_julia {
-                        match client.refresh_julia_language_server().await {
-                            Ok(true) => refreshed_julia = true,
-                            Ok(false) => {}
-                            Err(err) => {
-                                eprintln!("[simplecc] Julia symbol-cache refresh failed: {err}")
-                            }
-                        }
-                    }
-                }
-                if refreshed_julia {
-                    last_julia_refresh = Some(Instant::now());
-                }
-            }
-        });
+        let task = tokio::spawn(forward_events(rx, registry, out));
 
         Ok(Self {
             watcher,
@@ -161,6 +129,87 @@ impl Drop for WorkspaceWatcher {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+async fn forward_events(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<notify::Result<Event>>,
+    registry: Arc<RwLock<Option<Registry>>>,
+    out: EventTx,
+) {
+    let mut last_julia_refresh: Option<Instant> = None;
+    // Once lost, consistency is unknown until the watcher is recreated.
+    // Later ordinary events do not prove that missing changes were recovered.
+    let mut loss_reported = false;
+    while let Some(result) = rx.recv().await {
+        let first = match result {
+            Ok(event) => event,
+            Err(err) => {
+                eprintln!("[simplecc] workspace watcher error: {err}");
+                if report_event_loss(&out, &mut loss_reported).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Coalesce save bursts without waiting forever for a busy
+        // workspace to become quiet.
+        let batch = collect_batch(first, &mut rx).await;
+        if batch.rescan_required && report_event_loss(&out, &mut loss_reported).await.is_err() {
+            break;
+        }
+        let pending = batch.pending;
+
+        let manifest_changed = pending.keys().any(|path| is_julia_manifest(path));
+        // Each language server supplies its own dynamic watcher globs.
+        // Forward the complete coalesced batch and let the client-side
+        // registration matcher select the events for that server.
+        let changes = workspace_file_changes(pending);
+        if changes.is_empty() {
+            continue;
+        }
+
+        let clients = registry
+            .read()
+            .await
+            .as_ref()
+            .map(Registry::active_clients)
+            .unwrap_or_default();
+        let should_refresh_julia = manifest_changed
+            && last_julia_refresh.is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
+        let mut refreshed_julia = false;
+        for client in clients {
+            if let Err(err) = client.did_change_watched_files(&changes).await {
+                eprintln!("[simplecc] watched-file notification failed: {err}");
+            }
+            if should_refresh_julia {
+                match client.refresh_julia_language_server().await {
+                    Ok(true) => refreshed_julia = true,
+                    Ok(false) => {}
+                    Err(err) => {
+                        eprintln!("[simplecc] Julia symbol-cache refresh failed: {err}")
+                    }
+                }
+            }
+        }
+        if refreshed_julia {
+            last_julia_refresh = Some(Instant::now());
+        }
+    }
+}
+
+// Preserve delivery through the same bounded, fail-closed path as other daemon
+// errors. A full Vim output queue must not silently hide the loss notification.
+async fn report_event_loss(out: &EventTx, reported: &mut bool) -> Result<()> {
+    if !*reported {
+        out.send(serde_json::json!({
+            "type": "showMessage",
+            "level": "error",
+            "message": "SimpleCC workspace watcher lost events or failed; language-server file state may be stale. Automatic rescan is not implemented. Run :SimpleCCRestart to reinitialize servers and watching; inspect diagnostics before relying on them."
+        }).to_string()).await.map_err(|_| anyhow::anyhow!("failed to report watcher event loss"))?;
+        *reported = true;
+    }
+    Ok(())
 }
 
 fn merge_event(pending: &mut HashMap<PathBuf, u32>, event: Event) {
@@ -231,6 +280,122 @@ mod tests {
         Event::new(EventKind::Modify(ModifyKind::Any)).add_path(path.into())
     }
 
+    fn rescan() -> Event {
+        // Both Linux IN_Q_OVERFLOW and macOS MUST_SCAN_SUBDIRS can arrive
+        // without paths and with EventKind::Other.
+        Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+    }
+
+    #[tokio::test]
+    async fn rescan_flag_survives_coalescing_at_any_position() {
+        for first_is_rescan in [true, false] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (first, second) = if first_is_rescan {
+                (rescan(), change("saved.rs"))
+            } else {
+                (change("saved.rs"), rescan())
+            };
+            tx.send(Ok(second)).unwrap();
+            drop(tx);
+            let batch = collect_batch(first, &mut rx).await;
+            assert!(
+                batch.rescan_required,
+                "a pathless rescan must not disappear"
+            );
+            assert_eq!(batch.pending[Path::new("saved.rs")], CHANGED);
+        }
+    }
+
+    #[tokio::test]
+    async fn large_backlog_reports_loss_once_across_batch_boundaries() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for index in 0..100_000 {
+            let event = if index % (BATCH_MAX_EVENTS + 17) == 0 {
+                rescan()
+            } else {
+                change(&format!("/tmp/simplecc-pressure/{index}.rs"))
+            };
+            tx.send(Ok(event)).unwrap();
+        }
+        drop(tx);
+        let (sender, mut output) = tokio::sync::mpsc::channel(4);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            forward_events(rx, Arc::new(RwLock::new(None)), EventTx::new(sender)),
+        )
+        .await
+        .expect("loss reporting must not stall draining a closed backlog");
+        let message: serde_json::Value =
+            serde_json::from_str(&output.try_recv().expect("lost events must be visible")).unwrap();
+        assert_eq!(message["type"], "showMessage");
+        assert_eq!(message["level"], "error");
+        assert!(
+            message["message"]
+                .as_str()
+                .unwrap()
+                .contains(":SimpleCCRestart")
+        );
+        assert!(matches!(
+            output.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordinary_other_events_do_not_report_loss() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Ok(Event::new(EventKind::Other))).unwrap();
+        tx.send(Ok(Event::new(EventKind::Any))).unwrap();
+        drop(tx);
+        let (sender, mut output) = tokio::sync::mpsc::channel(4);
+        forward_events(rx, Arc::new(RwLock::new(None)), EventTx::new(sender)).await;
+        assert!(matches!(
+            output.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn watcher_errors_are_visible_before_and_inside_batches() {
+        for error_first in [true, false] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            if !error_first {
+                tx.send(Ok(change("/tmp/start.rs"))).unwrap();
+            }
+            tx.send(Err(notify::Error::generic("permission or backend failure")))
+                .unwrap();
+            tx.send(Ok(rescan())).unwrap();
+            tx.send(Ok(change("/tmp/after.rs"))).unwrap();
+            drop(tx);
+            let (sender, mut output) = tokio::sync::mpsc::channel(4);
+            forward_events(rx, Arc::new(RwLock::new(None)), EventTx::new(sender)).await;
+            let message: serde_json::Value =
+                serde_json::from_str(&output.try_recv().unwrap()).unwrap();
+            assert_eq!(message["level"], "error");
+            assert!(
+                message["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Automatic rescan is not implemented")
+            );
+            assert!(
+                output.try_recv().is_err(),
+                "do not spam repeated loss warnings"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_warning_delivery_is_not_acknowledged() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
+        let out = EventTx::new(sender);
+        let mut reported = false;
+        assert!(report_event_loss(&out, &mut reported).await.is_err());
+        assert!(!reported);
+        assert!(out.is_stalled());
+    }
+
     #[tokio::test]
     async fn continuous_events_do_not_wait_for_quiet() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -249,7 +414,7 @@ mod tests {
         .await;
         producer.abort();
         let pending = result.expect("continuous events must not starve dispatch");
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.pending.len(), 2);
     }
 
     #[tokio::test]
@@ -260,11 +425,15 @@ mod tests {
         }
         drop(tx);
         let first = collect_batch(change("0.rs"), &mut rx).await;
-        assert_eq!(first.len(), BATCH_MAX_EVENTS);
+        assert_eq!(first.pending.len(), BATCH_MAX_EVENTS);
         let remaining = rx.recv().await.unwrap().unwrap();
         let second = collect_batch(remaining, &mut rx).await;
-        assert_eq!(second.len(), 1);
-        assert!(second.contains_key(&PathBuf::from(format!("{BATCH_MAX_EVENTS}.rs"))));
+        assert_eq!(second.pending.len(), 1);
+        assert!(
+            second
+                .pending
+                .contains_key(&PathBuf::from(format!("{BATCH_MAX_EVENTS}.rs")))
+        );
         assert!(rx.recv().await.is_none());
     }
 
@@ -281,8 +450,8 @@ mod tests {
         tx.send(Ok(change("saved.rs"))).unwrap();
         drop(tx);
         let pending = collect_batch(change("temp.rs"), &mut rx).await;
-        assert_eq!(pending[Path::new("temp.rs")], DELETED);
-        assert_eq!(pending[Path::new("saved.rs")], CREATED);
+        assert_eq!(pending.pending[Path::new("temp.rs")], DELETED);
+        assert_eq!(pending.pending[Path::new("saved.rs")], CREATED);
     }
 
     #[test]
