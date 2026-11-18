@@ -8331,6 +8331,9 @@ def FindProjectRoot(): string
   var markers = ['.git', 'Cargo.toml', 'package.json', 'go.mod', 'pyproject.toml',
                  'Project.toml', 'JuliaProject.toml',
                  'Makefile', 'CMakeLists.txt', '.hg', '.svn']
+  if index(['typescript', 'typescriptreact', 'javascript', 'javascriptreact'], &l:filetype) >= 0
+    extend(markers, ['tsconfig.json', 'jsconfig.json'])
+  endif
   var dir = expand('%:p:h')
   if dir ==# ''
     dir = getcwd()

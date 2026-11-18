@@ -83,6 +83,26 @@ call assert_equal(['x' . s:colon . 'Yz'], getline(1, '$'),
 call call(function(printf('<SNR>%d_SnippetFinish', s:sid)), [])
 set virtualedit=
 
+" Standalone TS/JS projects can have a config but no package.json or .git.
+let s:workspace = tempname()
+call mkdir(s:workspace .. '/typescript/src', 'p')
+call mkdir(s:workspace .. '/javascript/src', 'p')
+call writefile([], s:workspace .. '/.git')
+call writefile(['{}'], s:workspace .. '/typescript/tsconfig.json')
+call writefile(['{}'], s:workspace .. '/javascript/jsconfig.json')
+let s:FindProjectRoot = function(printf('<SNR>%d_FindProjectRoot', s:sid))
+execute 'edit! ' .. fnameescape(s:workspace .. '/typescript/src/component.tsx')
+setlocal filetype=typescriptreact
+call assert_equal(s:workspace .. '/typescript', s:FindProjectRoot())
+execute 'edit! ' .. fnameescape(s:workspace .. '/javascript/src/component.jsx')
+setlocal filetype=javascriptreact
+call assert_equal(s:workspace .. '/javascript', s:FindProjectRoot())
+execute 'edit! ' .. fnameescape(s:workspace .. '/typescript/src/tool.py')
+setlocal filetype=python
+call assert_equal(s:workspace, s:FindProjectRoot())
+bwipeout!
+call delete(s:workspace, 'rf')
+
 " Statusline diagnostic counts: the exported function returns the documented
 " shape even for buffers with no diagnostics or a bufnr that does not exist.
 let s:zero_counts = {'error': 0, 'warning': 0, 'info': 0, 'hint': 0}

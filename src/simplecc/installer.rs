@@ -300,7 +300,8 @@ static KNOWN_SERVERS: &[ServerMeta] = &[
                 "--no-fund".to_string(),
                 "--prefix".to_string(),
                 install_dir.to_string_lossy().to_string(),
-                "typescript".to_string(),
+                // The language server wraps tsserver.js, which TypeScript 7 dropped.
+                "typescript@6".to_string(),
                 "typescript-language-server".to_string(),
             ],
             env: vec![],
@@ -1453,6 +1454,13 @@ mod tests {
             assert!(!command.args.iter().any(|arg| arg == "-g"));
             assert!((meta.binary_rel_path)(&current_platform()).contains("node_modules/.bin"));
         }
+    }
+
+    #[test]
+    fn typescript_language_server_installs_the_major_with_tsserver() {
+        let meta = find_server_meta("typescript-language-server").unwrap();
+        let command = meta.install_command.unwrap()(&current_platform(), Path::new("/tmp"));
+        assert!(command.args.iter().any(|arg| arg == "typescript@6"));
     }
 
     #[test]
