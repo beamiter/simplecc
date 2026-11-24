@@ -227,11 +227,21 @@ if !g:simplecc_no_default_maps
   if maparg('gy', 'n') ==# '' | nmap <silent> gy <Plug>(simplecc-type-definition)| endif
   if maparg('<leader>o', 'n') ==# '' | nmap <silent> <leader>o <Plug>(simplecc-outline) | endif
   if maparg('<leader>ih', 'n') ==# '' | nmap <silent> <leader>ih <Plug>(simplecc-inlay-hints) | endif
-  if maparg('<Tab>', 'i') ==# '' | imap <silent> <Tab> <Plug>(simplecc-select-tab) | endif
-  if maparg('<S-Tab>', 'i') ==# '' | imap <silent> <S-Tab> <Plug>(simplecc-select-shift-tab) | endif
-  if maparg('<Down>', 'i') ==# '' | imap <silent> <Down> <Plug>(simplecc-select-down) | endif
-  if maparg('<Up>', 'i') ==# '' | imap <silent> <Up> <Plug>(simplecc-select-up) | endif
-  if maparg('<CR>', 'i') ==# '' | imap <silent> <CR> <Plug>(simplecc-select-enter) | endif
+  if maparg('<Tab>', 'i') ==# ''
+    imap <silent> <Tab> <Plug>(simplecc-select-tab)
+  endif
+  if maparg('<S-Tab>', 'i') ==# ''
+    imap <silent> <S-Tab> <Plug>(simplecc-select-shift-tab)
+  endif
+  if maparg('<Down>', 'i') ==# ''
+    imap <silent> <Down> <Plug>(simplecc-select-down)
+  endif
+  if maparg('<Up>', 'i') ==# ''
+    imap <silent> <Up> <Plug>(simplecc-select-up)
+  endif
+  if maparg('<CR>', 'i') ==# ''
+    imap <silent> <CR> <Plug>(simplecc-select-enter)
+  endif
 endif
 
 # ─── Signs ────────────────────────────────────────────────
